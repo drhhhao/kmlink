@@ -5,7 +5,7 @@
 //! 发给 input/desktop 的消息走 channel，再 PostThreadMessage(WM_APP_WAKE) 叫醒对方的消息循环。
 
 use crate::config::Config;
-use crate::geom::{Desk, Layout, Point};
+use crate::geom::Desk;
 use crate::proto::Msg;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::path::PathBuf;
@@ -21,7 +21,11 @@ pub const WM_APP_WAKE: u32 = WM_APP + 1;
 #[derive(Debug)]
 pub enum ToInput {
     /// 会话建立/对方显示器变化。
-    PeerUp { name: String, desk: Desk },
+    PeerUp {
+        #[allow(dead_code)]
+        name: String,
+        desk: Desk,
+    },
     /// 会话断开：若正在驱动对方，立刻回到本机。
     PeerDown,
     /// 本机显示器变化（desktop 线程检测到 WM_DISPLAYCHANGE 后发）。
@@ -39,6 +43,7 @@ pub enum ToInput {
 
 /// 发给 desktop 线程。
 #[derive(Debug)]
+#[allow(dead_code)] // HideCursor/ShowCursor/Quit：现由 cursor 工作线程 / 托盘直接处理，保留以兼容
 pub enum ToDesktop {
     /// 对方发来的剪贴板文字。
     ClipText(String),
@@ -117,10 +122,6 @@ impl Hub {
         self.cfg.read().unwrap().clone()
     }
 
-    pub fn layout(&self) -> Layout {
-        self.cfg.read().unwrap().layout.layout
-    }
-
     /// 线程启动时登记自己的线程 id（GetCurrentThreadId），之后才能被叫醒。
     pub fn set_input_tid(&self, tid: u32) {
         self.input_tid.store(tid, Ordering::SeqCst);
@@ -184,7 +185,4 @@ fn wake_desktop(hwnd: isize, tid: u32) {
     }
 }
 
-/// 便于日志里打印点。
-pub fn pt(p: Point) -> String {
-    format!("({}, {})", p.x, p.y)
-}
+

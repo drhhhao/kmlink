@@ -74,6 +74,7 @@ fn daemon(with_console: bool) {
         let _m = CreateMutexW(None, true, w!("Local\\kmlink-daemon"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
             log!("已经在运行，退出");
+            log::flush(500);
             return;
         }
         std::mem::forget(_m);
@@ -97,5 +98,6 @@ fn daemon(with_console: bool) {
     injector.release_all();
     cursor::show();
     log!("退出");
+    log::flush(500);
     std::process::exit(0);
 }

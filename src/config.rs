@@ -142,6 +142,7 @@ impl Config {
     }
 
     /// 整个保存（拿跨进程锁）。多数情况应该用 `update`，只改自己关心的字段。
+    #[allow(dead_code)]
     pub fn save(&self) -> std::io::Result<()> {
         let _g = FileLock::acquire();
         self.save_locked()
@@ -165,6 +166,7 @@ impl Config {
     }
 
     /// 对方的 socket 地址（未填端口时用本机端口）。
+    #[allow(dead_code)]
     pub fn peer_addr(&self) -> Option<String> {
         let p = self.peer.trim();
         if p.is_empty() {

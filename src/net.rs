@@ -1043,7 +1043,13 @@ struct OutQueue {
 impl OutQueue {
     fn push(&mut self, o: Out) {
         match o {
-            Out::Msg(m) => self.msgs.push_back(m),
+            Out::Msg(m) => {
+                // 新复制的文字顶掉还没发完的图片/大段文字，免得对方最后收到旧内容
+                if matches!(m, Msg::ClipText { .. }) {
+                    self.img = None;
+                }
+                self.msgs.push_back(m)
+            }
             Out::Move { epoch, seq, x, y } => self.mv = Some(UdpMsg::Move { epoch, seq, x, y }),
             Out::ClipImage { format, raw_len, deflated } => {
                 if deflated.is_empty() || u32::try_from(deflated.len()).is_err() {
@@ -1425,6 +1431,18 @@ mod tests {
         }
     }
 
+    fn next_desktop_opt(rx: &Receiver<ToDesktop>, secs: u64) -> Option<ToDesktop> {
+        let end = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let left = end.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(ToDesktop::Status) => continue,
+                Ok(m) => return Some(m),
+                Err(_) => return None,
+            }
+        }
+    }
+
     #[test]
     fn two_peers_end_to_end() {
         let key = config::new_key_hex();
@@ -1473,26 +1491,32 @@ mod tests {
         raw[..100_000].fill(7); // 一部分可压缩
         let z = deflate(&raw);
         assert!(z.len() > CHUNK);
+        // 多片图片完整到达；期间插进来的控制消息（Yield）不用等图片发完
+        b.hub.to_net(Out::ClipImage { format: 17, raw_len: raw.len() as u32, deflated: z.clone() });
+        b.hub.send(Msg::Yield);
+        wait("Yield 先到", 10, || matches!(a.input.try_recv(), Ok(ToInput::Yield)));
+        match next_desktop(&a.desktop, 10) {
+            ToDesktop::ClipImage { format, data } => {
+                assert_eq!(format, 17);
+                assert!(data == raw);
+            }
+            m => panic!("{m:?}"),
+        }
+
+        // 图片还没发完时又复制了文字：文字是最新内容，对方最后拿到的必须是文字（旧图片作废）
         b.hub.to_net(Out::ClipImage { format: 17, raw_len: raw.len() as u32, deflated: z });
         b.hub.send(Msg::ClipText { text: "插队".into() });
-        let mut got_text = false;
-        let mut got_img = false;
-        for _ in 0..2 {
+        loop {
             match next_desktop(&a.desktop, 10) {
                 ToDesktop::ClipText(t) => {
                     assert_eq!(t, "插队");
-                    assert!(!got_img, "文字应先于图片完成");
-                    got_text = true;
+                    break;
                 }
-                ToDesktop::ClipImage { format, data } => {
-                    assert_eq!(format, 17);
-                    assert!(data == raw);
-                    got_img = true;
-                }
+                ToDesktop::ClipImage { .. } => continue, // 若图片抢在文字之前发完也可以，但不能在文字之后
                 m => panic!("{m:?}"),
             }
         }
-        assert!(got_text && got_img);
+        assert!(next_desktop_opt(&a.desktop, 1).is_none(), "文字之后不应再收到旧图片");
 
         // UDP：双方通过 Hi 学到对方地址
         let learned = |n: &Node| n.net.current().is_some_and(|s| lock(&s.udp_peer).learned);

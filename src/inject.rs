@@ -238,9 +238,6 @@ impl Injector {
         self.set_driven(&g, false);
     }
 
-    pub fn active(&self) -> bool {
-        self.lock().active
-    }
 }
 
 /// 抬起所有记录中按着的键和按钮（持锁调用）。没注入成功的放回记录。
