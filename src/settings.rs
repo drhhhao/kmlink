@@ -13,8 +13,8 @@
 //!    - “配对密钥”编辑框（cfg.key，64 位十六进制）+ “复制”按钮（复制到剪贴板）+ “新密钥”按钮。
 //!      提示：“两台必须相同：在一台复制，粘贴到另一台。”
 //!    - “本机地址”只读文字：列出本机 IPv4（GetAdaptersAddresses 或 std 解析主机名均可；没有就省略）。
-//! 3. 底部按钮：“保存”（校验密钥；config::update 只改 peer/key，排布真被改过才写 layout 并 rev = next_rev；关闭窗口）
-//!    和“取消”。主程序会在 1 秒内发现配置变化并重新加载、把排布同步给对方。
+//! 3. 底部按钮：“保存”（校验密钥和对方地址（同 net：IP 或 IP:端口）；config::update 只改 peer/key，排布真被改过才写 layout 并 rev = next_rev；关闭窗口）
+//!    和“取消”。主程序会在约 2 秒内发现配置变化并重新加载、把排布同步给对方。
 //! 只允许一个设置窗口（命名互斥量 Local\kmlink-settings），再打开就把已有的窗口提到前面。
 //! 文字要简洁。所有坐标是物理像素（进程已 PerMonitorV2），字体大小按 GetDpiForWindow 缩放。
 
@@ -22,8 +22,9 @@ use crate::config::{self, Config};
 use crate::geom::{Desk, Layout, Rect, Side};
 use crate::sys;
 use std::cell::RefCell;
+use std::net::{IpAddr, SocketAddr};
 use windows::Win32::Foundation::{
-    COLORREF, ERROR_ALREADY_EXISTS, GetLastError, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    COLORREF, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, COLOR_WINDOWTEXT, CreateCompatibleBitmap, CreateCompatibleDC,
@@ -35,7 +36,6 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
-use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -111,20 +111,33 @@ fn apply_save(c: &mut Config, peer: &str, key: String, opened: &Layout, now: &La
     }
 }
 
-/// 对方地址是不是本机（回环或本机网卡地址）。
+/// 按 net 的规则解析对方地址：空 = 不主动连接（Ok(None)）；IP 或 IP:端口
+/// （IPv6 可写裸地址、[地址] 或 [地址]:端口），端口 1..=65535。其余（含主机名）Err。
+fn peer_ip(peer: &str) -> Result<Option<IpAddr>, ()> {
+    let p = peer.trim();
+    if p.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(sa) = p.parse::<SocketAddr>() {
+        return if sa.port() == 0 { Err(()) } else { Ok(Some(sa.ip())) };
+    }
+    let bare = p.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(p);
+    bare.parse::<IpAddr>().map(Some).map_err(|_| ())
+}
+
+/// 对方地址是不是本机（回环、0.0.0.0/::、或本机网卡地址；IPv4 映射的 IPv6 按 IPv4 看）。
 fn is_own_addr(peer: &str, ips: &[String]) -> bool {
     let p = peer.trim();
-    let host = p.split_once(':').map_or(p, |(h, _)| h).trim();
-    if host.is_empty() {
-        return false;
-    }
+    let host = p.rsplit_once(':').map_or(p, |(h, _)| h).trim();
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    match host.parse::<std::net::Ipv4Addr>() {
-        Ok(ip) => ip.is_loopback() || ip.is_unspecified() || ips.iter().any(|s| s == host),
-        Err(_) => false,
-    }
+    let ip = match peer_ip(p) {
+        Ok(Some(IpAddr::V6(v6))) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        Ok(Some(ip)) => ip,
+        _ => return false,
+    };
+    ip.is_loopback() || ip.is_unspecified() || ips.iter().any(|s| *s == ip.to_string())
 }
 
 /// 画布下方的说明：“对方在右侧，下移 120 像素” / “对方在左侧，对齐”。
@@ -464,14 +477,12 @@ fn refresh() {
     }
 }
 
-/// 已有设置窗口：提到前面，返回 true（本进程该退出）。
+/// 已有设置窗口：提到前面，返回 true（本进程该退出）。已有的那个以管理员身份运行时也算。
 fn already_running() -> bool {
+    if !sys::already_running(w!("Local\\kmlink-settings"), false) {
+        return false;
+    }
     unsafe {
-        // 句柄不关，进程结束时系统回收
-        let m = CreateMutexW(None, false, w!("Local\\kmlink-settings"));
-        if m.is_err() || GetLastError() != ERROR_ALREADY_EXISTS {
-            return false;
-        }
         if let Ok(h) = FindWindowW(MAIN_CLASS, PCWSTR::null()) {
             let _ = ShowWindow(h, if IsIconic(h).as_bool() { SW_RESTORE } else { SW_SHOW });
             let _ = SetForegroundWindow(h);
@@ -689,6 +700,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                             let key: String = get_text(h).chars().filter(|c| !c.is_whitespace()).collect();
                             if !copy_text(hwnd, &key) {
                                 crate::log!("设置窗口：复制到剪贴板失败");
+                                warn(hwnd, "复制失败，请重试");
                             }
                         }
                     }
@@ -784,8 +796,15 @@ fn on_save(main: HWND) {
     let Some((layout, layout0, opened, ips)) = with_app(|a| (a.layout, a.layout0, a.cfg.clone(), a.ips.clone())) else {
         return;
     };
-    if is_own_addr(&peer, &ips) {
-        warn(main, "对方 IP 是本机地址，请填另一台的 IP");
+    let bad_peer = if peer_ip(&peer).is_err() {
+        Some("对方 IP 格式不对，例：192.168.1.8")
+    } else if is_own_addr(&peer, &ips) {
+        Some("对方 IP 是本机地址，请填另一台的 IP")
+    } else {
+        None
+    };
+    if let Some(text) = bad_peer {
+        warn(main, text);
         if let Some(h) = dlg(main, ID_PEER) {
             unsafe {
                 let _ = SetFocus(Some(h));
@@ -1044,56 +1063,62 @@ fn draw(hdc: HDC, a: &App, w: i32, h: i32) {
     }
 }
 
-/// 复制文字到剪贴板。
+/// 复制文字到剪贴板（密钥不进 Win+V 历史、不上云剪贴板）。先分配好内存再打开剪贴板；
+/// 剪贴板被别的程序占着时短暂重试（共约 0.5 秒）。
 fn copy_text(owner: HWND, s: &str) -> bool {
     let w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
-        if OpenClipboard(Some(owner)).is_err() {
-            return false;
-        }
-        let mut ok = false;
-        if EmptyClipboard().is_ok()
-            && let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, w.len() * 2)
-        {
-            let p = GlobalLock(hmem) as *mut u16;
-            if p.is_null() {
-                let _ = GlobalFree(Some(hmem));
-            } else {
-                std::ptr::copy_nonoverlapping(w.as_ptr(), p, w.len());
-                let _ = GlobalUnlock(hmem);
-                if SetClipboardData(CF_UNICODETEXT, Some(HANDLE(hmem.0))).is_ok() {
-                    ok = true; // 成功后内存归系统
-                    // 密钥不进 Win+V 历史、不上云剪贴板
-                    set_clip_dword(w!("CanIncludeInClipboardHistory"), 0);
-                    set_clip_dword(w!("CanUploadToCloudClipboard"), 0);
-                } else {
-                    let _ = GlobalFree(Some(hmem));
-                }
+        let Some(text) = global_from(&w) else { return false };
+        let history = global_from(&[0u16, 0]);
+        let cloud = global_from(&[0u16, 0]);
+        let mut opened = false;
+        for i in 0..25 {
+            if OpenClipboard(Some(owner)).is_ok() {
+                opened = true;
+                break;
+            }
+            if i < 24 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
-        let _ = CloseClipboard();
+        let mut ok = false;
+        let mut left = [Some(text), history, cloud];
+        if opened {
+            if EmptyClipboard().is_ok() && SetClipboardData(CF_UNICODETEXT, Some(HANDLE(text.0))).is_ok() {
+                ok = true; // 成功后内存归系统
+                left[0] = None;
+                for (i, name) in [(1, w!("CanIncludeInClipboardHistory")), (2, w!("CanUploadToCloudClipboard"))] {
+                    let f = RegisterClipboardFormatW(name);
+                    if let Some(h) = left[i]
+                        && f != 0
+                        && SetClipboardData(f, Some(HANDLE(h.0))).is_ok()
+                    {
+                        left[i] = None;
+                    }
+                }
+            }
+            let _ = CloseClipboard();
+        }
+        // 没交给剪贴板的自己释放
+        for h in left.into_iter().flatten() {
+            let _ = GlobalFree(Some(h));
+        }
         ok
     }
 }
 
-/// 剪贴板已打开时，放一个 DWORD 值的注册格式。
-unsafe fn set_clip_dword(name: PCWSTR, v: u32) {
+/// GlobalAlloc 一块内存并拷入 data（u16 序列）。
+unsafe fn global_from(data: &[u16]) -> Option<HGLOBAL> {
     unsafe {
-        let f = RegisterClipboardFormatW(name);
-        if f == 0 {
-            return;
-        }
-        let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, 4) else { return };
-        let p = GlobalLock(h) as *mut u32;
+        let h = GlobalAlloc(GMEM_MOVEABLE, data.len() * 2).ok()?;
+        let p = GlobalLock(h) as *mut u16;
         if p.is_null() {
             let _ = GlobalFree(Some(h));
-            return;
+            return None;
         }
-        *p = v;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
         let _ = GlobalUnlock(h);
-        if SetClipboardData(f, Some(HANDLE(h.0))).is_err() {
-            let _ = GlobalFree(Some(h));
-        }
+        Some(h)
     }
 }
 
@@ -1261,6 +1286,41 @@ mod tests {
         assert!(!is_own_addr("192.168.1.6", &ips));
         assert!(!is_own_addr("", &ips));
         assert!(!is_own_addr("pc-b", &ips));
+        // IPv6 回环 / 未指定 / IPv4 映射
+        assert!(is_own_addr("::1", &ips));
+        assert!(is_own_addr("[::1]", &ips));
+        assert!(is_own_addr("[::1]:47900", &ips));
+        assert!(is_own_addr("::", &ips));
+        assert!(is_own_addr("0.0.0.0", &ips));
+        assert!(is_own_addr("::ffff:127.0.0.1", &ips));
+        assert!(is_own_addr("[::ffff:192.168.1.5]:9", &ips));
+        assert!(!is_own_addr("fe80::1", &ips));
+        assert!(!is_own_addr("[2001:db8::1]:47900", &ips));
+    }
+
+    #[test]
+    fn peer_addr_format() {
+        let ok = |s: &str| peer_ip(s).is_ok();
+        assert_eq!(peer_ip(""), Ok(None));
+        assert_eq!(peer_ip("   "), Ok(None));
+        assert_eq!(peer_ip(" 10.0.0.2 "), Ok(Some("10.0.0.2".parse().unwrap())));
+        assert!(ok("10.0.0.2:47900"));
+        assert!(ok("10.0.0.2:1"));
+        assert!(ok("10.0.0.2:65535"));
+        assert!(ok("fe80::1"));
+        assert!(ok("[fe80::1]"));
+        assert!(ok("[::1]:9"));
+        assert!(!ok("10.0.0.2:0"));
+        assert!(!ok("10.0.0.2:65536"));
+        assert!(!ok("10.0.0.2:"));
+        assert!(!ok("10.0.0.2:abc"));
+        assert!(!ok("10.0.0"));
+        assert!(!ok("10.0.0.256"));
+        assert!(!ok("[::1]:0"));
+        assert!(ok("::1:9")); // 没有方括号就整段当 IPv6 地址（::1:9），也合法
+        assert!(!ok("pc-b"));
+        assert!(!ok("localhost:47900"));
+        assert!(!ok("http://10.0.0.2"));
     }
 
     #[test]

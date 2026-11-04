@@ -1,13 +1,22 @@
 //! desktop 线程：一个隐藏的顶层窗口（WS_EX_TOOLWINDOW，不显示）+ 消息循环。负责：
 //!
 //! 1. 剪贴板（clip.rs）：AddClipboardFormatListener；WM_CLIPBOARDUPDATE 时若 GetClipboardSequenceNumber()
-//!    等于我们自己最后一次写入后的序号 → 忽略；否则 100ms 防抖（SetTimer）后读取（剪贴板被占用则 200ms 后重试，最多 3 次）：
-//!    文字（≤ max_text_kb）→ 回声抑制（见 `Echo`）→ hub.send(Msg::ClipText)；超过 32 KiB（UTF-16）的大段文字
-//!    和图片一样压缩后走 Out::ClipImage（format = CF_UNICODETEXT），不让一个大帧堵住键鼠消息；
-//!    图片（cfg.clipboard.images 且没有可发的文字时；CF_DIBV5 优先，其次 CF_DIB；≤ max_image_mb）→
-//!    在另一个工作线程里 miniz_oxide 压缩（level 1）后 hub.to_net(Out::ClipImage{..})（压缩不能在本线程做，会卡消息循环）。
-//!    没有连接、暂停共享或 cfg.clipboard.enabled = false 时什么都不做；密码管理器标记的敏感内容不发。
-//!    收到 ToDesktop::ClipText / ClipImage → 写入剪贴板（clip.rs），记下写入后的序号。
+//!    等于我们自己最后一次写入后的序号 → 忽略；否则 100ms 防抖（SetTimer）后读取（剪贴板被占用则 200ms 后重试，最多 3 次）。
+//!    - 回声保护按内容（见 `ClipSync`）：记一个“两边已同步内容的摘要” synced——写入对方内容、或发出本机内容时更新；
+//!      本机采集到的内容摘要等于 synced 就不发（对方或本机有程序把同样内容再写一遍也不会来回）；本机出现别的内容
+//!      （包括敏感、超限、不支持的内容）时清掉。不设时间窗口、不限次数。写入的对方内容带 CanUploadToCloudClipboard = 0，
+//!      切断云剪贴板回路。
+//!    - 文字（≤ max_text_kb）→ 先 Out::CancelClip（让 net 丢掉待发的旧图片）再 hub.send(Msg::ClipText)；
+//!      超过 32 KiB（UTF-16）的大段文字和图片一样压缩后走 Out::ClipImage（format = CF_UNICODETEXT），不让大帧堵住键鼠消息。
+//!      文字超过 max_text_kb 直接跳过（不退而读图片），记一行限频日志。
+//!    - 图片（cfg.clipboard.images 且没有文字时；CF_DIBV5 优先，其次 CF_DIB；≤ max_image_mb）→ 交给唯一的、按需启动的
+//!      压缩工作线程（`submit`）：摘要、回声判断、CancelClip、分块 deflate（level 1，内容过时中途放弃）、Out::ClipImage。
+//!      工作线程只有“最新一条”的槽位，旧任务连同它的大缓冲直接丢弃；空闲 10 秒自己退出，空闲时不占内存。
+//!    - 没有连接、暂停共享或 cfg.clipboard.enabled = false 时不发；密码管理器标记的敏感内容
+//!      （含 CanUploadToCloudClipboard = 0）不发。
+//!    - 收到 ToDesktop::ClipText / ClipImage：每轮 drain 只应用最新一条（旧的直接丢弃，防大图片积压占内存）；
+//!      图片先校验 DIB 结构；写入后记下序号、Out::CancelClip（丢掉本机待发的旧图片和对方还在传的旧图片）；
+//!      剪贴板被占则只保留最新一条待写内容，定时器重试 3 次。
 //! 2. 托盘（tray-icon crate）：图标在代码里生成（32x32 RGBA：两个错开的圆角方块，连接时青色、断开时灰色）。
 //!    提示文字：“kmlink · 已连接 <对方名字>” / “kmlink · 等待连接”。菜单：
 //!      状态行（禁用项）、“屏幕排布与连接设置…”（启动 `<当前exe> settings`）、“暂停共享”（勾选项，hub.to_input(Pause)）、
@@ -16,13 +25,18 @@
 //!    菜单事件用 tray_icon::menu::MenuEvent::set_event_handler 转成本线程消息处理。
 //! 3. 显示器变化：WM_DISPLAYCHANGE（和 WM_SETTINGCHANGE 的 SPI_SETWORKAREA）→ 500ms 防抖后 sys::monitors()，
 //!    hub.to_input(LocalDesk) 并 hub.send(Msg::Hello{..}) 让对方更新。
-//! 4. 配置文件变化：每 1 秒看 config.toml 的修改时间；变了就 Config::load()，若成功：
-//!    写回 hub.cfg，hub.to_input(Config(..))；若 layout.rev 变了 → hub.send(Msg::Layout{.., rev})。这里从不写配置。
+//! 4. 配置文件变化：每 1 秒看 config.toml 的修改时间；变了且连续两次看到同一个值（防读到写了一半的文件）才 Config::load()；
+//!    成功才记下这个修改时间（失败下一秒重试），写回 hub.cfg，hub.to_input(Config(..))；
+//!    若 layout.rev 变了 → hub.send(Msg::Layout{.., rev})。这里从不写配置（托盘“开机自启”除外）。
 //! 5. ToDesktop::HideCursor / ShowCursor → cursor::hide / show。Status → 刷新托盘提示与图标。Quit → 退出循环。
+//! 6. 睡眠/注销：WM_POWERBROADCAST(PBT_APMSUSPEND)、WM_QUERYENDSESSION → hub.to_input(GoHome)；
+//!    WM_ENDSESSION（真要结束）→ 发 Quit 让主线程走正常退出（release_all、恢复光标、写完日志），在窗口过程里等它。
 //!
 //! 叫醒：hub 往隐藏窗口 PostMessage(WM_APP_WAKE)，窗口过程里 drain channel（托盘菜单的模态循环里也能收到）；
 //! 线程消息 WM_APP_WAKE（窗口登记前）和每秒的 TIMER_CONFIG 也会 drain 一次兜底。
-//! 6. first_run = true 时（刚生成了配置）：启动后直接打开设置窗口（`<当前exe> settings`）。
+//! first_run = true 时（刚生成了配置）：启动后直接打开设置窗口（`<当前exe> settings`）。
+//!
+//! 内存：空闲时这里不持有任何剪贴板内容，只留一个 u64 摘要；大缓冲（读出的图片、压缩结果、待写的对方内容）用完即释放。
 
 use crate::config::Config;
 use crate::geom::Desk;
@@ -30,11 +44,10 @@ use crate::hub::{Hub, Out, Status, ToDesktop, ToInput, WM_APP_WAKE};
 use crate::proto::{Msg, PROTO_VERSION};
 use crate::{clip, config, cursor, log, sys};
 use crossbeam_channel::{Receiver, unbounded};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -49,22 +62,35 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassW, SPI_SETWORKAREA, SW_SHOWNORMAL, SetTimer, WM_CLIPBOARDUPDATE,
-    WM_DISPLAYCHANGE, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+    PostQuitMessage, RegisterClassW, SPI_SETWORKAREA, SW_SHOWNORMAL, SetTimer, WM_CLIPBOARDUPDATE, WM_DISPLAYCHANGE,
+    WM_ENDSESSION, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
 const TIMER_CLIP: usize = 1;
 const TIMER_DISPLAY: usize = 2;
 const TIMER_CONFIG: usize = 3;
+const TIMER_WRITE: usize = 4;
 
 /// 剪贴板打不开时的重试：次数与间隔（毫秒）。
 const CLIP_RETRIES: u32 = 3;
 const CLIP_RETRY_MS: u32 = 200;
+/// 写入对方内容时剪贴板被占：重试次数与间隔（毫秒）。
+const WRITE_RETRIES: u32 = 3;
+const WRITE_RETRY_MS: u32 = 300;
 /// 超过这么多字节（UTF-16）的文字压缩后走低优先级分片通道。
 const BIG_TEXT: usize = 32 * 1024;
-/// 回声抑制的时间窗。
-const ECHO_WINDOW: Duration = Duration::from_secs(2);
+/// 压缩工作线程空闲这么久就退出。
+const WORKER_IDLE: Duration = Duration::from_secs(10);
+/// 分块压缩的块大小：每块之间看一次内容是否已过时。
+const DEFLATE_CHUNK: usize = 1024 * 1024;
+/// “内容太大/格式不对，不同步”类日志的最短间隔。
+const SKIP_LOG_EVERY: Duration = Duration::from_secs(60);
+/// 注销/关机时等主线程走完退出流程的上限。
+const END_WAIT: Duration = Duration::from_secs(3);
+/// WM_POWERBROADCAST 的“即将睡眠”（Win32_System_Power 里的常量，免得为它多开一个 feature）。
+const PBT_APMSUSPEND: usize = 4;
 
 const ICON_SIZE: u32 = 32;
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -74,10 +100,12 @@ thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     /// 我们自己最后一次写剪贴板后的序号（wndproc 不借 STATE 也能读）。
     static LAST_WRITE: Cell<Option<u32>> = const { Cell::new(None) };
+    /// 睡眠/注销处理用（重入时借不到 STATE 也要能发 GoHome）。
+    static HUB: OnceCell<Arc<Hub>> = const { OnceCell::new() };
 }
 
-/// 剪贴板“代次”：每次本机采集到新内容 +1；压缩中的旧图片发现代次变了就作废。
-static CLIP_GEN: AtomicU64 = AtomicU64::new(0);
+/// 剪贴板同步状态：桌面线程与压缩工作线程共用。
+static SYNC: Mutex<ClipSync> = Mutex::new(ClipSync::new());
 
 pub fn spawn(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
     let r = std::thread::Builder::new().name("desktop".into()).spawn(move || run(hub, rx, first_run));
@@ -86,42 +114,63 @@ pub fn spawn(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
     }
 }
 
-// ---------- 纯逻辑（可测试） ----------
-
-/// 回声抑制（自己写入引起的更新已按序号忽略，这里只挡短时间内的重复）：
-/// - 刚发出的内容 ECHO_WINDOW 内再出现不重发（有的程序会连写两次）；过了时间窗、或期间收到过对方内容，就照常发；
-/// - 刚收到并写入的内容 ECHO_WINDOW 内再出现（剪贴板工具重写一遍）不回发，只挡一次。
-#[derive(Default)]
-struct Echo {
-    sent: Option<(u64, Instant)>,
-    recv: Option<(u64, Instant)>,
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-impl Echo {
-    /// 本机采集到内容：返回是否应发送（并记下）。
-    fn should_send(&mut self, h: u64, now: Instant) -> bool {
-        let fresh = |t: Instant| now.saturating_duration_since(t) < ECHO_WINDOW;
-        if let Some((rh, t)) = self.recv.take() {
-            if rh == h && fresh(t) {
-                return false;
-            }
+fn sync<R>(f: impl FnOnce(&mut ClipSync) -> R) -> R {
+    f(&mut lock(&SYNC))
+}
+
+// ---------- 纯逻辑（可测试） ----------
+
+/// 按内容的回声保护 + 新旧判断。
+struct ClipSync {
+    /// 本机内容代次：本机采集到新内容、或收到对方内容时 +1；压缩中的旧任务据此作废。
+    generation: u64,
+    /// 两边已同步内容的摘要（None = 不能确定两边一样）。
+    synced: Option<u64>,
+    /// synced 的改动次数：对方图片写入后在工作线程里补算摘要，期间 synced 被别处改过就不再写回。
+    ver: u64,
+}
+
+impl ClipSync {
+    const fn new() -> ClipSync {
+        ClipSync { generation: 0, synced: None, ver: 0 }
+    }
+    /// 本机剪贴板有了新内容（任何种类）：返回新代次，之前的压缩任务作废。
+    fn local(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+    /// 两边不再一致（本机有了不同步的内容、对方内容没写入等）。
+    fn forget(&mut self) {
+        self.synced = None;
+        self.ver += 1;
+    }
+    /// 本机内容（代次 g、摘要 h）准备发出：代次已过时或两边已同步（回声）就不发；要发就记为已同步。
+    fn offer(&mut self, g: u64, h: u64) -> bool {
+        if g != self.generation || self.synced == Some(h) {
+            return false;
         }
-        if let Some((sh, t)) = self.sent {
-            if sh == h && fresh(t) {
-                return false;
-            }
-        }
-        self.sent = Some((h, now));
+        self.synced = Some(h);
+        self.ver += 1;
         true
     }
-    /// 收到对方内容：清掉“刚发出”，之后本机再复制同样内容也会发出。
-    fn received(&mut self, h: u64, now: Instant) {
-        self.sent = None;
-        self.recv = Some((h, now));
+    /// 收到对方内容、准备写入：本机压缩中的旧内容作废。返回当前 ver（写入成功后交给 `written`）。
+    fn incoming(&mut self) -> u64 {
+        self.generation += 1;
+        self.ver
     }
-    fn reset(&mut self) {
-        self.sent = None;
-        self.recv = None;
+    /// 对方内容已写入，摘要 h：期间 synced 没被改过才记为已同步。
+    fn written(&mut self, ver: u64, h: u64) {
+        if self.ver == ver {
+            self.synced = Some(h);
+            self.ver += 1;
+        }
+    }
+    fn current(&self, g: u64) -> bool {
+        self.generation == g
     }
 }
 
@@ -147,13 +196,215 @@ fn hash_text(s: &str) -> u64 {
     h.finish()
 }
 
+/// 图片摘要：结构正常的 DIB 只看尺寸、位深、颜色表和像素（不看头的版本和掩码），
+/// 这样 CF_DIB 与系统转换出的 CF_DIBV5 算作同一内容；结构不对的整段算。
 fn hash_image(format: u32, data: &[u8]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    1u8.hash(&mut h);
-    format.hash(&mut h);
-    data.hash(&mut h);
+    match clip::dib(data) {
+        Ok(d) => {
+            1u8.hash(&mut h);
+            (d.width, d.height, d.bit_count).hash(&mut h);
+            data[d.palette..d.bits].hash(&mut h);
+            data[d.bits..d.bits + d.bits_len].hash(&mut h);
+        }
+        Err(_) => {
+            2u8.hash(&mut h);
+            format.hash(&mut h);
+            data.hash(&mut h);
+        }
+    }
     h.finish()
 }
+
+fn is_clip(m: &ToDesktop) -> bool {
+    matches!(m, ToDesktop::ClipText(_) | ToDesktop::ClipImage { .. })
+}
+
+/// 一轮 drain：剪贴板消息（ClipText / ClipImage）只留最新一条，旧的当场丢弃（释放内存）；其余按原顺序。
+fn latest_clip(it: impl Iterator<Item = ToDesktop>) -> (Vec<ToDesktop>, Option<ToDesktop>) {
+    let mut rest = Vec::new();
+    let mut clip = None;
+    for m in it {
+        if is_clip(&m) {
+            clip = Some(m);
+        } else {
+            rest.push(m);
+        }
+    }
+    (rest, clip)
+}
+
+/// 配置文件修改时间：和已加载的一样 → 不动；变了要连续两次看到同一个值才加载（防读到写了一半的文件）。
+/// seen = 上次看到、还没加载的修改时间。返回是否该加载。
+fn cfg_due(loaded: Option<SystemTime>, seen: &mut Option<SystemTime>, now: Option<SystemTime>) -> bool {
+    if now.is_none() || now == loaded {
+        *seen = None;
+        return false;
+    }
+    if *seen != now {
+        *seen = now;
+        return false;
+    }
+    true
+}
+
+/// 限频：距上次至少 gap 才返回 true（并记下这次）。
+fn every(last: &mut Option<Instant>, now: Instant, gap: Duration) -> bool {
+    if last.is_some_and(|t| now.saturating_duration_since(t) < gap) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+/// 分块 deflate（raw deflate，和 miniz_oxide::deflate::compress_to_vec 同格式），每块之前问一次 `live`，
+/// 内容过时就中途放弃。输出缓冲按需增长（compress_to_vec 一上来就按输入的一半分配），最后收紧到实际大小。
+fn deflate_while(data: &[u8], live: impl Fn() -> bool) -> Option<Vec<u8>> {
+    use miniz_oxide::deflate::core::{CompressorOxide, TDEFLFlush, TDEFLStatus, compress, create_comp_flags_from_zip_params};
+    let mut c = CompressorOxide::new(create_comp_flags_from_zip_params(1, 0, 0));
+    let mut out: Vec<u8> = Vec::new();
+    let mut pos = 0;
+    let mut input = data;
+    loop {
+        if !live() {
+            return None;
+        }
+        let (chunk, flush) =
+            if input.len() > DEFLATE_CHUNK { (&input[..DEFLATE_CHUNK], TDEFLFlush::None) } else { (input, TDEFLFlush::Finish) };
+        if out.len() - pos < 128 * 1024 {
+            let grow = (out.len() / 2).max(256 * 1024);
+            out.resize(out.len() + grow, 0);
+        }
+        let (st, used, wrote) = compress(&mut c, chunk, &mut out[pos..], flush);
+        pos += wrote;
+        input = &input[used..];
+        match st {
+            TDEFLStatus::Done => break,
+            TDEFLStatus::Okay => {}
+            _ => return None,
+        }
+    }
+    out.truncate(pos);
+    out.shrink_to_fit();
+    Some(out)
+}
+
+// ---------- 压缩工作线程（唯一、按需启动、只保留最新任务） ----------
+
+/// 本机内容。
+enum Payload {
+    Text(String),
+    Image(Vec<u8>),
+}
+
+enum Job {
+    /// 本机采集到的图片 / 大段文字：摘要 → 回声判断 → CancelClip → 压缩 → Out::ClipImage。
+    Local { generation: u64, format: u32, data: Payload },
+    /// 刚写入的对方图片：补算摘要记为已同步，然后释放这份字节。
+    Written { ver: u64, format: u32, data: Vec<u8> },
+}
+
+/// 两个槽位各只留最新一条；Written 先做（它决定紧随其后的本机内容是不是回声）。
+struct Work {
+    written: Option<Job>,
+    local: Option<Job>,
+    running: bool,
+}
+
+static WORK: Mutex<Work> = Mutex::new(Work { written: None, local: None, running: false });
+static WORK_CV: Condvar = Condvar::new();
+
+fn submit(hub: &Arc<Hub>, job: Job) {
+    let mut w = lock(&WORK);
+    // 槽位里的旧任务直接替换掉，它的大缓冲随之释放
+    match job {
+        j @ Job::Written { .. } => w.written = Some(j),
+        j @ Job::Local { .. } => w.local = Some(j),
+    }
+    if w.running {
+        WORK_CV.notify_one();
+        return;
+    }
+    let h = hub.clone();
+    match std::thread::Builder::new().name("clip-work".into()).spawn(move || worker(h)) {
+        Ok(_) => w.running = true,
+        Err(e) => {
+            w.written = None;
+            w.local = None;
+            drop(w);
+            log!("启动剪贴板工作线程失败：{e}");
+        }
+    }
+}
+
+fn worker(hub: Arc<Hub>) {
+    loop {
+        let job = {
+            let mut w = lock(&WORK);
+            loop {
+                if let Some(j) = w.written.take() {
+                    break j;
+                }
+                if let Some(j) = w.local.take() {
+                    break j;
+                }
+                let (g, r) = WORK_CV.wait_timeout(w, WORKER_IDLE).unwrap_or_else(|e| e.into_inner());
+                w = g;
+                if r.timed_out() && w.written.is_none() && w.local.is_none() {
+                    // 空闲：退出，线程栈和压缩器都还给系统
+                    w.running = false;
+                    return;
+                }
+            }
+        };
+        run_job(&hub, job);
+    }
+}
+
+fn run_job(hub: &Hub, job: Job) {
+    match job {
+        Job::Written { ver, format, data } => {
+            let h = hash_image(format, &data);
+            drop(data);
+            sync(|s| s.written(ver, h));
+        }
+        Job::Local { generation, format, data } => {
+            let h = match &data {
+                Payload::Text(t) => hash_text(t),
+                Payload::Image(d) => hash_image(format, d),
+            };
+            // 回声判断与 CancelClip 在同一把锁里：先让 net 丢掉旧图片，再发新内容
+            let go = sync(|s| {
+                let ok = s.offer(generation, h);
+                if ok {
+                    hub.to_net(Out::CancelClip);
+                }
+                ok
+            });
+            if !go {
+                return;
+            }
+            let raw = match data {
+                Payload::Text(t) => clip::utf16le(&t),
+                Payload::Image(d) => d,
+            };
+            let Ok(raw_len) = u32::try_from(raw.len()) else { return };
+            let Some(deflated) = deflate_while(&raw, || sync(|s| s.current(generation))) else { return };
+            drop(raw);
+            if !hub.status().connected {
+                return;
+            }
+            // 检查与发送在同一把锁里：期间有了更新的内容就不发
+            sync(|s| {
+                if s.current(generation) {
+                    hub.to_net(Out::ClipImage { format, raw_len, deflated });
+                }
+            });
+        }
+    }
+}
+
+// ---------- 托盘（纯逻辑） ----------
 
 /// 托盘提示文字。
 fn tip_text(st: &Status) -> String {
@@ -303,6 +554,20 @@ struct Items {
     quit: MenuItem,
 }
 
+/// 对方发来、要写入本机剪贴板的内容。
+enum Incoming {
+    Text(String),
+    Image { format: u32, data: Vec<u8> },
+}
+
+/// 剪贴板被占、还没写进去的对方内容（只留最新一条）。
+struct PendingWrite {
+    what: Incoming,
+    /// 收到时 ClipSync 的 ver。
+    ver: u64,
+    tries: u32,
+}
+
 struct State {
     hub: Arc<Hub>,
     hwnd: HWND,
@@ -312,12 +577,18 @@ struct State {
     quitting: bool,
     tray: Option<TrayIcon>,
     items: Items,
-    echo: Echo,
     /// 上次处理过的剪贴板序号（同一序号不重复处理）。
     last_seq: Option<u32>,
     /// 剪贴板打不开时的重试：(序号, 已重试次数)。
     retry: Option<(u32, u32)>,
+    /// 待重试写入的对方内容。
+    pending: Option<PendingWrite>,
+    /// 上次“内容太大，不同步”日志的时间（限频）。
+    skip_log: Option<Instant>,
+    /// 已加载的配置文件修改时间 / 看到但还没加载的 / 上次解析失败的（同一个只报一次）。
     cfg_mtime: Option<SystemTime>,
+    cfg_seen: Option<SystemTime>,
+    cfg_bad: Option<SystemTime>,
     desk: Desk,
     /// 托盘上次显示的内容（变了才刷新）。
     shown: Option<(bool, String)>,
@@ -358,47 +629,45 @@ fn open_config_dir() {
     }
 }
 
-/// 压缩后交给 net（低优先级分片）。在工作线程里做，`make` 也在那里调用（比如文字转 UTF-16）。
-fn spawn_deflate(hub: Arc<Hub>, generation: u64, format: u32, make: impl FnOnce() -> Vec<u8> + Send + 'static) {
-    let r = std::thread::Builder::new().name("clip-deflate".into()).spawn(move || {
-        let data = make();
-        let Ok(raw_len) = u32::try_from(data.len()) else { return };
-        let deflated = miniz_oxide::deflate::compress_to_vec(&data, 1);
-        // 压缩期间又有新内容（本机或对方的）或断开了：作废
-        if CLIP_GEN.load(Ordering::SeqCst) != generation || !hub.status().connected {
-            return;
-        }
-        hub.to_net(Out::ClipImage { format, raw_len, deflated });
-    });
-    if let Err(e) = r {
-        log!("启动压缩线程失败：{e}");
-    }
-}
-
 impl State {
     /// drain 菜单事件和 ToDesktop；收到退出时 PostQuitMessage，由消息循环收尾。
     fn pump(&mut self) {
         while !self.quitting {
-            let ok = if let Ok(id) = self.mrx.try_recv() {
-                self.menu(&id)
-            } else if let Ok(m) = self.rx.try_recv() {
-                self.handle(m)
-            } else {
+            if let Ok(id) = self.mrx.try_recv() {
+                if !self.menu(&id) {
+                    self.quit();
+                }
+                continue;
+            }
+            let (rest, clip) = latest_clip(self.rx.try_iter());
+            if rest.is_empty() && clip.is_none() {
                 break;
-            };
-            if !ok {
-                self.quitting = true;
-                unsafe { PostQuitMessage(0) };
+            }
+            for m in rest {
+                if !self.handle(m) {
+                    self.quit();
+                    break;
+                }
+            }
+            if let Some(m) = clip
+                && !self.quitting
+            {
+                self.incoming(m);
             }
         }
+    }
+
+    fn quit(&mut self) {
+        self.quitting = true;
+        unsafe { PostQuitMessage(0) };
     }
 
     fn refresh_tray(&mut self) {
         let st = self.hub.status();
         if st.connected != self.connected {
             self.connected = st.connected;
-            // 连接变化后重新计算回声（对方剪贴板可能已变）
-            self.echo.reset();
+            // 连接变化：对方剪贴板可能已变，不再认为两边一致
+            sync(|s| s.forget());
         }
         self.items.pause.set_checked(st.paused);
         let tip = tip_text(&st);
@@ -429,25 +698,7 @@ impl State {
     /// 处理一条 ToDesktop；返回 false 表示退出。
     fn handle(&mut self, m: ToDesktop) -> bool {
         match m {
-            ToDesktop::ClipText(text) => self.apply_text(text),
-            // 大段文字：压缩通道送来的 UTF-16 LE
-            ToDesktop::ClipImage { format: clip::CF_UNICODETEXT, data } => self.apply_text(clip::from_utf16le(&data)),
-            ToDesktop::ClipImage { format, data } => {
-                let c = self.hub.cfg();
-                if !c.clipboard.enabled || !c.clipboard.images || self.hub.status().paused {
-                    return true;
-                }
-                // 本机还在压缩的旧内容作废
-                CLIP_GEN.fetch_add(1, Ordering::SeqCst);
-                self.echo.received(hash_image(format, &data), Instant::now());
-                match clip::write_image(self.hwnd, format, &data) {
-                    Some(seq) => {
-                        LAST_WRITE.with(|w| w.set(Some(seq)));
-                        self.last_seq = Some(seq);
-                    }
-                    None => log!("写剪贴板图片失败（{} 字节）", data.len()),
-                }
-            }
+            m @ (ToDesktop::ClipText(_) | ToDesktop::ClipImage { .. }) => self.incoming(m),
             ToDesktop::HideCursor => cursor::hide(),
             ToDesktop::ShowCursor => cursor::show(),
             ToDesktop::Status => self.refresh_tray(),
@@ -456,23 +707,100 @@ impl State {
         true
     }
 
-    /// 写入对方发来的文字。
-    fn apply_text(&mut self, text: String) {
+    /// 对方发来的剪贴板内容：校验后写入（剪贴板被占则稍后重试）。
+    fn incoming(&mut self, m: ToDesktop) {
         let c = self.hub.cfg();
         let max_text = c.clipboard.max_text_kb as usize * 1024;
-        if !c.clipboard.enabled || text.is_empty() || text.len() > max_text || self.hub.status().paused {
+        let what = if !c.clipboard.enabled || self.hub.status().paused {
+            None
+        } else {
+            match m {
+                ToDesktop::ClipText(t) => Some(Incoming::Text(t)),
+                // 大段文字：压缩通道送来的 UTF-16 LE
+                ToDesktop::ClipImage { format: clip::CF_UNICODETEXT, data } => Some(Incoming::Text(clip::from_utf16le(&data))),
+                ToDesktop::ClipImage { format, data }
+                    if c.clipboard.images && (format == clip::CF_DIB || format == clip::CF_DIBV5) =>
+                {
+                    match clip::dib(&data) {
+                        Ok(_) => Some(Incoming::Image { format, data }),
+                        Err(e) => {
+                            log!("对方发来的图片不对（{e}，{} 字节），丢弃", data.len());
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        };
+        let what = what.filter(|w| match w {
+            Incoming::Text(t) => !t.is_empty() && t.len() <= max_text,
+            Incoming::Image { .. } => true,
+        });
+        // 有了更新的对方内容：之前没写进去的那条作废
+        self.drop_pending();
+        let Some(what) = what else {
+            // 对方剪贴板变了而本机没跟上：两边不再一致
+            sync(|s| s.forget());
             return;
-        }
-        // 本机还在压缩的旧内容作废
-        CLIP_GEN.fetch_add(1, Ordering::SeqCst);
-        self.echo.received(hash_text(&text), Instant::now());
-        match clip::write_text(self.hwnd, &text) {
-            Some(seq) => {
+        };
+        let ver = sync(|s| s.incoming());
+        self.try_write(PendingWrite { what, ver, tries: 0 });
+    }
+
+    /// 写入对方内容；剪贴板被占则留着，定时器重试。
+    fn try_write(&mut self, mut p: PendingWrite) {
+        let r = match &p.what {
+            Incoming::Text(t) => clip::write_text(self.hwnd, t),
+            Incoming::Image { format, data } => clip::write_image(self.hwnd, *format, data),
+        };
+        match r {
+            Ok(seq) => {
                 LAST_WRITE.with(|w| w.set(Some(seq)));
                 self.last_seq = Some(seq);
+                // 对方内容已到位：本机待发的旧图片、对方还在传的旧图片都不要了
+                self.hub.to_net(Out::CancelClip);
+                match p.what {
+                    Incoming::Text(t) => {
+                        let h = hash_text(&t);
+                        sync(|s| s.written(p.ver, h));
+                    }
+                    // 图片摘要在工作线程里算（不卡消息循环），算完这份字节就释放
+                    Incoming::Image { format, data } => submit(&self.hub, Job::Written { ver: p.ver, format, data }),
+                }
             }
-            None => log!("写剪贴板文字失败"),
+            Err(clip::WriteError::Busy) if p.tries < WRITE_RETRIES => {
+                p.tries += 1;
+                self.pending = Some(p);
+                unsafe {
+                    SetTimer(Some(self.hwnd), TIMER_WRITE, WRITE_RETRY_MS, None);
+                }
+            }
+            Err(e) => {
+                let what = match &p.what {
+                    Incoming::Text(t) => format!("文字 {} 字节", t.len()),
+                    Incoming::Image { data, .. } => format!("图片 {} 字节", data.len()),
+                };
+                log!("写剪贴板失败（{what}，{e:?}），放弃");
+                sync(|s| s.forget());
+            }
         }
+    }
+
+    fn drop_pending(&mut self) {
+        if self.pending.take().is_some() {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_WRITE);
+            }
+        }
+    }
+
+    /// 本机有了不同步的内容：待写的对方内容作废（本机的更新），两边不再一致。
+    fn local_other(&mut self) {
+        self.drop_pending();
+        sync(|s| {
+            s.local();
+            s.forget();
+        });
     }
 
     /// 菜单事件；返回 false 表示退出。
@@ -532,6 +860,14 @@ impl State {
                 // 兜底：万一叫醒消息丢了
                 self.pump();
             }
+            TIMER_WRITE => {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_WRITE);
+                }
+                if let Some(p) = self.pending.take() {
+                    self.try_write(p);
+                }
+            }
             _ => {}
         }
     }
@@ -544,6 +880,10 @@ impl State {
         let c = self.hub.cfg();
         let st = self.hub.status();
         if !c.clipboard.enabled || !st.connected || st.paused {
+            // 不同步，但要记下本机有了别的内容
+            self.retry = None;
+            self.last_seq = Some(seq);
+            self.local_other();
             return;
         }
         let max_text = c.clipboard.max_text_kb as usize * 1024;
@@ -563,6 +903,7 @@ impl State {
                         log!("剪贴板一直被占用，放弃这次同步");
                         self.retry = None;
                         self.last_seq = Some(seq);
+                        self.local_other();
                     }
                 }
                 return;
@@ -571,25 +912,37 @@ impl State {
         self.retry = None;
         self.last_seq = Some(seq);
         match content {
-            Some(clip::Content::Text(text)) => {
-                if !self.echo.should_send(hash_text(&text), Instant::now()) {
+            clip::Content::Text(text) if !is_big_text(&text) => {
+                let h = hash_text(&text);
+                // 两边已一致（回声）：不发；待写的对方内容也照常写
+                if !sync(|s| {
+                    let g = s.local();
+                    s.offer(g, h)
+                }) {
                     return;
                 }
-                let generation = CLIP_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-                if is_big_text(&text) {
-                    spawn_deflate(self.hub.clone(), generation, clip::CF_UNICODETEXT, move || clip::utf16le(&text));
-                } else {
-                    self.hub.send(Msg::ClipText { text });
-                }
+                self.drop_pending();
+                // 先让 net 丢掉还没发完的旧图片，再发新内容
+                self.hub.to_net(Out::CancelClip);
+                self.hub.send(Msg::ClipText { text });
             }
-            Some(clip::Content::Image { format, data }) => {
-                if !self.echo.should_send(hash_image(format, &data), Instant::now()) {
-                    return;
-                }
-                let generation = CLIP_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-                spawn_deflate(self.hub.clone(), generation, format, move || data);
+            clip::Content::Text(text) => {
+                let generation = sync(|s| s.local());
+                self.drop_pending();
+                submit(&self.hub, Job::Local { generation, format: clip::CF_UNICODETEXT, data: Payload::Text(text) });
             }
-            None => {}
+            clip::Content::Image { format, data } => {
+                let generation = sync(|s| s.local());
+                self.drop_pending();
+                submit(&self.hub, Job::Local { generation, format, data: Payload::Image(data) });
+            }
+            clip::Content::TooBig { image, size } => {
+                if every(&mut self.skip_log, Instant::now(), SKIP_LOG_EVERY) {
+                    log!("剪贴板{}太大（约 {} KB），不同步", if image { "图片" } else { "文字" }, size / 1024);
+                }
+                self.local_other();
+            }
+            clip::Content::Concealed | clip::Content::Other => self.local_other(),
         }
     }
 
@@ -607,14 +960,20 @@ impl State {
 
     fn check_config(&mut self) {
         let m = cfg_mtime(&self.hub.cfg_path);
-        if m.is_none() || m == self.cfg_mtime {
+        if !cfg_due(self.cfg_mtime, &mut self.cfg_seen, m) {
             return;
         }
-        self.cfg_mtime = m;
         let Some(c) = Config::load() else {
-            log!("config.toml 读取/解析失败，忽略这次修改");
+            // 不记修改时间：下一秒再试（同一个版本只报一次）
+            if self.cfg_bad != m {
+                self.cfg_bad = m;
+                log!("config.toml 读取/解析失败，稍后重试");
+            }
             return;
         };
+        self.cfg_mtime = m;
+        self.cfg_seen = None;
+        self.cfg_bad = None;
         log!("配置文件已变化，重新加载");
         let old = self.hub.cfg();
         if let Ok(mut g) = self.hub.cfg.write() {
@@ -635,6 +994,35 @@ impl State {
             self.items.autostart.set_checked(autostart_get().is_some());
         }
     }
+}
+
+// ---------- 睡眠 / 注销 ----------
+
+fn go_home(why: &str) {
+    HUB.with(|h| {
+        if let Some(hub) = h.get() {
+            log!("{why}：回到本机");
+            hub.to_input(ToInput::GoHome);
+        }
+    });
+}
+
+/// 会话真的要结束（注销/关机/安装程序要求退出）：窗口过程一返回系统就可能结束进程，
+/// 所以在这里发 Quit 让主线程走正常退出（release_all、恢复光标、写完日志、结束进程），并等它。
+fn end_session() {
+    let Some(hub) = HUB.with(|h| h.get().cloned()) else { return };
+    log!("系统注销/关机：退出");
+    // 先移除托盘图标（借不到状态就算了）
+    let _ = with_state(|s| s.tray = None);
+    hub.to_input(ToInput::GoHome);
+    hub.to_input(ToInput::Quit);
+    let end = Instant::now() + END_WAIT;
+    while Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // 主线程没走完：至少恢复光标、写完日志
+    cursor::show();
+    log::flush(300);
 }
 
 // ---------- 窗口与消息循环 ----------
@@ -663,6 +1051,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
             }
             unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+        WM_POWERBROADCAST => {
+            if wp.0 == PBT_APMSUSPEND {
+                go_home("系统即将睡眠");
+            }
+            LRESULT(1)
+        }
+        WM_QUERYENDSESSION => {
+            go_home("系统即将注销/关机");
+            LRESULT(1)
+        }
+        WM_ENDSESSION => {
+            if wp.0 != 0 {
+                end_session();
+            }
+            LRESULT(0)
         }
         WM_TIMER => {
             // 借不到状态（重入）时不处理：一次性定时器没被 Kill，下个周期再来
@@ -748,6 +1152,9 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
         return;
     };
     let tid = unsafe { GetCurrentThreadId() };
+    HUB.with(|h| {
+        let _ = h.set(hub.clone());
+    });
 
     unsafe {
         if let Err(e) = AddClipboardFormatListener(hwnd) {
@@ -788,10 +1195,13 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
         quitting: false,
         tray,
         items,
-        echo: Echo::default(),
         last_seq: Some(clip::seq()), // 启动前已有的剪贴板内容不发
         retry: None,
+        pending: None,
+        skip_log: None,
         cfg_mtime: cfg_mtime(&hub.cfg_path),
+        cfg_seen: None,
+        cfg_bad: None,
         desk: sys::monitors(),
         shown: Some((st.connected, tip_text(&st))),
         connected: st.connected,
@@ -834,6 +1244,7 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
         let _ = KillTimer(Some(hwnd), TIMER_CONFIG);
         let _ = KillTimer(Some(hwnd), TIMER_CLIP);
         let _ = KillTimer(Some(hwnd), TIMER_DISPLAY);
+        let _ = KillTimer(Some(hwnd), TIMER_WRITE);
     }
     let state = STATE.with(|s| s.borrow_mut().take());
     drop(state); // 托盘图标随之移除
@@ -846,33 +1257,162 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clip::tests::make_dib;
 
     #[test]
-    fn echo_suppression() {
-        let mut e = Echo::default();
-        let a = hash_text("a");
-        let b = hash_text("b");
-        let t0 = Instant::now();
-        let ms = |n: u64| t0 + Duration::from_millis(n);
-        assert!(e.should_send(a, t0));
-        assert!(!e.should_send(a, ms(100))); // 刚发过的不重发
-        assert!(e.should_send(a, ms(3000))); // 过了时间窗：用户再复制一次，照发
-        e.received(b, ms(3100));
-        assert!(!e.should_send(b, ms(3200))); // 刚收到的不回发
-        assert!(e.should_send(b, ms(3300))); // 只挡一次
-        // 收到对方内容后，本机马上再复制刚发过的内容也要发
-        assert!(e.should_send(a, ms(4000)));
-        e.received(b, ms(4100));
-        assert!(e.should_send(a, ms(4200)));
-        // 收到的内容过了时间窗才出现：照发
-        e.received(b, ms(5000));
-        assert!(e.should_send(b, ms(8000)));
-        e.received(b, ms(9000));
-        e.reset();
-        assert!(e.should_send(b, ms(9100)));
-        // 文字与图片摘要不同
+    fn echo_by_content() {
+        let mut s = ClipSync::new();
+        let (a, b, c) = (hash_text("a"), hash_text("b"), hash_text("c"));
+        // 本机复制 a：发出
+        let g = s.local();
+        assert!(s.offer(g, a));
+        // 本机有程序把 a 再写一遍（任意次、任意时间）：不发
+        for _ in 0..5 {
+            let g = s.local();
+            assert!(!s.offer(g, a));
+        }
+        // 收到对方 b 并写入；对方或本机程序把 b 再写回来：不回发
+        let v = s.incoming();
+        s.written(v, b);
+        for _ in 0..5 {
+            let g = s.local();
+            assert!(!s.offer(g, b));
+        }
+        // 用户再复制 a：和已同步的不同，发出
+        let g = s.local();
+        assert!(s.offer(g, a));
+        // 本机出现敏感内容等不同步的东西：清掉；之后再复制 a 也要发
+        s.local();
+        s.forget();
+        let g = s.local();
+        assert!(s.offer(g, a));
+        // 对方内容没写入（暂停、太大）：两边不一致，再复制 a 照发
+        s.incoming();
+        s.forget();
+        let g = s.local();
+        assert!(s.offer(g, a));
+        // 过时的代次（压缩期间又有新内容）不发
+        let g1 = s.local();
+        let g2 = s.local();
+        assert!(!s.offer(g1, c));
+        assert!(s.offer(g2, c));
+        assert!(!s.current(g1));
+    }
+
+    #[test]
+    fn echo_pending_image_digest() {
+        let mut s = ClipSync::new();
+        let (img, t) = (hash_image(8, &[1, 2, 3]), hash_text("t"));
+        // 写入对方图片后，摘要在工作线程里补算；期间本机程序把同一图片再写一遍（代次变了）
+        let v = s.incoming();
+        let g = s.local();
+        s.written(v, img); // 工作线程先做 Written
+        assert!(!s.offer(g, img)); // 再判断本机内容：回声，不发
+        // 补算期间本机已复制了新文字：迟到的摘要不能覆盖
+        let v = s.incoming();
+        let g = s.local();
+        assert!(s.offer(g, t));
+        s.written(v, img);
+        let g = s.local();
+        assert!(!s.offer(g, t)); // synced 仍是 t
+        // 收到对方内容：本机压缩中的旧内容作废
+        let g = s.local();
+        s.incoming();
+        assert!(!s.current(g));
+    }
+
+    #[test]
+    fn image_digest_ignores_header_version() {
+        let dib = make_dib(40, 2, 2, 32, 0, 0, 0, 16);
+        let v5 = make_dib(124, 2, 2, 32, 3, 0, 0, 16);
+        assert_eq!(hash_image(clip::CF_DIB, &dib), hash_image(clip::CF_DIBV5, &v5));
+        let other = make_dib(40, 2, -2, 32, 0, 0, 0, 16);
+        assert_ne!(hash_image(clip::CF_DIB, &dib), hash_image(clip::CF_DIB, &other));
+        let mut px = dib.clone();
+        px[45] ^= 1;
+        assert_ne!(hash_image(clip::CF_DIB, &dib), hash_image(clip::CF_DIB, &px));
+        // 文字与图片摘要不同；结构不对的按整段算
         assert_ne!(hash_text("x"), hash_image(8, b"x"));
         assert_ne!(hash_image(8, b"x"), hash_image(17, b"x"));
+    }
+
+    #[test]
+    fn keeps_only_latest_clip() {
+        let msgs = vec![
+            ToDesktop::ClipText("old".into()),
+            ToDesktop::Status,
+            ToDesktop::ClipImage { format: 8, data: vec![0; 1000] },
+            ToDesktop::HideCursor,
+            ToDesktop::ClipText("new".into()),
+            ToDesktop::Quit,
+        ];
+        let (rest, clip) = latest_clip(msgs.into_iter());
+        assert!(matches!(clip, Some(ToDesktop::ClipText(ref t)) if t == "new"));
+        assert_eq!(rest.len(), 3);
+        assert!(matches!(rest[0], ToDesktop::Status));
+        assert!(matches!(rest[1], ToDesktop::HideCursor));
+        assert!(matches!(rest[2], ToDesktop::Quit));
+        // 最新的是图片
+        let (rest, clip) = latest_clip(
+            vec![ToDesktop::ClipText("a".into()), ToDesktop::ClipImage { format: 17, data: vec![1] }].into_iter(),
+        );
+        assert!(rest.is_empty());
+        assert!(matches!(clip, Some(ToDesktop::ClipImage { format: 17, .. })));
+        let (rest, clip) = latest_clip(vec![ToDesktop::Status].into_iter());
+        assert_eq!(rest.len(), 1);
+        assert!(clip.is_none());
+    }
+
+    #[test]
+    fn config_mtime_must_settle() {
+        let t = |s: u64| Some(SystemTime::UNIX_EPOCH + Duration::from_secs(s));
+        let mut seen = None;
+        // 没变
+        assert!(!cfg_due(t(1), &mut seen, t(1)));
+        // 变了：第一次只记下
+        assert!(!cfg_due(t(1), &mut seen, t(2)));
+        // 又变了（还在写）：重新等
+        assert!(!cfg_due(t(1), &mut seen, t(3)));
+        // 连续两次一样：加载
+        assert!(cfg_due(t(1), &mut seen, t(3)));
+        // 加载失败（调用方不更新 loaded）：下一秒再试
+        assert!(cfg_due(t(1), &mut seen, t(3)));
+        // 加载成功后与已加载的一样：不动
+        assert!(!cfg_due(t(3), &mut seen, t(3)));
+        assert_eq!(seen, None);
+        // 文件不见了
+        assert!(!cfg_due(t(3), &mut seen, None));
+    }
+
+    #[test]
+    fn rate_limit() {
+        let t0 = Instant::now();
+        let mut last = None;
+        assert!(every(&mut last, t0, Duration::from_secs(60)));
+        assert!(!every(&mut last, t0 + Duration::from_secs(10), Duration::from_secs(60)));
+        assert!(every(&mut last, t0 + Duration::from_secs(61), Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn chunked_deflate() {
+        // 3.5 块：有重复也有变化
+        let data: Vec<u8> = (0..DEFLATE_CHUNK * 7 / 2).map(|i| ((i / 7) ^ (i >> 12)) as u8).collect();
+        let z = deflate_while(&data, || true).unwrap();
+        assert!(z.len() < data.len());
+        assert_eq!(z.capacity(), z.len());
+        assert_eq!(miniz_oxide::inflate::decompress_to_vec(&z).unwrap(), data);
+        // 空输入
+        let z = deflate_while(&[], || true).unwrap();
+        assert!(miniz_oxide::inflate::decompress_to_vec(&z).unwrap().is_empty());
+        // 内容过时：中途放弃
+        let n = std::cell::Cell::new(0);
+        assert!(
+            deflate_while(&data, || {
+                n.set(n.get() + 1);
+                n.get() < 2
+            })
+            .is_none()
+        );
     }
 
     #[test]

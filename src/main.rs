@@ -26,10 +26,8 @@ mod settings;
 mod sys;
 
 use std::sync::Arc;
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
 use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole};
-use windows::Win32::System::Threading::CreateMutexW;
 use windows::core::w;
 
 fn main() {
@@ -69,15 +67,13 @@ fn daemon(with_console: bool) {
     sys::dpi_aware();
     log::init("kmlink");
 
-    // 只允许一个实例
+    // 只允许一个实例（另一个以管理员身份运行时也算）
+    if sys::already_running(w!("Local\\kmlink-daemon"), true) {
+        log!("已经在运行，退出");
+        log::flush(500);
+        return;
+    }
     unsafe {
-        let _m = CreateMutexW(None, true, w!("Local\\kmlink-daemon"));
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            log!("已经在运行，退出");
-            log::flush(500);
-            return;
-        }
-        std::mem::forget(_m);
         let _ = timeBeginPeriod(1);
     }
 

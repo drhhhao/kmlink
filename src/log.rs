@@ -1,4 +1,4 @@
-//! 极简日志：写 %APPDATA%\kmlink\<name>.log（超过 2 MB 轮转为 <name>.old.log），带 --console 时同时打到控制台。
+//! 极简日志：写 %APPDATA%\kmlink\<name>.log（超过 2 MB 轮转为 <name>.old.log；改名失败就截断当前文件），带 --console 时同时打到控制台。
 //! `log!` 不阻塞：只格式化后放进 channel，后台线程做文件/控制台 IO。init 之前的日志先缓存在 channel 里。
 //! 仍然不要在钩子回调里打日志（格式化也要时间）。
 
@@ -7,6 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 pub static CONSOLE: AtomicBool = AtomicBool::new(false);
 const MAX: u64 = 2 * 1024 * 1024;
@@ -41,24 +42,47 @@ struct Out {
     old: PathBuf,
     file: Option<std::fs::File>,
     size: u64,
+    /// 文件打不开（或满了又截断不了）时，到这个时间再试。
+    reopen_at: Option<Instant>,
 }
 
+/// 打不开/截断不了时多久后再试。
+const REOPEN_AFTER: Duration = Duration::from_secs(30);
+
 impl Out {
+    fn new(cur: PathBuf, old: PathBuf) -> Out {
+        Out { cur, old, file: None, size: 0, reopen_at: None }
+    }
+
     fn open(&mut self) {
         self.file = std::fs::OpenOptions::new().create(true).append(true).open(&self.cur).ok();
         self.size = std::fs::metadata(&self.cur).map(|m| m.len()).unwrap_or(0);
+        self.reopen_at = self.file.is_none().then(|| Instant::now() + REOPEN_AFTER);
     }
 
     fn rotate_if_big(&mut self) {
+        if self.size <= MAX {
+            return;
+        }
+        self.file = None;
+        let _ = std::fs::remove_file(&self.old);
+        if std::fs::rename(&self.cur, &self.old).is_err() {
+            // 改名失败（别的程序打开了它且不许删除/改名）：截断当前文件，免得无限增长
+            let _ = std::fs::OpenOptions::new().write(true).truncate(true).open(&self.cur);
+        }
+        self.open();
         if self.size > MAX {
+            // 截断也不行：先不写，过一会儿再试
             self.file = None;
-            let _ = std::fs::remove_file(&self.old);
-            let _ = std::fs::rename(&self.cur, &self.old);
-            self.open();
+            self.reopen_at = Some(Instant::now() + REOPEN_AFTER);
         }
     }
 
     fn write(&mut self, s: &str) {
+        if self.file.is_none() && self.reopen_at.is_none_or(|t| Instant::now() >= t) {
+            self.open();
+            self.rotate_if_big();
+        }
         if let Some(f) = self.file.as_mut()
             && f.write_all(s.as_bytes()).is_ok()
         {
@@ -68,7 +92,7 @@ impl Out {
 }
 
 fn writer(rx: Receiver<String>, cur: PathBuf, old: PathBuf) {
-    let mut o = Out { cur, old, file: None, size: 0 };
+    let mut o = Out::new(cur, old);
     o.open();
     o.rotate_if_big();
     while let Ok(first) = rx.recv() {
@@ -141,7 +165,7 @@ mod tests {
         let old = dir.join("t.old.log");
         let _ = std::fs::remove_file(&cur);
         let _ = std::fs::remove_file(&old);
-        let mut o = Out { cur: cur.clone(), old: old.clone(), file: None, size: 0 };
+        let mut o = Out::new(cur.clone(), old.clone());
         o.open();
         o.write("abc\n");
         o.size = MAX + 1; // 模拟写满
@@ -152,6 +176,35 @@ mod tests {
         drop(o);
         assert_eq!(std::fs::read_to_string(&cur).unwrap(), "x\n");
         assert_eq!(std::fs::read_to_string(&old).unwrap(), "abc\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncates_when_rename_fails() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("kmlink-logtest2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cur = dir.join("t.log");
+        let old = dir.join("t.old.log");
+        let _ = std::fs::remove_file(&cur);
+        let _ = std::fs::remove_file(&old);
+        let mut o = Out::new(cur.clone(), old.clone());
+        o.open();
+        o.write("abc
+");
+        // 别的程序以“共享读写、不共享删除”打开：改名会失败
+        let holder = std::fs::OpenOptions::new().read(true).share_mode(1 | 2).open(&cur).unwrap();
+        o.size = MAX + 1;
+        o.rotate_if_big();
+        assert!(!old.exists());
+        assert_eq!(o.size, 0);
+        assert!(o.file.is_some());
+        o.write("x
+");
+        drop(o);
+        drop(holder);
+        assert_eq!(std::fs::read_to_string(&cur).unwrap(), "x
+");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,10 +1,15 @@
 //! 少量公用的 Win32 小工具。
 
 use crate::geom::{Desk, Rect};
-use windows::Win32::Foundation::{LPARAM, RECT};
+#[cfg(test)]
+use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_HANDLE, GetLastError, LPARAM, RECT, WIN32_ERROR,
+};
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
-use windows::core::BOOL;
+use windows::core::{BOOL, PCWSTR};
 
 /// 必须在创建任何窗口之前调用：之后所有坐标都是物理像素。
 pub fn dpi_aware() {
@@ -37,4 +42,43 @@ pub fn monitors() -> Desk {
 /// UTF-16 + 结尾 0。
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 单实例：创建命名互斥量 name，已有同名的返回 true（本进程该退出）。
+/// 另一个实例以管理员身份运行时，普通权限打开它会被拒绝访问（ERROR_ACCESS_DENIED），也算“已在运行”。
+/// 句柄不关，进程结束时系统回收。
+pub fn already_running(name: PCWSTR, own: bool) -> bool {
+    let (created, err) = unsafe {
+        match CreateMutexW(None, own, name) {
+            Ok(_) => (true, GetLastError()),
+            Err(e) => (false, WIN32_ERROR::from_error(&e).unwrap_or(ERROR_INVALID_HANDLE)),
+        }
+    };
+    if !created && err != ERROR_ACCESS_DENIED {
+        crate::log!("创建互斥量失败：{}", err.0);
+    }
+    mutex_taken(created, err)
+}
+
+/// 互斥量是否已被别的实例占着：创建成功但已存在，或者没权限打开。
+fn mutex_taken(created: bool, err: WIN32_ERROR) -> bool {
+    if created { err == ERROR_ALREADY_EXISTS } else { err == ERROR_ACCESS_DENIED }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_instance_rules() {
+        assert!(!mutex_taken(true, ERROR_SUCCESS));
+        assert!(mutex_taken(true, ERROR_ALREADY_EXISTS));
+        assert!(mutex_taken(false, ERROR_ACCESS_DENIED));
+        // 其它失败：照常运行
+        assert!(!mutex_taken(false, ERROR_INVALID_HANDLE));
+        // 真实互斥量：同一进程再建一次也是“已存在”
+        let name = wide(&format!("Local\\kmlink-test-{}", std::process::id()));
+        assert!(!already_running(PCWSTR(name.as_ptr()), false));
+        assert!(already_running(PCWSTR(name.as_ptr()), false));
+    }
 }
