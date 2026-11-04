@@ -496,7 +496,7 @@ impl State {
         self.desk = d.clone();
         self.hub.to_input(ToInput::LocalDesk(d.clone()));
         let c = self.hub.cfg();
-        self.hub.send(Msg::Hello { ver: PROTO_VERSION, name: c.name, monitors: d.monitors, udp_port: c.port });
+        self.hub.send(Msg::Hello { ver: PROTO_VERSION, name: c.name, monitors: d.monitors, udp_port: c.port, id: crate::proto::instance_id() });
     }
 
     fn check_config(&mut self) {
@@ -521,7 +521,7 @@ impl State {
         }
         if c.name != old.name || c.port != old.port {
             let d = self.desk.clone();
-            self.hub.send(Msg::Hello { ver: PROTO_VERSION, name: c.name.clone(), monitors: d.monitors, udp_port: c.port });
+            self.hub.send(Msg::Hello { ver: PROTO_VERSION, name: c.name.clone(), monitors: d.monitors, udp_port: c.port, id: crate::proto::instance_id() });
         }
         if c.autostart != old.autostart {
             autostart_set(c.autostart);

@@ -39,7 +39,15 @@ pub enum Button {
 #[serde(tag = "type")]
 pub enum Msg {
     /// 连接建立后双方各发一次；显示器变化时重发。
-    Hello { ver: u32, name: String, monitors: Vec<Rect>, udp_port: u16 },
+    /// id：本进程启动时随机生成（`instance_id()`），用来发现“连到了自己”。
+    Hello {
+        ver: u32,
+        name: String,
+        monitors: Vec<Rect>,
+        udp_port: u16,
+        #[serde(default)]
+        id: u64,
+    },
     /// 排布（从发送方的角度）。接收方若 rev 更新，则镜像后保存。
     Layout { side: Side, offset: i32, scale: f64, rev: u64 },
     /// 控制端接管：把光标放到 (x, y)（接收方坐标）。epoch 每次接管 +1。
@@ -51,8 +59,10 @@ pub enum Msg {
     Wheel { epoch: u32, x: i32, y: i32, delta: i32, horizontal: bool },
     /// 扫描码 + 扩展键标志；scan 为 0 时用 vk。
     Key { epoch: u32, scan: u16, ext: bool, vk: u16, down: bool },
-    /// 被控端本地有人动了鼠标/键盘：请控制端放手。
+    /// 被控端本地有人动了鼠标/键盘（或被控端处于暂停）：请控制端放手。
     Yield,
+    /// UDP 不可用（绑定失败/还没学到对方地址）时，鼠标位置改走可靠通道。语义同 UdpMsg::Move。
+    Move { epoch: u32, seq: u32, x: i32, y: i32 },
     ClipText { text: String },
     /// 剪贴板图片开始：之后跟 total 字节的 FRAME_CHUNK（deflate 压缩后的 CF_DIB/CF_DIBV5 数据）。
     ClipImage { id: u32, format: u32, total: u32, raw_len: u32 },
@@ -95,6 +105,16 @@ impl UdpMsg {
             _ => None,
         }
     }
+}
+
+/// 本进程的随机 id（Hello 里带上；收到的 Hello.id 等于它说明连到了自己）。
+pub fn instance_id() -> u64 {
+    static ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| {
+        let mut b = [0u8; 8];
+        let _ = getrandom::fill(&mut b);
+        u64::from_le_bytes(b) | 1
+    })
 }
 
 pub fn encode_msg(m: &Msg) -> Vec<u8> {

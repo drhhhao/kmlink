@@ -30,6 +30,8 @@ type KeyId = (u16, bool, u16);
 
 #[derive(Default)]
 struct Inner {
+    /// 当前会话号（net 的 Session.id）。旧会话的读线程晚到的消息一律忽略。
+    sid: u64,
     epoch: u32,
     active: bool,
     /// 当前 epoch 内收到的最大 Move seq。
@@ -43,6 +45,10 @@ impl Inner {
     /// 本条消息属于当前接管吗？
     fn current(&self, epoch: u32) -> bool {
         self.active && epoch == self.epoch
+    }
+
+    fn session(&self, sid: u64) -> bool {
+        self.sid == sid
     }
 
     /// 记录按键状态（没见过按下的抬起照样注入，无害）。
@@ -98,9 +104,12 @@ impl Injector {
     }
 
     /// 对方接管：光标放到 (x, y)。
-    pub fn enter(&self, epoch: u32, x: i32, y: i32) {
+    pub fn enter(&self, sid: u64, epoch: u32, x: i32, y: i32) {
         {
             let mut g = self.lock();
+            if !g.session(sid) {
+                return;
+            }
             // 上一次接管没正常结束：先把残留的按键抬起来
             if g.active && g.epoch != epoch {
                 release(&mut g);
@@ -115,10 +124,10 @@ impl Injector {
     }
 
     /// 对方放手：抬起所有按着的键和按钮。
-    pub fn leave(&self, epoch: u32) {
+    pub fn leave(&self, sid: u64, epoch: u32) {
         {
             let mut g = self.lock();
-            if !g.current(epoch) {
+            if !g.session(sid) || !g.current(epoch) {
                 return;
             }
             release(&mut g);
@@ -129,43 +138,62 @@ impl Injector {
     }
 
     /// UDP 来的绝对位置。
-    pub fn moved(&self, epoch: u32, seq: u32, x: i32, y: i32) {
+    pub fn moved(&self, sid: u64, epoch: u32, seq: u32, x: i32, y: i32) {
         let mut g = self.lock();
-        if !g.current(epoch) || seq <= g.seq {
+        if !g.session(sid) || !g.current(epoch) || seq <= g.seq {
             return;
         }
         g.seq = seq;
         send(&[move_input(x, y)]);
     }
 
-    pub fn button(&self, epoch: u32, x: i32, y: i32, b: Button, down: bool) {
+    pub fn button(&self, sid: u64, epoch: u32, x: i32, y: i32, b: Button, down: bool) {
         let mut g = self.lock();
-        if !g.current(epoch) {
+        if !g.session(sid) || !g.current(epoch) {
             return;
         }
         g.buttons[button_index(b)] = down;
         send(&[move_input(x, y), button_input(b, down)]);
     }
 
-    pub fn wheel(&self, epoch: u32, x: i32, y: i32, delta: i32, horizontal: bool) {
+    pub fn wheel(&self, sid: u64, epoch: u32, x: i32, y: i32, delta: i32, horizontal: bool) {
         let g = self.lock();
-        if !g.current(epoch) || delta == 0 {
+        if !g.session(sid) || !g.current(epoch) || delta == 0 {
             return;
         }
         let flags = if horizontal { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL };
         send(&[move_input(x, y), mouse(0, 0, delta as u32, flags)]);
     }
 
-    pub fn key(&self, epoch: u32, scan: u16, ext: bool, vk: u16, down: bool) {
+    pub fn key(&self, sid: u64, epoch: u32, scan: u16, ext: bool, vk: u16, down: bool) {
         let mut g = self.lock();
-        if !g.current(epoch) || (scan == 0 && vk == 0) {
+        if !g.session(sid) || !g.current(epoch) || (scan == 0 && vk == 0) {
             return;
         }
         g.track_key((scan, ext, vk), down);
         send(&[key_input((scan, ext, vk), down)]);
     }
 
-    /// 会话断开等：抬起一切，结束被控状态。
+    /// 新会话登记：抬起旧会话留下的一切，之后只接受这个会话的消息。
+    pub fn begin_session(&self, sid: u64) {
+        {
+            let mut g = self.lock();
+            release(&mut g);
+            g.active = false;
+            g.sid = sid;
+        }
+        self.hub.to_input(ToInput::Driven(false));
+        self.hub.set_status(|s| s.driven = false);
+    }
+
+    /// 会话结束：只有它仍是当前会话时才抬起一切。
+    pub fn end_session(&self, sid: u64) {
+        if self.lock().session(sid) {
+            self.release_all();
+        }
+    }
+
+    /// 抬起一切，结束被控状态（退出程序时用）。
     pub fn release_all(&self) {
         {
             let mut g = self.lock();

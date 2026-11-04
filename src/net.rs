@@ -298,7 +298,7 @@ impl Net {
 
     fn hello(&self, cfg: &Config) -> Msg {
         let udp_port = self.udp.as_ref().and_then(|u| u.local_addr().ok()).map(|a| a.port()).unwrap_or(cfg.port);
-        Msg::Hello { ver: PROTO_VERSION, name: cfg.name.clone(), monitors: crate::sys::monitors().monitors, udp_port }
+        Msg::Hello { ver: PROTO_VERSION, name: cfg.name.clone(), monitors: crate::sys::monitors().monitors, udp_port, id: crate::proto::instance_id() }
     }
 
     /// 握手、互发 Hello/Layout、读对方 Hello（= 认证）、登记为当前会话。
@@ -389,9 +389,9 @@ impl Net {
             }
             cur.replace(new.clone()).is_some()
         };
+        self.injector.begin_session(new.id);
         if replaced {
             crate::log!("新连接替换旧连接");
-            self.injector.release_all();
             self.hub.to_input(ToInput::PeerDown);
         }
         true
@@ -410,7 +410,7 @@ impl Net {
         };
         if was_current {
             crate::log!("与 {} 的连接断开：{why}", sess.peer);
-            self.injector.release_all();
+            self.injector.end_session(sess.id);
             self.hub.to_input(ToInput::PeerDown);
             self.hub.set_status(|s| {
                 s.connected = false;
@@ -448,7 +448,7 @@ impl Net {
 
     fn handle(&self, sess: &Session, m: Msg, clip: &mut ClipRx) {
         match m {
-            Msg::Hello { ver, name, monitors, udp_port } => {
+            Msg::Hello { ver, name, monitors, udp_port, .. } => {
                 if ver != PROTO_VERSION {
                     crate::log!("对方协议版本 {ver} 与本机 {PROTO_VERSION} 不同");
                 }
@@ -473,11 +473,12 @@ impl Net {
                 self.hub.to_input(ToInput::PeerUp { name, desk });
             }
             Msg::Layout { side, offset, scale, rev } => self.apply_layout(Layout { side, offset, scale }, rev),
-            Msg::Enter { epoch, x, y } => self.injector.enter(epoch, x, y),
-            Msg::Leave { epoch } => self.injector.leave(epoch),
-            Msg::Button { epoch, x, y, button, down } => self.injector.button(epoch, x, y, button, down),
-            Msg::Wheel { epoch, x, y, delta, horizontal } => self.injector.wheel(epoch, x, y, delta, horizontal),
-            Msg::Key { epoch, scan, ext, vk, down } => self.injector.key(epoch, scan, ext, vk, down),
+            Msg::Enter { epoch, x, y } => self.injector.enter(sess.id, epoch, x, y),
+            Msg::Leave { epoch } => self.injector.leave(sess.id, epoch),
+            Msg::Button { epoch, x, y, button, down } => self.injector.button(sess.id, epoch, x, y, button, down),
+            Msg::Wheel { epoch, x, y, delta, horizontal } => self.injector.wheel(sess.id, epoch, x, y, delta, horizontal),
+            Msg::Key { epoch, scan, ext, vk, down } => self.injector.key(sess.id, epoch, scan, ext, vk, down),
+            Msg::Move { epoch, seq, x, y } => self.injector.moved(sess.id, epoch, seq, x, y),
             Msg::Yield => self.hub.to_input(ToInput::Yield),
             Msg::ClipText { text } => {
                 let c = self.hub.cfg().clipboard;
@@ -616,7 +617,7 @@ impl Net {
                 u.learned = true;
             }
             if let Some(UdpMsg::Move { epoch, seq, x, y }) = UdpMsg::decode(&plain) {
-                self.injector.moved(epoch, seq, x, y);
+                self.injector.moved(sess.id, epoch, seq, x, y);
             }
         }
     }

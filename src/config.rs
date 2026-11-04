@@ -100,36 +100,64 @@ pub fn peer_desk_path() -> PathBuf {
 
 impl Config {
     /// 读取配置；不存在就创建一个带新密钥的默认配置。返回 (配置, 是否新建)。
+    /// 文件存在但解析失败：备份为 config.bad-<时间>.toml，尽量保留其中的 key/peer，绝不悄悄换掉密钥。
     pub fn load_or_create() -> (Config, bool) {
+        let _g = FileLock::acquire();
         let p = path();
-        if let Ok(s) = std::fs::read_to_string(&p) {
-            match toml::from_str::<Config>(&s) {
+        match std::fs::read_to_string(&p) {
+            Ok(s) => match toml::from_str::<Config>(&s) {
                 Ok(mut c) => {
                     if c.key_bytes().is_none() {
+                        crate::log!("config.toml 里的 key 无效，已生成新密钥（两台需重新配对）");
                         c.key = new_key_hex();
-                        let _ = c.save();
+                        let _ = c.save_locked();
                     }
-                    return (c, false);
+                    (c, false)
                 }
-                Err(e) => crate::log!("config.toml 解析失败（{e}），使用默认配置"),
+                Err(e) => {
+                    let bak = dir().join(format!("config.bad-{}.toml", now_ms()));
+                    let _ = std::fs::copy(&p, &bak);
+                    crate::log!("config.toml 解析失败（{e}），已备份到 {}", bak.display());
+                    let mut c = Config::default();
+                    c.key = salvage(&s, "key").filter(|k| parse_key(k).is_some()).unwrap_or_else(new_key_hex);
+                    if let Some(peer) = salvage(&s, "peer") {
+                        c.peer = peer;
+                    }
+                    let _ = c.save_locked();
+                    (c, false)
+                }
+            },
+            Err(_) => {
+                let c = Config { key: new_key_hex(), ..Default::default() };
+                let _ = c.save_locked();
+                (c, true)
             }
         }
-        let c = Config { key: new_key_hex(), ..Default::default() };
-        let _ = c.save();
-        (c, true)
     }
 
+    /// 只读不写；解析失败返回 None。
     pub fn load() -> Option<Config> {
         let s = std::fs::read_to_string(path()).ok()?;
         toml::from_str(&s).ok()
     }
 
+    /// 整个保存（拿跨进程锁）。多数情况应该用 `update`，只改自己关心的字段。
     pub fn save(&self) -> std::io::Result<()> {
+        let _g = FileLock::acquire();
+        self.save_locked()
+    }
+
+    fn save_locked(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(dir())?;
         let s = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
-        let tmp = path().with_extension("toml.tmp");
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let tmp = dir().join(format!("config.toml.{}.{}.tmp", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         std::fs::write(&tmp, s)?;
-        std::fs::rename(tmp, path())
+        let r = std::fs::rename(&tmp, path());
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        r
     }
 
     pub fn key_bytes(&self) -> Option<[u8; 32]> {
@@ -146,9 +174,65 @@ impl Config {
     }
 }
 
+/// 读-改-写配置（跨进程加锁）：从磁盘读最新的（读不到就用 `fallback`），交给 f 改，再保存。
+/// 主程序、设置窗口都用它，只改自己负责的字段，避免互相覆盖。
+pub fn update(fallback: &Config, f: impl FnOnce(&mut Config)) -> std::io::Result<Config> {
+    let _g = FileLock::acquire();
+    let mut c = Config::load().unwrap_or_else(|| fallback.clone());
+    f(&mut c);
+    c.save_locked()?;
+    Ok(c)
+}
+
+/// 排布版本号：只在排布真的变了时调用。取 max(当前时间, 旧值 + 1)，两台时钟不准也不会倒退（Lamport）。
+pub fn next_rev(old: u64) -> u64 {
+    now_ms().max(old.saturating_add(1))
+}
+
+/// 跨进程的配置文件锁（命名互斥量 Local\\kmlink-config）。
+struct FileLock(windows::Win32::Foundation::HANDLE);
+
+impl FileLock {
+    fn acquire() -> FileLock {
+        use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+        unsafe {
+            match CreateMutexW(None, false, windows::core::w!("Local\\kmlink-config")) {
+                Ok(h) => {
+                    let _ = WaitForSingleObject(h, 3000);
+                    FileLock(h)
+                }
+                Err(_) => FileLock(windows::Win32::Foundation::HANDLE::default()),
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::ReleaseMutex;
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = ReleaseMutex(self.0);
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// 从解析不了的 toml 里尽量捞出 `name = "value"`。
+fn salvage(s: &str, name: &str) -> Option<String> {
+    s.lines().find_map(|l| {
+        let l = l.trim();
+        let rest = l.strip_prefix(name)?.trim_start().strip_prefix('=')?.trim();
+        let v = rest.strip_prefix('"')?;
+        Some(v[..v.find('"')?].to_string())
+    })
+}
+
 pub fn parse_key(s: &str) -> Option<[u8; 32]> {
     let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if s.len() != 64 {
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 32];
@@ -198,5 +282,28 @@ mod tests {
         let e: Config = toml::from_str("peer = \"1.2.3.4:5\"").unwrap();
         assert_eq!(e.port, DEFAULT_PORT);
         assert_eq!(e.peer_addr().unwrap(), "1.2.3.4:5");
+    }
+
+    #[test]
+    fn parse_key_rejects_non_ascii() {
+        let mut k = "a".repeat(62);
+        k.push('中'); // 3 字节，总长 65 —— 不能 panic
+        assert!(parse_key(&k).is_none());
+        assert!(parse_key(&"g".repeat(64)).is_none());
+        assert!(parse_key(&"Ab".repeat(32)).is_some());
+    }
+
+    #[test]
+    fn salvage_and_rev() {
+        let broken = "key = \"abcd\"
+peer = \"10.0.0.1\"
+[layout
+";
+        assert_eq!(salvage(broken, "key").as_deref(), Some("abcd"));
+        assert_eq!(salvage(broken, "peer").as_deref(), Some("10.0.0.1"));
+        assert_eq!(salvage(broken, "port"), None);
+        let far_future = now_ms() + 10_000_000;
+        assert_eq!(next_rev(far_future), far_future + 1);
+        assert!(next_rev(0) >= now_ms() - 1000);
     }
 }

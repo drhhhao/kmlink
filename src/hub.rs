@@ -83,6 +83,8 @@ pub struct Hub {
     input_tid: AtomicU32,
     desktop_tx: Sender<ToDesktop>,
     desktop_tid: AtomicU32,
+    /// desktop 线程的隐藏窗口：有了它就用 PostMessage 叫醒（托盘菜单等模态循环里线程消息会丢）。
+    desktop_hwnd: std::sync::atomic::AtomicIsize,
     net_tx: Sender<Out>,
 }
 
@@ -105,6 +107,7 @@ impl Hub {
             input_tid: AtomicU32::new(0),
             desktop_tx,
             desktop_tid: AtomicU32::new(0),
+            desktop_hwnd: std::sync::atomic::AtomicIsize::new(0),
             net_tx,
         };
         (hub, HubRx { input, desktop, net })
@@ -128,13 +131,19 @@ impl Hub {
         wake(tid);
     }
 
+    /// desktop 线程创建好隐藏窗口后登记（窗口过程要处理 WM_APP_WAKE）。
+    pub fn set_desktop_hwnd(&self, hwnd: isize) {
+        self.desktop_hwnd.store(hwnd, Ordering::SeqCst);
+        wake_desktop(hwnd, self.desktop_tid.load(Ordering::SeqCst));
+    }
+
     pub fn to_input(&self, m: ToInput) {
         let _ = self.input_tx.send(m);
         wake(self.input_tid.load(Ordering::SeqCst));
     }
     pub fn to_desktop(&self, m: ToDesktop) {
         let _ = self.desktop_tx.send(m);
-        wake(self.desktop_tid.load(Ordering::SeqCst));
+        wake_desktop(self.desktop_hwnd.load(Ordering::SeqCst), self.desktop_tid.load(Ordering::SeqCst));
     }
     pub fn to_net(&self, m: Out) {
         let _ = self.net_tx.send(m);
@@ -157,6 +166,21 @@ fn wake(tid: u32) {
         unsafe {
             let _ = PostThreadMessageW(tid, WM_APP_WAKE, WPARAM(0), LPARAM(0));
         }
+    }
+}
+
+fn wake_desktop(hwnd: isize, tid: u32) {
+    if hwnd != 0 {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void)),
+                WM_APP_WAKE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    } else {
+        wake(tid);
     }
 }
 
