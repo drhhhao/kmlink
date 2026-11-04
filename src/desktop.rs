@@ -175,6 +175,13 @@ impl ClipSync {
             self.ver += 1;
         }
     }
+    /// 标成已同步的本机内容其实没送到（中途放弃、没连上）：撤销，之后同样内容还能再发。
+    fn unoffer(&mut self, h: u64) {
+        if self.synced == Some(h) {
+            self.synced = None;
+            self.ver += 1;
+        }
+    }
     fn current(&self, g: u64) -> bool {
         self.generation == g
     }
@@ -323,19 +330,28 @@ fn run_job(hub: &Hub, job: Job) {
     // 之后才有的更新内容（代次变了）会在它自己的 CancelClip / 新流里顶掉这一条
     let go = sync(|s| {
         if !s.offer(generation, h) {
+            log!("剪贴板{}与对方一致或已过时，不发", describe_format(format));
+            return false;
+        }
+        if !connected {
+            s.unoffer(h);
             return false;
         }
         hub.to_net(Out::CancelClip);
-        if connected {
-            hub.to_net(Out::ClipStream { format, raw_len, data: rx });
-        }
-        connected
+        hub.to_net(Out::ClipStream { format, raw_len, data: rx });
+        true
     });
     if !go {
         return;
     }
     if stream_out(&data, &tx, &|| sync(|s| s.current(generation))) {
         tx.finish();
+        log!("剪贴板{}已发出（{} KB）", describe_format(format), raw_len / 1024);
+    } else {
+        // 没送到：撤销“已同步”。常见情形：很多程序放图片会连着触发两次剪贴板通知（放入、OleFlushClipboard），
+        // 第二次让第一次的发送过时；不撤销的话第二次会被当成回声，结果一次都没发出去。
+        sync(|s| s.unoffer(h));
+        log!("剪贴板{}没发完就放弃了（更新的内容、断开或对方不要了）", describe_format(format));
     }
     // 没送完就丢弃 tx = 放弃（net 随后告诉对方作废）；原始数据随 data 一起释放
 }
@@ -728,6 +744,7 @@ impl State {
         self.drop_pending();
         let Some(what) = what else {
             // 对方剪贴板变了而本机没跟上：两边不再一致
+            log!("对方的剪贴板内容没写入（暂停、关闭了同步、类型或大小不符）");
             sync(|s| s.forget());
             return;
         };
@@ -754,6 +771,9 @@ impl State {
                     Incoming::Data(b) => b.hash,
                 };
                 sync(|s| s.written(p.ver, h));
+                if matches!(p.what, Incoming::Data(_)) {
+                    log!("已写入对方的{}", p.what.describe());
+                }
             }
             Err(clip::WriteError::Busy) if p.tries < WRITE_RETRIES => {
                 p.tries += 1;
@@ -921,6 +941,7 @@ impl State {
                 submit(&self.hub, Job { generation, format: clip::CF_UNICODETEXT, data: Payload::Text(text) });
             }
             clip::Content::Image { format, data } => {
+                log!("本机复制了图片（格式 {format}，{} KB）", data.len() / 1024);
                 let generation = sync(|s| s.local());
                 self.drop_pending();
                 submit(&self.hub, Job { generation, format, data: Payload::Image(data) });
@@ -931,7 +952,11 @@ impl State {
                 }
                 self.local_other();
             }
-            clip::Content::Concealed | clip::Content::Other => self.local_other(),
+            clip::Content::Concealed => {
+                log!("本机剪贴板是敏感内容（密码等），不同步");
+                self.local_other()
+            }
+            clip::Content::Other => self.local_other(),
         }
     }
 
@@ -1247,6 +1272,23 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
 mod tests {
     use super::*;
     use crate::clip::tests::make_dib;
+
+    #[test]
+    fn aborted_send_is_not_synced() {
+        // 同一张图连着两次通知：第一次开始发、被第二次顶掉（没送到）→ 撤销 → 第二次照常发
+        let mut s = ClipSync::new();
+        let g1 = s.local();
+        assert!(s.offer(g1, 7));
+        let g2 = s.local();
+        assert!(!s.current(g1));
+        s.unoffer(7);
+        assert!(s.offer(g2, 7));
+        // 已经换成别的内容时撤销旧摘要不影响
+        let g3 = s.local();
+        assert!(s.offer(g3, 8));
+        s.unoffer(7);
+        assert_eq!(s.synced, Some(8));
+    }
 
     #[test]
     fn echo_by_content() {
@@ -1567,4 +1609,8 @@ mod tests {
         let p = Path::new(r"C:\Program Files\kmlink\kmlink.exe");
         assert_eq!(run_value(p), "\"C:\\Program Files\\kmlink\\kmlink.exe\"");
     }
+}
+
+fn describe_format(format: u32) -> &'static str {
+    if format == clip::CF_UNICODETEXT { "大段文字" } else { "图片" }
 }

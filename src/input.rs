@@ -1068,6 +1068,9 @@ struct Hooks {
 impl Hooks {
     fn install(&mut self) {
         self.uninstall();
+        // 看门狗拿“最后一次输入”和“最后一次钩子回调”比：刚装好时算作刚回调过，
+        // 否则启动后（或重装后）第一次检查会拿装钩子之前的输入误判成钩子丢了
+        LAST_HOOK.with(|c| c.set(tick()));
         unsafe {
             let hinst = GetModuleHandleW(None).ok().map(|m| HINSTANCE(m.0));
             match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hinst, 0) {

@@ -85,6 +85,9 @@ const TIE_WINDOW: Duration = Duration::from_secs(2);
 const ALIVE_WINDOW: Duration = Duration::from_secs(2);
 /// 这么久没收到对方任何帧（对方每秒 Ping）：抬起本机按着的键和按钮（会话不断）。
 const STALE_AFTER: Duration = Duration::from_millis(1500);
+/// 这么久没收到对方任何帧：本机若正在控制对方，先回到本机（会话不断；断线要等 READ_TIMEOUT）。
+/// WiFi 的正常停顿在几百毫秒以内，2.5 秒足够不误判，又不让用户对着“失灵”的鼠标干等 6 秒。
+const GOHOME_AFTER: Duration = Duration::from_millis(2500);
 /// 同时进行中的入站握手上限（防止局域网里有东西乱连把线程堆满）。
 const MAX_PENDING_HANDSHAKES: usize = 8;
 /// 同一源 IP 同时进行中的入站握手上限。
@@ -223,6 +226,8 @@ struct RxClock {
     at: Instant,
     /// 这段安静已经抬起过按键（有新帧来才重新计时）。
     staled: bool,
+    /// 这一段安静期里已经让 input 回过本机。
+    homed: bool,
 }
 
 struct TcpTx {
@@ -958,7 +963,7 @@ impl Net {
             peer,
             peer_id: *peer_id,
             sig: CfgSig::of(&cfg),
-            last_rx: Mutex::new(RxClock { at: Instant::now(), staled: false }),
+            last_rx: Mutex::new(RxClock { at: Instant::now(), staled: false, homed: false }),
             udp_warned: AtomicBool::new(false),
             ctl,
             tx: Mutex::new(TcpTx { stream: wstream, sealer: tx }),
@@ -1038,6 +1043,7 @@ impl Net {
                 let mut c = lock(&sess.last_rx);
                 c.at = Instant::now();
                 c.staled = false;
+                c.homed = false;
             }
             // 本机剪贴板已被更新的内容取代：丢掉正在接收的对方图片（之后这个 id 的分片都忽略）
             let g = self.clip_gen.load(Ordering::Relaxed);
@@ -1050,6 +1056,7 @@ impl Net {
                 Some(Frame::Chunk { id, offset, data }) => st.clip.chunk(id, offset, data),
                 Some(Frame::End { id, total }) => {
                     if let Some(b) = st.clip.end(id, total) {
+                        crate::log!("收到对方的剪贴板数据（格式 {}）", b.format);
                         self.hub.to_desktop(ToDesktop::ClipData(b));
                     }
                 }
@@ -1379,6 +1386,10 @@ impl Net {
             self.stats.stales.fetch_add(1, Ordering::Relaxed);
             self.injector.stale(s.id);
         }
+        if !c.homed && now.saturating_duration_since(c.at) >= GOHOME_AFTER {
+            c.homed = true;
+            self.hub.to_input(ToInput::GoHome); // 不在控制对方时 input 什么都不做
+        }
     }
 
     /// 每秒一次：设置变了就断开；否则 Ping、UDP Hi、检查 UDP。
@@ -1429,6 +1440,8 @@ impl Net {
                 let c = lock(&s.last_rx);
                 if !c.staled {
                     wake = wake.min(c.at + STALE_AFTER);
+                } else if !c.homed {
+                    wake = wake.min(c.at + GOHOME_AFTER);
                 }
             }
             match rx.recv_timeout(wake.saturating_duration_since(Instant::now())) {
