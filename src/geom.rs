@@ -33,26 +33,30 @@ impl Rect {
     pub const fn new(l: i32, t: i32, r: i32, b: i32) -> Self {
         Self { l, t, r, b }
     }
+    /// 宽度（退化矩形为 0；用 i64 算，对方发来的极端坐标也不会溢出）。
     pub fn w(&self) -> i32 {
-        self.r - self.l
+        (self.r as i64 - self.l as i64).clamp(0, i32::MAX as i64) as i32
     }
     pub fn h(&self) -> i32 {
-        self.b - self.t
+        (self.b as i64 - self.t as i64).clamp(0, i32::MAX as i64) as i32
     }
     pub fn contains(&self, p: Point) -> bool {
         p.x >= self.l && p.x < self.r && p.y >= self.t && p.y < self.b
     }
+    /// 钳进矩形。退化矩形（r <= l 或 b <= t）不 panic：钳到 l / t。
     pub fn clamp(&self, p: Point) -> Point {
-        Point::new(p.x.clamp(self.l, self.r - 1), p.y.clamp(self.t, self.b - 1))
+        let r = self.l.max(self.r.saturating_sub(1));
+        let b = self.t.max(self.b.saturating_sub(1));
+        Point::new(p.x.clamp(self.l, r), p.y.clamp(self.t, b))
     }
     pub fn center(&self) -> Point {
-        Point::new(self.l + self.w() / 2, self.t + self.h() / 2)
+        Point::new((self.l as i64 + self.w() as i64 / 2) as i32, (self.t as i64 + self.h() as i64 / 2) as i32)
     }
     fn dist2(&self, p: Point) -> i64 {
         let c = self.clamp(p);
-        let dx = (c.x - p.x) as i64;
-        let dy = (c.y - p.y) as i64;
-        dx * dx + dy * dy
+        let dx = c.x as i64 - p.x as i64;
+        let dy = c.y as i64 - p.y as i64;
+        dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy))
     }
 }
 
@@ -116,7 +120,7 @@ impl Desk {
         self.monitors.iter().any(|m| m.contains(p))
     }
 
-    /// 离 p 最近的、落在某块显示器里的点（显示器之间的空洞不能停留）。
+    /// 离 p 最近的、落在某块显示器里的点（显示器之间的空洞不能停留）。不知道光标原来在哪时用。
     pub fn clamp(&self, p: Point) -> Point {
         if self.contains(p) || self.monitors.is_empty() {
             return p;
@@ -125,16 +129,28 @@ impl Desk {
         m.clamp(p)
     }
 
+    /// 光标从 from 移向 p：p 落在某块显示器里就是 p；否则钳在 from 所在的那块显示器里
+    /// （L 形多显示器时不会跳到“离 p 最近”的另一块屏上）。from 不在任何显示器上时退回 clamp。
+    pub fn clamp_from(&self, from: Point, p: Point) -> Point {
+        if self.contains(p) || self.monitors.is_empty() {
+            return p;
+        }
+        match self.monitors.iter().find(|m| m.contains(from)) {
+            Some(m) => m.clamp(p),
+            None => self.clamp(p),
+        }
+    }
+
     /// p 是否在 `side` 方向的“外边缘”上：p 在某块显示器的那条边上，且再往外一个像素已不在任何显示器里。
     pub fn on_outer_edge(&self, side: Side, p: Point) -> bool {
         let Some(m) = self.monitors.iter().find(|m| m.contains(p)) else {
             return false;
         };
         let (at_edge, beyond) = match side {
-            Side::Left => (p.x <= m.l, Point::new(p.x - 1, p.y)),
-            Side::Right => (p.x >= m.r - 1, Point::new(p.x + 1, p.y)),
-            Side::Top => (p.y <= m.t, Point::new(p.x, p.y - 1)),
-            Side::Bottom => (p.y >= m.b - 1, Point::new(p.x, p.y + 1)),
+            Side::Left => (p.x <= m.l, Point::new(p.x.saturating_sub(1), p.y)),
+            Side::Right => (p.x >= m.r.saturating_sub(1), Point::new(p.x.saturating_add(1), p.y)),
+            Side::Top => (p.y <= m.t, Point::new(p.x, p.y.saturating_sub(1))),
+            Side::Bottom => (p.y >= m.b.saturating_sub(1), Point::new(p.x, p.y.saturating_add(1))),
         };
         at_edge && !self.contains(beyond)
     }
@@ -210,13 +226,13 @@ impl Layout {
         if along_peer_rel < 0.0 || along_peer_rel >= len_peer as f64 {
             return None;
         }
-        let a = base + along_peer_rel.floor() as i32;
+        let a = base.saturating_add(along_peer_rel.floor() as i32);
         // 进入对方桌面：贴着对方朝向本机的那条边
         let probe = match self.side {
             Side::Right => Point::new(pb.l, a),
-            Side::Left => Point::new(pb.r - 1, a),
+            Side::Left => Point::new(pb.r.saturating_sub(1), a),
             Side::Bottom => Point::new(a, pb.t),
-            Side::Top => Point::new(a, pb.b - 1),
+            Side::Top => Point::new(a, pb.b.saturating_sub(1)),
         };
         // 那一行/列上对方最靠近本机的显示器边缘
         let entry = edge_point_facing(peer, self.side.opposite(), probe)?;
@@ -237,9 +253,9 @@ impl Layout {
         let along_mine = along_peer * s + o + if self.side.horizontal() { me.t as f64 } else { me.l as f64 };
         let a = along_mine.floor() as i32;
         let probe = match self.side {
-            Side::Right => Point::new(me.r - 1, a),
+            Side::Right => Point::new(me.r.saturating_sub(1), a),
             Side::Left => Point::new(me.l, a),
-            Side::Bottom => Point::new(a, me.b - 1),
+            Side::Bottom => Point::new(a, me.b.saturating_sub(1)),
             Side::Top => Point::new(a, me.t),
         };
         edge_point_facing(mine, self.side, probe)
@@ -251,9 +267,9 @@ impl Layout {
 fn edge_point_facing(desk: &Desk, side: Side, probe: Point) -> Option<Point> {
     let cands = desk.monitors.iter().filter(|m| if side.horizontal() { probe.y >= m.t && probe.y < m.b } else { probe.x >= m.l && probe.x < m.r });
     match side {
-        Side::Right => cands.max_by_key(|m| m.r).map(|m| Point::new(m.r - 1, probe.y)),
+        Side::Right => cands.max_by_key(|m| m.r).map(|m| Point::new(m.r.saturating_sub(1).max(m.l), probe.y)),
         Side::Left => cands.min_by_key(|m| m.l).map(|m| Point::new(m.l, probe.y)),
-        Side::Bottom => cands.max_by_key(|m| m.b).map(|m| Point::new(probe.x, m.b - 1)),
+        Side::Bottom => cands.max_by_key(|m| m.b).map(|m| Point::new(probe.x, m.b.saturating_sub(1).max(m.t))),
         Side::Top => cands.min_by_key(|m| m.t).map(|m| Point::new(probe.x, m.t)),
     }
 }
@@ -286,7 +302,7 @@ impl VirtualCursor {
         let iy = fy.trunc();
         self.rem_x = fx - ix;
         self.rem_y = fy - iy;
-        let want = Point::new(self.pos.x + ix as i32, self.pos.y + iy as i32);
+        let want = Point::new(self.pos.x.saturating_add(ix as i32), self.pos.y.saturating_add(iy as i32));
         // 往本机方向推出对方的外边缘？
         let toward_me = match layout.side {
             Side::Right => want.x < self.pos.x,
@@ -294,12 +310,13 @@ impl VirtualCursor {
             Side::Bottom => want.y < self.pos.y,
             Side::Top => want.y > self.pos.y,
         };
-        let clamped = peer.clamp(want);
+        // 先钳在当前所在的显示器里，确实落进另一块显示器才换过去
+        let clamped = peer.clamp_from(self.pos, want);
         if toward_me && clamped != want {
             // 用“刚好贴边”的那个点判断回程（沿边方向保留移动）
             let edge = match layout.side {
-                Side::Right | Side::Left => peer.clamp(Point::new(want.x, clamped.y)),
-                _ => peer.clamp(Point::new(clamped.x, want.y)),
+                Side::Right | Side::Left => peer.clamp_from(self.pos, Point::new(want.x, clamped.y)),
+                _ => peer.clamp_from(self.pos, Point::new(clamped.x, want.y)),
             };
             if let Some(back) = layout.return_to_me(mine, peer, edge) {
                 self.rem_x = 0.0;
@@ -387,6 +404,53 @@ mod tests {
         assert_eq!(d.clamp(Point::new(3000, 900)), Point::new(3000, 539));
         assert!(d.on_outer_edge(Side::Right, Point::new(1919, 800))); // 那段右边外面没屏幕
         assert!(!d.on_outer_edge(Side::Right, Point::new(1919, 300)));
+    }
+
+    #[test]
+    fn l_shape_clamp_stays_on_current_monitor() {
+        // 左边一块 1920x1080，右边一块只有上半截（右下角是空洞）
+        let d = Desk::new(vec![Rect::new(0, 0, 1920, 1080), Rect::new(1920, 0, 3840, 540)]);
+        // 在右边那块往下推进空洞：贴着它的下边，不跳到左边那块（旧逻辑会跳到“最近的” (1919, 700)）
+        assert_eq!(d.clamp_from(Point::new(1930, 530), Point::new(1930, 700)), Point::new(1930, 539));
+        assert_eq!(d.clamp(Point::new(1930, 700)), Point::new(1919, 700));
+        // 在左边那块往右推进空洞：贴着左边那块的右边
+        assert_eq!(d.clamp_from(Point::new(1900, 800), Point::new(1950, 820)), Point::new(1919, 820));
+        // 目标确实落在另一块显示器里：换过去
+        assert_eq!(d.clamp_from(Point::new(1900, 300), Point::new(1950, 310)), Point::new(1950, 310));
+        // from 不在任何显示器上：退回最近的
+        assert_eq!(d.clamp_from(Point::new(5000, 5000), Point::new(3000, 900)), Point::new(3000, 539));
+
+        // 对方是 L 形：虚拟光标在右边那块里往下推，停在那块的下边
+        let a = one(1920, 1080);
+        let l = Layout::default();
+        let mut vc = VirtualCursor::new(Point::new(1930, 530));
+        match vc.step(0, 100, 1.0, &l, &a, &d) {
+            Step::Moved(p) => assert_eq!(p, Point::new(1930, 539)),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn degenerate_and_extreme_rects_do_not_panic() {
+        let r = Rect::new(100, 100, 100, 50); // r <= l、b <= t
+        assert_eq!(r.w(), 0);
+        assert_eq!(r.h(), 0);
+        assert_eq!(r.clamp(Point::new(500, -500)), Point::new(100, 100));
+        let _ = r.center();
+        let r = Rect::new(i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+        assert_eq!(r.w(), i32::MAX);
+        let _ = r.center();
+        let _ = r.dist2(Point::new(i32::MIN, i32::MAX));
+        let d = Desk::new(vec![Rect::new(i32::MAX - 10, 0, i32::MAX, 10), Rect::new(5, 5, 5, 5)]);
+        let _ = d.clamp(Point::new(i32::MIN, i32::MIN));
+        let _ = d.park_point();
+        assert!(!d.on_outer_edge(Side::Right, Point::new(i32::MAX, 0)));
+        let a = one(1920, 1080);
+        let l = Layout { side: Side::Left, offset: i32::MIN, scale: 1e9 };
+        let _ = l.exit_to_peer(&a, &d, Point::new(0, 500));
+        let _ = l.return_to_me(&a, &d, Point::new(i32::MAX - 10, 3));
+        let mut vc = VirtualCursor::new(Point::new(i32::MAX - 5, 3));
+        let _ = vc.step(i32::MAX, i32::MIN, 20.0, &l, &a, &d);
     }
 
     #[test]
