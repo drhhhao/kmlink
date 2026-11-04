@@ -1026,6 +1026,7 @@ impl Net {
                 old.close();
             }
             let replaced = cur.replace(new.clone()).is_some();
+            self.hub.to_desktop(ToDesktop::ClipForget);
             self.injector.begin_session(new.id);
             if replaced {
                 crate::log!("新连接替换旧连接");
@@ -1095,6 +1096,9 @@ impl Net {
             }
             drop(plain);
             st.clip.expire(Instant::now());
+            if std::mem::take(&mut st.clip.lost) {
+                self.clip_lost();
+            }
             self.flush(&mut st, false);
         };
         self.flush(&mut st, true);
@@ -1157,15 +1161,21 @@ impl Net {
                 let c = self.hub.cfg().clipboard;
                 if c.enabled && text.len() <= c.max_text_kb as usize * 1024 {
                     self.hub.to_desktop(ToDesktop::ClipText(text));
+                } else {
+                    self.clip_lost();
                 }
             }
             Msg::ClipStart { id, format, raw_len } => match clip_limit(&self.hub.cfg().clipboard, format) {
                 Some(max) => {
                     if let Err(e) = st.clip.start(id, format, raw_len, max) {
                         crate::log!("忽略对方的剪贴板数据（格式 {format}，{raw_len} 字节，{e}）");
+                        self.clip_lost();
                     }
                 }
-                None => st.clip.reset(),
+                None => {
+                    st.clip.reset();
+                    self.clip_lost();
+                }
             },
             Msg::Ping { t } => self.enqueue(Out::Msg(Msg::Pong { t })),
             Msg::Pong { .. } => {}
@@ -1373,6 +1383,12 @@ impl Net {
         }
     }
 
+    /// 对方的剪贴板内容没能落到本机（拒收、超限、出错、超时）：两边都不再一致，各自清掉“已同步”记录。
+    fn clip_lost(&self) {
+        self.hub.to_desktop(ToDesktop::ClipForget);
+        self.enqueue(Out::Msg(Msg::ClipForget));
+    }
+
     fn mark_mouse(&self) {
         self.mouse_at.store(mono_ms(), Ordering::Relaxed);
     }
@@ -1455,6 +1471,7 @@ impl Net {
                 self.clip_gen.fetch_add(1, Ordering::Relaxed);
                 self.enqueue(Out::CancelClip);
             }
+            Out::CancelClipSend => self.enqueue(Out::CancelClip),
             Out::ClipStream { format, raw_len, data } => {
                 // 压缩线程交来新分片 / 结束时叫醒 net-tcp。先拿一下队列锁再通知：net-tcp 查过“没活”到开始等待
                 // 之间一直持有这把锁，所以通知不会落在两者之间丢掉
@@ -1626,7 +1643,7 @@ impl OutQueue {
                 }
                 self.img = Some(ImgTx { sess: None, id: 0, format, raw_len, data, header_sent: false, off: 0 });
             }
-            Out::CancelClip => self.drop_img(),
+            Out::CancelClip | Out::CancelClipSend => self.drop_img(),
         }
     }
 
@@ -1789,6 +1806,8 @@ impl Incoming {
 #[derive(Default)]
 struct ClipRx {
     cur: Option<Incoming>,
+    /// 对方的内容因出错/超时被丢弃（reader 看到后让两边都清掉“已同步”记录）。
+    lost: bool,
 }
 
 impl ClipRx {
@@ -1829,6 +1848,7 @@ impl ClipRx {
         if self.cur.as_ref().is_some_and(|c| now.saturating_duration_since(c.at) >= CLIP_STALL) {
             crate::log!("对方的剪贴板数据 30 秒没有进展，丢弃");
             self.cur = None;
+            self.lost = true;
         }
     }
 
@@ -1841,6 +1861,7 @@ impl ClipRx {
         if let Err(e) = inc.feed(offset, data) {
             crate::log!("对方的剪贴板数据有误（{e}），丢弃");
             self.cur = None;
+            self.lost = true;
         }
     }
 
@@ -1853,6 +1874,7 @@ impl ClipRx {
             Ok(b) => Some(b),
             Err(e) => {
                 crate::log!("对方的剪贴板数据有误（{e}），丢弃");
+                self.lost = true;
                 None
             }
         }
@@ -2565,7 +2587,7 @@ mod tests {
         loop {
             let left = end.saturating_duration_since(Instant::now());
             match rx.recv_timeout(left) {
-                Ok(ToDesktop::Status) => continue,
+                Ok(ToDesktop::Status | ToDesktop::ClipForget) => continue, // 状态刷新、“已同步”记账：不是测试要看的内容
                 Ok(m) => return Some(m),
                 Err(_) => return None,
             }

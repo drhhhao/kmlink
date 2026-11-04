@@ -207,17 +207,23 @@ fn is_clip(m: &ToDesktop) -> bool {
 }
 
 /// 一轮 drain：剪贴板消息（ClipText / ClipData）只留最新一条，旧的当场丢弃（释放内存）；其余按原顺序。
-fn latest_clip(it: impl Iterator<Item = ToDesktop>) -> (Vec<ToDesktop>, Option<ToDesktop>) {
+/// ClipForget 若出现在留下的那条剪贴板消息之后，返回 forget_after = true（写入之后还要再清“已同步”）；
+/// 出现在它之前的照常放进 rest（先处理）。
+fn latest_clip(it: impl Iterator<Item = ToDesktop>) -> (Vec<ToDesktop>, Option<ToDesktop>, bool) {
     let mut rest = Vec::new();
     let mut clip = None;
+    let mut forget_after = false;
     for m in it {
         if is_clip(&m) {
             clip = Some(m);
+            forget_after = false;
+        } else if matches!(m, ToDesktop::ClipForget) && clip.is_some() {
+            forget_after = true;
         } else {
             rest.push(m);
         }
     }
-    (rest, clip)
+    (rest, clip, forget_after)
 }
 
 /// 配置文件修改时间：和已加载的一样 → 不动；变了要连续两次看到同一个值才加载（防读到写了一半的文件）。
@@ -668,7 +674,7 @@ impl State {
                 }
                 continue;
             }
-            let (rest, clip) = latest_clip(self.rx.try_iter());
+            let (rest, clip, forget_after) = latest_clip(self.rx.try_iter());
             if rest.is_empty() && clip.is_none() {
                 break;
             }
@@ -682,6 +688,9 @@ impl State {
                 && !self.quitting
             {
                 self.incoming(m);
+                if forget_after {
+                    sync(|s| s.forget());
+                }
             }
         }
     }
@@ -746,6 +755,7 @@ impl State {
             // 对方剪贴板变了而本机没跟上：两边不再一致
             log!("对方的剪贴板内容没写入（暂停、关闭了同步、类型或大小不符）");
             sync(|s| s.forget());
+            self.hub.send(Msg::ClipForget);
             return;
         };
         let ver = sync(|s| s.incoming());
@@ -763,8 +773,8 @@ impl State {
             Ok(seq) => {
                 LAST_WRITE.with(|w| w.set(Some(seq)));
                 self.last_seq = Some(seq);
-                // 对方内容已到位：本机待发的旧图片、对方还在传的旧图片都不要了
-                self.hub.to_net(Out::CancelClip);
+                // 对方内容已到位：本机待发的旧图片不要了（对方此刻还在传的一定更新，不能丢）
+                self.hub.to_net(Out::CancelClipSend);
                 // 图片 / 大段文字的摘要 net 收的时候已算好
                 let h = match &p.what {
                     Incoming::Text(t) => hash_text(t),
@@ -785,6 +795,7 @@ impl State {
             Err(e) => {
                 log!("写剪贴板失败（{}，{e:?}），放弃", p.what.describe());
                 sync(|s| s.forget());
+                self.hub.send(Msg::ClipForget);
             }
         }
     }
@@ -1372,6 +1383,20 @@ mod tests {
     }
 
     #[test]
+    fn forget_after_latest_clip() {
+        // 先文字后 ClipForget：写入之后还要清
+        let (rest, clip, after) = latest_clip(vec![ToDesktop::ClipText("x".into()), ToDesktop::ClipForget].into_iter());
+        assert!(rest.is_empty() && clip.is_some() && after);
+        // ClipForget 在前：照常先处理，写入后不清
+        let (rest, clip, after) = latest_clip(vec![ToDesktop::ClipForget, ToDesktop::ClipText("x".into())].into_iter());
+        assert!(matches!(rest[..], [ToDesktop::ClipForget]) && clip.is_some() && !after);
+        // 文字、ClipForget、更新的文字：以最新那条为准，不清
+        let (_, clip, after) =
+            latest_clip(vec![ToDesktop::ClipText("a".into()), ToDesktop::ClipForget, ToDesktop::ClipText("b".into())].into_iter());
+        assert!(matches!(clip, Some(ToDesktop::ClipText(ref t)) if t == "b") && !after);
+    }
+
+    #[test]
     fn keeps_only_latest_clip() {
         let msgs = vec![
             ToDesktop::ClipText("old".into()),
@@ -1381,18 +1406,18 @@ mod tests {
             ToDesktop::ClipText("new".into()),
             ToDesktop::Quit,
         ];
-        let (rest, clip) = latest_clip(msgs.into_iter());
+        let (rest, clip, _) = latest_clip(msgs.into_iter());
         assert!(matches!(clip, Some(ToDesktop::ClipText(ref t)) if t == "new"));
         assert_eq!(rest.len(), 3);
         assert!(matches!(rest[0], ToDesktop::Status));
         assert!(matches!(rest[1], ToDesktop::HideCursor));
         assert!(matches!(rest[2], ToDesktop::Quit));
         // 最新的是图片
-        let (rest, clip) =
+        let (rest, clip, _) =
             latest_clip(vec![ToDesktop::ClipText("a".into()), ToDesktop::ClipData(blob(17, 10, 0))].into_iter());
         assert!(rest.is_empty());
         assert!(matches!(clip, Some(ToDesktop::ClipData(ref b)) if b.format == 17));
-        let (rest, clip) = latest_clip(vec![ToDesktop::Status].into_iter());
+        let (rest, clip, _) = latest_clip(vec![ToDesktop::Status].into_iter());
         assert_eq!(rest.len(), 1);
         assert!(clip.is_none());
     }
