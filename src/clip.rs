@@ -1,9 +1,11 @@
 //! 剪贴板读写（Win32）。由 desktop 线程调用，hwnd 是它的隐藏窗口。
-//! OpenClipboard 可能因为别的程序占用而失败：最多重试 10 次，每次间隔 10ms。
+//! OpenClipboard 可能因为别的程序占用而失败：最多重试 10 次，每次间隔 10ms；仍失败则 read 返回 Err(Busy)，由调用方稍后再试。
+//! 密码管理器标记为“不要监视/不进历史”的内容不读（见 `concealed`）。
 
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
 
@@ -74,21 +76,62 @@ fn get_global(format: u32) -> Option<(HGLOBAL, usize)> {
     Some((hg, size))
 }
 
-/// 读取剪贴板：优先文字（超过 max_text 字节返回 None），否则若 want_image 读图片（超过 max_image 字节返回 None）。
-pub fn read(hwnd: HWND, max_text: usize, want_image: bool, max_image: usize) -> Option<Content> {
-    let _g = open(hwnd)?;
+/// 剪贴板被别的程序占着，打不开（稍后重试）。
+#[derive(Debug, PartialEq, Eq)]
+pub struct Busy;
+
+/// 密码管理器等用来标记“别同步/别进历史”的注册格式（0 = 注册失败）。
+fn conceal_formats() -> [u32; 3] {
+    static F: std::sync::OnceLock<[u32; 3]> = std::sync::OnceLock::new();
+    *F.get_or_init(|| unsafe {
+        [
+            RegisterClipboardFormatW(windows::core::w!("ExcludeClipboardContentFromMonitorProcessing")),
+            RegisterClipboardFormatW(windows::core::w!("Clipboard Viewer Ignore")),
+            RegisterClipboardFormatW(windows::core::w!("CanIncludeInClipboardHistory")),
+        ]
+    })
+}
+
+/// 内容被标记为敏感（剪贴板须已打开）。
+fn concealed() -> bool {
+    let [exclude, ignore, history] = conceal_formats();
+    if (exclude != 0 && available(exclude)) || (ignore != 0 && available(ignore)) {
+        return true;
+    }
+    if history == 0 || !available(history) {
+        return false;
+    }
+    // CanIncludeInClipboardHistory：DWORD 0 = 不许进历史
+    let Some((hg, size)) = get_global(history) else { return false };
+    if size < 4 {
+        return false;
+    }
+    let Some(lk) = Locked::new(hg) else { return false };
+    let v = unsafe { (lk.p as *const u32).read_unaligned() };
+    v == 0
+}
+
+/// 读取剪贴板：优先文字（空或超过 max_text 字节则跳过），否则若 want_image 读图片（超过 max_image 字节返回 None）。
+/// 打不开剪贴板返回 Err(Busy)；敏感内容返回 Ok(None)。
+pub fn read(hwnd: HWND, max_text: usize, want_image: bool, max_image: usize) -> Result<Option<Content>, Busy> {
+    let _g = open(hwnd).ok_or(Busy)?;
+    if concealed() {
+        return Ok(None);
+    }
     if available(CF_UNICODETEXT) {
-        return read_text(max_text).map(Content::Text);
+        if let Some(t) = read_text(max_text) {
+            return Ok(Some(Content::Text(t)));
+        }
     }
     if !want_image {
-        return None;
+        return Ok(None);
     }
     for format in [CF_DIBV5, CF_DIB] {
         if available(format) {
-            return read_bytes(format, max_image).map(|data| Content::Image { format, data });
+            return Ok(read_bytes(format, max_image).map(|data| Content::Image { format, data }));
         }
     }
-    None
+    Ok(None)
 }
 
 fn read_text(max_text: usize) -> Option<String> {
@@ -123,6 +166,17 @@ pub(crate) fn utf16_until_nul(units: &[u16]) -> String {
 /// 文字 → CF_UNICODETEXT 的字节（UTF-16 LE + 结尾 0）。
 pub(crate) fn text_bytes(text: &str) -> Vec<u8> {
     text.encode_utf16().chain(std::iter::once(0)).flat_map(|u| u.to_le_bytes()).collect()
+}
+
+/// 文字 → UTF-16 LE 字节（不带结尾 0）。大段文字走压缩通道时用。
+pub(crate) fn utf16le(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+}
+
+/// UTF-16 LE 字节 → 文字（读到第一个 0 为止；奇数长度忽略最后一个字节）。
+pub(crate) fn from_utf16le(b: &[u8]) -> String {
+    let u: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    utf16_until_nul(&u)
 }
 
 fn write_global(hwnd: HWND, format: u32, data: &[u8]) -> Option<u32> {
@@ -185,5 +239,18 @@ mod tests {
         assert_eq!(&b[b.len() - 2..], &[0, 0]);
         let u: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         assert_eq!(utf16_until_nul(&u), "剪贴板 ok");
+    }
+
+    #[test]
+    fn utf16le_roundtrip() {
+        let t = "大段文字 😀 abc";
+        let b = utf16le(t);
+        assert_eq!(b.len(), t.encode_utf16().count() * 2);
+        assert_eq!(from_utf16le(&b), t);
+        assert_eq!(&text_bytes(t)[..b.len()], &b[..]);
+        let mut odd = b.clone();
+        odd.push(0x41);
+        assert_eq!(from_utf16le(&odd), t);
+        assert_eq!(from_utf16le(&[]), "");
     }
 }
