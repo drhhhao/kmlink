@@ -10,10 +10,14 @@
 //! - 记录本机被按下还没抬起的键（(scan, ext, vk)）和鼠标按钮；leave / release_all / 会话断开时全部抬起，防止卡键。
 //! - epoch 不等于当前 epoch 的消息丢弃；Move 只接受同一 epoch 内 seq 更大的。
 //! - enter 时通知 input 线程 ToInput::Driven(true)，leave/release_all 时 Driven(false)，并更新 hub.status.driven。
-//! - SendInput 返回 0（锁屏/UAC 安全桌面时会这样）不要重试循环，直接放弃这一次。
+//!   这两个通知在持锁时发出（都不阻塞），并发的 enter/leave 不会把顺序弄反。
+//! - 本机暂停共享时 enter 不接管，回 Msg::Yield 让对方回去。
+//! - SendInput 返回 0（锁屏/UAC 安全桌面时会这样）不要重试循环，直接放弃这一次；
+//!   但抬起没注入成功的键/按钮留在记录里，下次 enter/leave/release_all 再抬。
 
 use crate::hub::{Hub, ToInput};
-use crate::proto::{Button, INJECT_MARK};
+use crate::proto::{Button, INJECT_MARK, Msg};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
@@ -63,6 +67,10 @@ impl Inner {
         }
     }
 
+    fn holds_any(&self) -> bool {
+        !self.keys.is_empty() || self.buttons.iter().any(|b| *b)
+    }
+
     /// 取出所有按着的键（按按下的逆序抬起）和按钮，并清空记录。
     fn take_held(&mut self) -> (Vec<KeyId>, Vec<Button>) {
         let mut keys = std::mem::take(&mut self.keys);
@@ -74,6 +82,18 @@ impl Inner {
             }
         }
         (keys, btns)
+    }
+
+    /// 抬起没注入成功：放回记录（keys 是 take_held 的抬起顺序），下次再抬。
+    fn put_back(&mut self, keys: &[KeyId], btns: &[Button]) {
+        for k in keys {
+            if !self.keys.contains(k) {
+                self.keys.insert(0, *k);
+            }
+        }
+        for b in btns {
+            self.buttons[button_index(*b)] = true;
+        }
     }
 }
 
@@ -103,38 +123,48 @@ impl Injector {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 对方接管：光标放到 (x, y)。
+    /// 持锁时调用（参数只为证明持锁）：通知 input 线程、更新状态，都不阻塞，顺序与锁内变化一致。
+    fn set_driven(&self, _g: &MutexGuard<'_, Inner>, b: bool) {
+        self.hub.to_input(ToInput::Driven(b));
+        self.hub.set_status(|s| s.driven = b);
+    }
+
+    /// 对方接管：光标放到 (x, y)。本机暂停共享时不接管，回 Yield。
     pub fn enter(&self, sid: u64, epoch: u32, x: i32, y: i32) {
-        {
-            let mut g = self.lock();
-            if !g.session(sid) {
-                return;
-            }
-            // 上一次接管没正常结束：先把残留的按键抬起来
-            if g.active && g.epoch != epoch {
-                release(&mut g);
-            }
-            g.epoch = epoch;
-            g.active = true;
-            g.seq = 0;
-            send(&[move_input(x, y)]);
+        let paused = self.hub.status().paused;
+        let mut g = self.lock();
+        if !g.session(sid) {
+            return;
         }
-        self.hub.to_input(ToInput::Driven(true));
-        self.hub.set_status(|s| s.driven = true);
+        if paused {
+            if g.active {
+                release(&mut g);
+                g.active = false;
+                self.set_driven(&g, false);
+            }
+            self.hub.send(Msg::Yield);
+            return;
+        }
+        // 上一次接管没正常结束，或上次抬起没注入成功：先把残留的按键抬起来
+        if (g.active && g.epoch != epoch) || g.holds_any() {
+            release(&mut g);
+        }
+        g.epoch = epoch;
+        g.active = true;
+        g.seq = 0;
+        send(&[move_input(x, y)]);
+        self.set_driven(&g, true);
     }
 
     /// 对方放手：抬起所有按着的键和按钮。
     pub fn leave(&self, sid: u64, epoch: u32) {
-        {
-            let mut g = self.lock();
-            if !g.session(sid) || !g.current(epoch) {
-                return;
-            }
-            release(&mut g);
-            g.active = false;
+        let mut g = self.lock();
+        if !g.session(sid) || !g.current(epoch) {
+            return;
         }
-        self.hub.to_input(ToInput::Driven(false));
-        self.hub.set_status(|s| s.driven = false);
+        release(&mut g);
+        g.active = false;
+        self.set_driven(&g, false);
     }
 
     /// UDP 来的绝对位置。
@@ -152,8 +182,11 @@ impl Injector {
         if !g.session(sid) || !g.current(epoch) {
             return;
         }
-        g.buttons[button_index(b)] = down;
-        send(&[move_input(x, y), button_input(b, down)]);
+        let ok = send(&[move_input(x, y), button_input(b, down)]) == 2;
+        // 按下总记下；抬起没注入成功就留着，放手时再抬
+        if down || ok {
+            g.buttons[button_index(b)] = down;
+        }
     }
 
     pub fn wheel(&self, sid: u64, epoch: u32, x: i32, y: i32, delta: i32, horizontal: bool) {
@@ -170,38 +203,39 @@ impl Injector {
         if !g.session(sid) || !g.current(epoch) || (scan == 0 && vk == 0) {
             return;
         }
-        g.track_key((scan, ext, vk), down);
-        send(&[key_input((scan, ext, vk), down)]);
+        let k = (scan, ext, vk);
+        let ok = send(&[key_input(k, down)]) == 1;
+        // 同上：抬起失败（Win+L 后进了安全桌面等）留在记录里
+        if down || ok {
+            g.track_key(k, down);
+        }
     }
 
     /// 新会话登记：抬起旧会话留下的一切，之后只接受这个会话的消息。
     pub fn begin_session(&self, sid: u64) {
-        {
-            let mut g = self.lock();
-            release(&mut g);
-            g.active = false;
-            g.sid = sid;
-        }
-        self.hub.to_input(ToInput::Driven(false));
-        self.hub.set_status(|s| s.driven = false);
+        let mut g = self.lock();
+        release(&mut g);
+        g.active = false;
+        g.sid = sid;
+        self.set_driven(&g, false);
     }
 
     /// 会话结束：只有它仍是当前会话时才抬起一切。
     pub fn end_session(&self, sid: u64) {
-        if self.lock().session(sid) {
-            self.release_all();
+        let mut g = self.lock();
+        if g.session(sid) {
+            release(&mut g);
+            g.active = false;
+            self.set_driven(&g, false);
         }
     }
 
     /// 抬起一切，结束被控状态（退出程序时用）。
     pub fn release_all(&self) {
-        {
-            let mut g = self.lock();
-            release(&mut g);
-            g.active = false;
-        }
-        self.hub.to_input(ToInput::Driven(false));
-        self.hub.set_status(|s| s.driven = false);
+        let mut g = self.lock();
+        release(&mut g);
+        g.active = false;
+        self.set_driven(&g, false);
     }
 
     pub fn active(&self) -> bool {
@@ -209,21 +243,38 @@ impl Injector {
     }
 }
 
-/// 抬起所有记录中按着的键和按钮（持锁调用）。
+/// 抬起所有记录中按着的键和按钮（持锁调用）。没注入成功的放回记录。
 fn release(g: &mut Inner) {
     let (keys, btns) = g.take_held();
-    let mut v: Vec<INPUT> = keys.into_iter().map(|k| key_input(k, false)).collect();
-    v.extend(btns.into_iter().map(|b| button_input(b, false)));
-    if !v.is_empty() {
-        send(&v);
+    let mut v: Vec<INPUT> = keys.iter().map(|k| key_input(*k, false)).collect();
+    v.extend(btns.iter().map(|b| button_input(*b, false)));
+    if v.is_empty() {
+        return;
     }
+    let n = send(&v) as usize;
+    let (rk, rb) = unsent(&keys, &btns, n);
+    g.put_back(rk, rb);
 }
 
-/// 注入；失败（安全桌面等）就放弃，不重试。
-fn send(inputs: &[INPUT]) {
-    unsafe {
-        let _ = SendInput(inputs, std::mem::size_of::<INPUT>() as i32);
+/// 先键后按钮注入了前 n 个：剩下没注入的键和按钮。
+fn unsent<'a>(keys: &'a [KeyId], btns: &'a [Button], n: usize) -> (&'a [KeyId], &'a [Button]) {
+    let nk = n.min(keys.len());
+    let nb = n.saturating_sub(keys.len()).min(btns.len());
+    (&keys[nk..], &btns[nb..])
+}
+
+/// 注入，返回实际注入个数；失败（安全桌面等）不重试。少于请求数时记一次日志（恢复正常后再失败会再记）。
+fn send(inputs: &[INPUT]) -> u32 {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let n = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+    if (n as usize) < inputs.len() {
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            crate::log!("注入失败：{n}/{} 个事件（锁屏、UAC 或管理员窗口？）", inputs.len());
+        }
+    } else {
+        WARNED.store(false, Ordering::Relaxed);
     }
+    n
 }
 
 fn mouse(dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
@@ -364,5 +415,26 @@ mod tests {
         assert_eq!(btns, vec![Button::Right]);
         let (keys, btns) = g.take_held();
         assert!(keys.is_empty() && btns.is_empty());
+        assert!(!g.holds_any());
+    }
+
+    #[test]
+    fn failed_release_is_kept() {
+        // take_held 的抬起顺序：0x1d 先按，0x1e 后按
+        let keys = [(0x1e, false, 0x41), (0x1d, false, 0xa2)];
+        let btns = [Button::Left];
+        assert_eq!(unsent(&keys, &btns, 0), (&keys[..], &btns[..]));
+        assert_eq!(unsent(&keys, &btns, 1), (&keys[1..], &btns[..]));
+        assert_eq!(unsent(&keys, &btns, 2), (&keys[2..], &btns[..]));
+        assert_eq!(unsent(&keys, &btns, 3), (&keys[2..], &btns[1..]));
+
+        let mut g = Inner::default();
+        g.track_key((0x30, false, 0x42), true);
+        g.put_back(&keys, &btns);
+        assert!(g.holds_any());
+        // 放回后仍按原先的按下顺序逆序抬起
+        let (k, b) = g.take_held();
+        assert_eq!(k, vec![(0x30, false, 0x42), (0x1e, false, 0x41), (0x1d, false, 0xa2)]);
+        assert_eq!(b, vec![Button::Left]);
     }
 }

@@ -14,6 +14,7 @@ mod config;
 mod crypto;
 mod cursor;
 mod desktop;
+mod elev;
 mod geom;
 mod hub;
 mod inject;

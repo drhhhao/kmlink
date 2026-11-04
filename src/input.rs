@@ -4,24 +4,24 @@
 //! SetThreadPriority(THREAD_PRIORITY_TIME_CRITICAL)；本机显示器 = sys::monitors()。
 //! 状态放在 thread_local 的 RefCell 里（钩子回调是 extern "system" fn，没有上下文指针）。
 //! 回调里绝不阻塞：不打日志、不做文件/网络 IO（发消息用 hub.to_net / hub.to_desktop，都是无界 channel）。
-//! 回调超过 LowLevelHooksTimeout 会被系统摘掉钩子：消息循环每 2 秒用 SetTimer(线程定时器) 检查
+//! 回调超过 LowLevelHooksTimeout 会被系统摘掉钩子：消息循环用 SetTimer(线程定时器，见文末补充规则) 检查
 //! GetLastInputInfo 比最后一次钩子回调新 1 秒以上就重装钩子（看门狗）。
 //!
 //! 模式：
 //!   Home：本机在用。鼠标移动时（没有按着鼠标键、未暂停、对方已连接、对方显示器已知）：
 //!         若 layout.exit_to_peer(本机, 对方, pt) 有入口点 → 开始驱动：
 //!           epoch += 1；虚拟光标 = 入口点；记下“出口点”；记下此刻本机按着的键（GetAsyncKeyState），这些键的抬起放行给本机、不转发；
-//!           hub.send(Msg::Enter{epoch, x, y})；hub.to_desktop(HideCursor)；SetCursorPos(停放点 = 本机 Desk::park_point)；
+//!           hub.send(Msg::Enter{epoch, x, y})；cursor::request_hide()；SetCursorPos(停放点 = 本机 Desk::park_point)；
 //!           记下停放时间；吞掉这次移动。hub.set_status(driving = true)。
 //!   Driving：吞掉所有鼠标/键盘事件（我们自己注入的、带 INJECT_MARK 的除外）。
-//!         移动：d = pt - 停放点（停放后 50ms 内离停放点超过 300 像素的事件是停放前的旧坐标，丢弃）；
+//!         移动：d = pt - 真实光标位置（旧坐标过滤与重新停放见文末）；
 //!               VirtualCursor::step(d, cfg.input.speed) → Moved(p)：hub.to_net(Out::Move{epoch, seq+=1, x, y})
 //!                                                      → Return(p)：回到本机（见下），本机光标放到 p。
 //!         按钮：hub.send(Msg::Button{epoch, 虚拟光标位置, ..})；记录对方按着的按钮。
 //!         滚轮：WM_MOUSEWHEEL / WM_MOUSEHWHEEL，delta = (mouseData >> 16) as i16。
 //!         键盘：热键（cfg.input.hotkey_vk）按下 → 回到本机（落点 = 出口点）。其他键 → Msg::Key{scan = scanCode,
 //!               ext = flags & LLKHF_EXTENDED, vk, down}；记录对方按着的键。
-//!   回到本机：hub.send(Msg::Leave{epoch})；SetCursorPos(落点)；hub.to_desktop(ShowCursor)；
+//!   回到本机：hub.send(Msg::Leave{epoch})；SetCursorPos(落点)；cursor::request_show()；
 //!         此刻转发给对方、还没抬起的键/按钮 → 以后在本机的抬起事件要吞掉（本机没见过它们的按下）。
 //!         hub.set_status(driving = false)。
 //!   Home 时热键 → 切换暂停（同托盘“暂停共享”），吞掉。
@@ -35,10 +35,22 @@
 //! - 落点往本机内侧挪 1 像素，免得沿边上下移动时立刻又跨过去。
 //! - 被控时又收到对方 Enter（双方同时跨屏）：本机放手，避免互相驱动。
 //! - 看门狗发现钩子丢了且正在驱动：先回到本机（光标恢复可见），再重装钩子。
+//!
+//! 后来补的规则（评审修复）：
+//! - 定时器 250ms 一次：查前台是否管理员窗口（UIPI，钩子收不到它的输入）和输入桌面是否 Default
+//!   （Ctrl+Alt+Del/UAC/锁屏）。前台是管理员窗口时不跨屏（状态栏提示）；驱动中遇到这两种情况立刻回到本机。
+//!   看门狗每秒查一次，输入桌面不是 Default 时不查，连续两次异常才重装钩子。
+//! - 驱动中移动量 = pt - 钩子回调时的真实光标位置（GetCursorPos）；光标离停放点超过 50 像素就重新停放，
+//!   重新停放后的头几个事件做旧坐标过滤。
+//! - 对方还按着鼠标键（拖动中）时不回到本机，虚拟光标贴边停住。
+//! - 回到本机或被控结束后，要先看到光标离开过跨屏那条边，才允许再次跨屏（防止来回弹）。
+//! - 跨屏时就按着的 Alt/Win，若驱动期间转发过东西，它在本机的抬起改为：注入 vk 0xE8 按下抬起 + 该键抬起，
+//!   免得本机弹出菜单栏/开始菜单（在消息循环里 SendInput，不在钩子回调里）。
+//! - 光标隐藏/恢复走 cursor::request_hide/request_show（专用线程）；状态更新和 SendInput 推迟到消息循环执行。
 
 use crate::config::Config;
 use crate::geom::{Desk, Layout, Point, Side, Step, VirtualCursor};
-use crate::hub::{Hub, Out, ToDesktop, ToInput, WM_APP_WAKE};
+use crate::hub::{Hub, Out, ToInput, WM_APP_WAKE};
 use crate::proto::{Button, INJECT_MARK, Msg};
 use crossbeam_channel::Receiver;
 use std::cell::{Cell, RefCell};
@@ -61,7 +73,14 @@ pub enum Action {
     Driving(bool),
     /// hub.set_status(paused)
     Paused(bool),
+    /// on：status.last_error = msg；off：last_error 仍是 msg 时清掉。
+    Error { msg: &'static str, on: bool },
+    /// 本机 Alt/Win 抬起前先注入 vk 0xE8 按下抬起，防止弹菜单（scan/ext 是原来那次抬起的）。
+    Mask { vk: u16, scan: u16, ext: bool },
 }
+
+/// 前台是管理员（更高完整性）窗口时的提示。
+pub const FG_BLOCKED_MSG: &str = "前台是管理员窗口，无法切换";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -80,6 +99,8 @@ pub enum MouseKind {
 pub struct MouseEv {
     pub kind: MouseKind,
     pub pt: Point,
+    /// 回调时的真实光标位置（GetCursorPos；只有移动事件有，取不到为 None）
+    pub cur: Option<Point>,
     /// 事件时间（毫秒，GetTickCount 同一时基）
     pub time: u32,
     /// 别的程序注入的（不是我们自己的）
@@ -106,8 +127,19 @@ const VK_PACKET: u32 = 0xE7;
 const VK_PAUSE: u32 = 0x13;
 /// 停放后这段时间内，离停放点太远的移动是停放前的旧坐标。
 const STALE_MS: i32 = 50;
-const STALE_DIST: i64 = 300;
+/// 停放后只对头几个移动事件做旧坐标过滤。
+const STALE_EVENTS: u8 = 3;
+/// 光标离停放点超过这个距离就重新停放；重新停放后头几个事件里位移超过它的算旧坐标。
+const REPARK_DIST: i64 = 50;
 const YIELD_MS: i32 = 300;
+/// 本机抬起时要防菜单的键：Alt、LAlt、RAlt、LWin、RWin。
+const MASK_VKS: [usize; 5] = [0x12, 0xA4, 0xA5, 0x5B, 0x5C];
+/// 不在任何显示器上的桌面：传给 VirtualCursor::step 当“本机”，就不会回到本机（拖动中贴边停住）。
+static NO_DESK: Desk = Desk { monitors: Vec::new() };
+
+fn dist2(dx: i32, dy: i32) -> i64 {
+    (dx as i64) * (dx as i64) + (dy as i64) * (dy as i64)
+}
 
 fn button_index(b: Button) -> usize {
     match b {
@@ -125,11 +157,23 @@ struct Drive {
     exit: Point,
     park: Point,
     park_time: u32,
+    /// 停放后还要做旧坐标过滤的事件数
+    fresh: u8,
     /// 跨屏时本机按着的键：抬起放行给本机，不转发
     local_held: [bool; 256],
     /// 已转发给对方、还没抬起的键/按钮
     remote_keys: [bool; 256],
     remote_buttons: [bool; 5],
+    /// 这次驱动转发过按键/按钮/滚轮（决定本机 Alt/Win 抬起要不要防菜单）
+    forwarded: bool,
+}
+
+impl Drive {
+    fn repark(&mut self, time: u32, out: &mut Vec<Action>) {
+        self.park_time = time;
+        self.fresh = STALE_EVENTS;
+        out.push(Action::SetCursor(self.park));
+    }
 }
 
 pub struct Kvm {
@@ -150,6 +194,14 @@ pub struct Kvm {
     hotkey_held: bool,
     last_yield: Option<u32>,
     probe: KeyProbe,
+    /// 跨屏已就绪：回到本机/被控结束后，要先看到光标离开过跨屏那条边
+    armed: bool,
+    /// 前台是管理员窗口（定时器刷新的缓存）
+    fg_blocked: bool,
+    /// 已经提示过 FG_BLOCKED_MSG
+    warned: bool,
+    /// 驱动结束时仍按着的 Alt/Win：本机抬起时要防菜单
+    mask_up: [bool; 256],
 }
 
 impl Kvm {
@@ -170,6 +222,10 @@ impl Kvm {
             hotkey_held: false,
             last_yield: None,
             probe,
+            armed: true,
+            fg_blocked: false,
+            warned: false,
+            mask_up: [false; 256],
         };
         k.apply_config(cfg);
         k
@@ -230,6 +286,15 @@ impl Kvm {
     }
 
     fn try_cross(&mut self, pt: Point, time: u32, out: &mut Vec<Action>) -> bool {
+        // 钩子里的坐标可能越出屏幕：先钳回桌面
+        let p = self.mine.clamp(pt);
+        if !self.armed {
+            // 回来后先要离开过跨屏那条边
+            if !self.mine.on_outer_edge(self.layout.side, p) {
+                self.armed = true;
+            }
+            return false;
+        }
         if self.paused || self.driven {
             return false;
         }
@@ -239,8 +304,6 @@ impl Kvm {
         if peer.is_empty() || self.mine.is_empty() {
             return false;
         }
-        // 钩子里的坐标可能越出屏幕：先钳回桌面
-        let p = self.mine.clamp(pt);
         let Some(entry) = self.layout.exit_to_peer(&self.mine, peer, p) else {
             return false;
         };
@@ -248,20 +311,30 @@ impl Kvm {
         if MOUSE_VKS.iter().any(|&v| held[v]) {
             return false; // 拖动中不跨屏
         }
+        if self.fg_blocked {
+            // 前台是管理员窗口：钩子收不到它的按键，跨过去键盘会落在本机
+            self.warn(out);
+            return false;
+        }
         for v in MOUSE_VKS {
             held[v] = false;
         }
         self.epoch = self.epoch.wrapping_add(1);
         self.seq = 0;
         let park = self.mine.park_point();
+        // 上次驱动留下的 Alt/Win 防菜单标记并入这次
+        let forwarded = MASK_VKS.iter().any(|&v| self.mask_up[v] && held[v]);
+        self.mask_up = [false; 256];
         self.drive = Some(Drive {
             vc: VirtualCursor::new(entry),
             exit: p,
             park,
             park_time: time,
+            fresh: STALE_EVENTS,
             local_held: held,
             remote_keys: [false; 256],
             remote_buttons: [false; 5],
+            forwarded,
         });
         out.push(Action::Send(Msg::Enter { epoch: self.epoch, x: entry.x, y: entry.y }));
         out.push(Action::HideCursor);
@@ -277,11 +350,20 @@ impl Kvm {
         };
         match ev.kind {
             MouseKind::Move => {
-                let dx = ev.pt.x - d.park.x;
-                let dy = ev.pt.y - d.park.y;
-                let dist2 = (dx as i64) * (dx as i64) + (dy as i64) * (dy as i64);
-                if (ev.time.wrapping_sub(d.park_time) as i32) < STALE_MS && dist2 > STALE_DIST * STALE_DIST {
-                    return Verdict::Swallow; // 停放前的旧坐标
+                // 吞掉的事件不会移动光标：位移 = pt - 此刻真实光标位置
+                let cur = ev.cur.unwrap_or(d.park);
+                let dx = ev.pt.x - cur.x;
+                let dy = ev.pt.y - cur.y;
+                let since_park = ev.time.wrapping_sub(d.park_time) as i32;
+                if d.fresh > 0 {
+                    d.fresh -= 1;
+                    if since_park < STALE_MS && dist2(dx, dy) > REPARK_DIST * REPARK_DIST {
+                        return Verdict::Swallow; // 停放前的旧坐标
+                    }
+                }
+                // 光标被别的程序挪走了（SetCursorPos、对齐默认按钮、ClipCursor）：重新停放
+                if dist2(cur.x - d.park.x, cur.y - d.park.y) > REPARK_DIST * REPARK_DIST && since_park >= STALE_MS {
+                    d.repark(ev.time, out);
                 }
                 if dx == 0 && dy == 0 {
                     return Verdict::Swallow;
@@ -292,7 +374,9 @@ impl Kvm {
                     return Verdict::Swallow;
                 };
                 let before = d.vc.pos;
-                match d.vc.step(dx, dy, self.speed, &self.layout, &self.mine, peer) {
+                // 对方还按着鼠标键（拖动中）：不回到本机，贴边停住
+                let mine = if d.remote_buttons.iter().any(|b| *b) { &NO_DESK } else { &self.mine };
+                match d.vc.step(dx, dy, self.speed, &self.layout, mine, peer) {
                     Step::Moved(p) => {
                         if p != before {
                             self.seq = self.seq.wrapping_add(1);
@@ -305,12 +389,14 @@ impl Kvm {
             MouseKind::Button(b, down) => {
                 let i = button_index(b);
                 d.remote_buttons[i] = down;
+                d.forwarded = true;
                 self.swallow_buttons[i] = false;
                 let p = d.vc.pos;
                 out.push(Action::Send(Msg::Button { epoch, x: p.x, y: p.y, button: b, down }));
             }
             MouseKind::Wheel { delta, horizontal } => {
                 if delta != 0 {
+                    d.forwarded = true;
                     let p = d.vc.pos;
                     out.push(Action::Send(Msg::Wheel { epoch, x: p.x, y: p.y, delta, horizontal }));
                 }
@@ -332,6 +418,11 @@ impl Kvm {
                     return Verdict::Swallow;
                 }
                 d.local_held[vk] = false;
+                if d.forwarded && MASK_VKS.contains(&vk) {
+                    // 本机只看到 Alt/Win 按下又抬起会弹菜单：改成先注入掩码键再抬起
+                    out.push(mask(&ev));
+                    return Verdict::Swallow;
+                }
                 return Verdict::Pass;
             }
             if is_hotkey {
@@ -348,6 +439,7 @@ impl Kvm {
                 return Verdict::Swallow;
             }
             d.remote_keys[vk] = ev.down;
+            d.forwarded = true;
             self.swallow_keys[vk] = false;
             out.push(Action::Send(Msg::Key { epoch, scan: ev.scan, ext: ev.ext, vk: ev.vk as u16, down: ev.down }));
             return Verdict::Swallow;
@@ -364,6 +456,12 @@ impl Kvm {
             } else {
                 self.hotkey_held = false;
             }
+            return Verdict::Swallow;
+        }
+        // 驱动结束时还按着的 Alt/Win：自动重复的按下照常放行，抬起时防菜单
+        if self.mask_up[vk] && !ev.down {
+            self.mask_up[vk] = false;
+            out.push(mask(&ev));
             return Verdict::Swallow;
         }
         if self.swallow_keys[vk] {
@@ -385,6 +483,13 @@ impl Kvm {
         for (s, r) in self.swallow_buttons.iter_mut().zip(d.remote_buttons.iter()) {
             *s |= *r;
         }
+        if d.forwarded {
+            for v in MASK_VKS {
+                self.mask_up[v] = d.local_held[v];
+            }
+        }
+        // 先离开跨屏那条边才能再跨（防止立刻弹回去）
+        self.armed = false;
         let land = self.inward(land);
         out.push(Action::Send(Msg::Leave { epoch: self.epoch }));
         out.push(Action::SetCursor(land));
@@ -436,9 +541,8 @@ impl Kvm {
                 let exit = self.exit_point().map(|e| self.mine.clamp(e));
                 if let (Some(d), Some(exit)) = (self.drive.as_mut(), exit) {
                     d.park = park;
-                    d.park_time = now;
                     d.exit = exit;
-                    out.push(Action::SetCursor(park));
+                    d.repark(now, out);
                 }
             }
             ToInput::Config(cfg) => self.apply_config(&cfg),
@@ -448,6 +552,9 @@ impl Kvm {
                 self.last_yield = None;
                 if b {
                     self.go_home_exit(out); // 双方同时跨屏：本机放手
+                } else {
+                    // 对方放手时本机光标可能正停在共用的那条边上：先离开过边才跨
+                    self.armed = false;
                 }
             }
             ToInput::Pause(p) => {
@@ -465,6 +572,34 @@ impl Kvm {
     pub fn hooks_lost(&mut self, out: &mut Vec<Action>) {
         self.go_home_exit(out);
     }
+
+    /// 定时器（250ms）：fg_blocked = 前台是管理员窗口；desk_ok = 输入桌面是 Default。
+    /// 驱动中任一不满足就立刻回到本机（Leave 让对方抬起所有键）。
+    pub fn poll(&mut self, fg_blocked: bool, desk_ok: bool, out: &mut Vec<Action>) {
+        self.fg_blocked = fg_blocked;
+        if self.drive.is_some() && (!desk_ok || fg_blocked) {
+            self.go_home_exit(out);
+            if desk_ok {
+                self.warn(out);
+            }
+        }
+        if !fg_blocked && self.warned {
+            self.warned = false;
+            out.push(Action::Error { msg: FG_BLOCKED_MSG, on: false });
+        }
+    }
+
+    fn warn(&mut self, out: &mut Vec<Action>) {
+        if !self.warned {
+            self.warned = true;
+            out.push(Action::Error { msg: FG_BLOCKED_MSG, on: true });
+        }
+    }
+}
+
+/// 本机 Alt/Win 的抬起改成“掩码键 + 抬起”。
+fn mask(ev: &KeyEv) -> Action {
+    Action::Mask { vk: (ev.vk & 0xFF) as u16, scan: ev.scan, ext: ev.ext }
 }
 
 /// 钩子给的扫描码：0 时用 MapVirtualKey 的结果（低字节 = 扫描码，高字节 0xE0/0xE1 = 扩展键）。
@@ -483,21 +618,22 @@ fn scan_of(vk: u32, scan_code: u32, ext_flag: bool, mapped: impl FnOnce() -> u32
 
 // ───────────────────────── Win32：钩子与消息循环 ─────────────────────────
 
-use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{
     GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetLastInputInfo, LASTINPUTINFO, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+    GetAsyncKeyState, GetLastInputInfo, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, LASTINPUTINFO, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLKHF_INJECTED,
-    LLKHF_UP, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostQuitMessage, SetCursorPos, SetTimer,
-    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WM_USER,
-    WM_XBUTTONDOWN, WM_XBUTTONUP,
+    CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED,
+    LLKHF_INJECTED, LLKHF_UP, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostQuitMessage,
+    PostThreadMessageW, SetCursorPos, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_APP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 thread_local! {
@@ -505,9 +641,17 @@ thread_local! {
     static HUB: RefCell<Option<Arc<Hub>>> = const { RefCell::new(None) };
     /// 最后一次钩子回调的 GetTickCount（看门狗用）。
     static LAST_HOOK: Cell<u32> = const { Cell::new(0) };
+    /// 推迟到消息循环执行的动作。
+    static DEFER: RefCell<Vec<Action>> = const { RefCell::new(Vec::new()) };
 }
 
-const WATCHDOG_MS: u32 = 2000;
+/// 自己发给自己：执行 DEFER 里的动作。
+const WM_APP_DEFER: u32 = WM_APP + 2;
+/// 未分配的虚拟键，用来打断 Alt/Win 单按（同 AutoHotkey 的 vkE8）。
+const VK_MASK: u16 = 0xE8;
+/// 定时器周期：前台/桌面检查；看门狗每 WATCHDOG_TICKS 次查一次。
+const TICK_MS: u32 = 250;
+const WATCHDOG_TICKS: u32 = 4;
 
 fn tick() -> u32 {
     unsafe { GetTickCount() }
@@ -529,7 +673,10 @@ fn dispatch(f: impl FnOnce(&mut Kvm, &mut Vec<Action>) -> Verdict) -> Verdict {
     v
 }
 
+/// 钩子回调里可能执行：只做不阻塞的事（channel、SetCursorPos）。
+/// 要拿锁的状态更新和 SendInput 推迟到消息循环（WM_APP_DEFER）。
 fn execute(actions: Vec<Action>) {
+    let mut deferred = false;
     HUB.with(|h| {
         let h = h.borrow();
         let Some(hub) = h.as_ref() else {
@@ -542,13 +689,55 @@ fn execute(actions: Vec<Action>) {
                 Action::SetCursor(p) => unsafe {
                     let _ = SetCursorPos(p.x, p.y);
                 },
-                Action::HideCursor => hub.to_desktop(ToDesktop::HideCursor),
-                Action::ShowCursor => hub.to_desktop(ToDesktop::ShowCursor),
-                Action::Driving(b) => hub.set_status(|s| s.driving = b),
-                Action::Paused(b) => hub.set_status(|s| s.paused = b),
+                Action::HideCursor => crate::cursor::request_hide(),
+                Action::ShowCursor => crate::cursor::request_show(),
+                a @ (Action::Driving(_) | Action::Paused(_) | Action::Error { .. } | Action::Mask { .. }) => {
+                    DEFER.with(|d| d.borrow_mut().push(a));
+                    deferred = true;
+                }
             }
         }
     });
+    if deferred {
+        unsafe {
+            let _ = PostThreadMessageW(GetCurrentThreadId(), WM_APP_DEFER, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// 消息循环里执行推迟的动作。
+fn run_deferred(hub: &Hub) {
+    let list = DEFER.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    for a in list {
+        match a {
+            Action::Driving(b) => hub.set_status(|s| s.driving = b),
+            Action::Paused(b) => hub.set_status(|s| s.paused = b),
+            Action::Error { msg, on } => hub.set_status(|s| {
+                if on {
+                    s.last_error = msg.to_string();
+                } else if s.last_error == msg {
+                    s.last_error.clear();
+                }
+            }),
+            Action::Mask { vk, scan, ext } => send_mask(vk, scan, ext),
+            _ => {}
+        }
+    }
+}
+
+/// 注入 [vk 0xE8 按下, 0xE8 抬起, vk 抬起]（INJECT_MARK，本机钩子不处理），顺序固定：先掩码后抬起。
+fn send_mask(vk: u16, scan: u16, ext: bool) {
+    let key = |vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT { wVk: VIRTUAL_KEY(vk), wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: INJECT_MARK },
+        },
+    };
+    let up_flags = if ext { KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY } else { KEYEVENTF_KEYUP };
+    let v = [key(VK_MASK, 0, KEYBD_EVENT_FLAGS(0)), key(VK_MASK, 0, KEYEVENTF_KEYUP), key(vk, scan, up_flags)];
+    unsafe {
+        let _ = SendInput(&v, std::mem::size_of::<INPUT>() as i32);
+    }
 }
 
 fn mouse_event(msg: u32, ms: &MSLLHOOKSTRUCT) -> Option<MouseEv> {
@@ -573,9 +762,17 @@ fn mouse_event(msg: u32, ms: &MSLLHOOKSTRUCT) -> Option<MouseEv> {
         WM_MOUSEHWHEEL => MouseKind::Wheel { delta: hi as i16 as i32, horizontal: true },
         _ => return None,
     };
+    // 移动事件：此刻真实光标位置（回调时还没被这次事件移动）
+    let cur = if kind == MouseKind::Move {
+        let mut p = POINT::default();
+        unsafe { GetCursorPos(&mut p) }.ok().map(|_| Point::new(p.x, p.y))
+    } else {
+        None
+    };
     Some(MouseEv {
         kind,
         pt: Point::new(ms.pt.x, ms.pt.y),
+        cur,
         time: ms.time,
         injected: ms.flags & LLMHF_INJECTED != 0,
     })
@@ -689,15 +886,19 @@ pub fn run(hub: Arc<Hub>, rx: Receiver<ToInput>) {
     ST.with(|s| *s.borrow_mut() = Some(Kvm::new(mine, &cfg, epoch, Box::new(probe_keys))));
     HUB.with(|h| *h.borrow_mut() = Some(hub.clone()));
 
+    crate::cursor::start_worker();
     let mut hooks = Hooks::default();
     hooks.install();
-    let timer = unsafe { SetTimer(None, 0, WATCHDOG_MS, None) };
+    let timer = unsafe { SetTimer(None, 0, TICK_MS, None) };
     if timer == 0 {
         crate::log!("看门狗定时器创建失败");
     }
     hub.set_input_tid(unsafe { GetCurrentThreadId() });
 
+    let mut ticks: u32 = 0;
+    let mut trips: u32 = 0;
     let mut lost_streak: u32 = 0;
+    let mut desk_was_ok = true;
     let mut quitting = false;
     loop {
         let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
@@ -706,19 +907,40 @@ pub fn run(hub: Arc<Hub>, rx: Receiver<ToInput>) {
         }
         match msg.message {
             WM_APP_WAKE => {}
+            WM_APP_DEFER => run_deferred(&hub),
             WM_TIMER => {
-                if watchdog_tripped() {
-                    lost_streak += 1;
-                    if lost_streak == 1 || lost_streak % 30 == 0 {
-                        crate::log!("钩子似乎被系统摘掉了（第 {lost_streak} 次），重装");
+                ticks = ticks.wrapping_add(1);
+                let desk_ok = crate::elev::input_desktop_default();
+                if desk_ok != desk_was_ok {
+                    desk_was_ok = desk_ok;
+                    crate::log!("输入桌面{}", if desk_ok { "回到 Default" } else { "切走了（安全桌面/锁屏）" });
+                }
+                let blocked = desk_ok && crate::elev::foreground_blocked();
+                dispatch(|k, out| {
+                    k.poll(blocked, desk_ok, out);
+                    Verdict::Pass
+                });
+                if !desk_ok {
+                    // 安全桌面上钩子本来就收不到输入：不算，回来后也不把那边的输入算进去
+                    trips = 0;
+                    LAST_HOOK.with(|c| c.set(tick()));
+                } else if ticks % WATCHDOG_TICKS == 0 {
+                    // 连续两次异常才算钩子丢了（避开空闲后第一次输入的竞态）
+                    trips = if watchdog_tripped() { trips + 1 } else { 0 };
+                    if trips >= 2 {
+                        trips = 0;
+                        lost_streak += 1;
+                        if lost_streak == 1 || lost_streak % 30 == 0 {
+                            crate::log!("钩子似乎被系统摘掉了（第 {lost_streak} 次），重装");
+                        }
+                        dispatch(|k, out| {
+                            k.hooks_lost(out);
+                            Verdict::Pass
+                        });
+                        hooks.install();
+                    } else if trips == 0 {
+                        lost_streak = 0;
                     }
-                    dispatch(|k, out| {
-                        k.hooks_lost(out);
-                        Verdict::Pass
-                    });
-                    hooks.install();
-                } else {
-                    lost_streak = 0;
                 }
             }
             _ => unsafe {
@@ -740,6 +962,9 @@ pub fn run(hub: Arc<Hub>, rx: Receiver<ToInput>) {
             let _ = KillTimer(None, timer);
         }
     }
+    run_deferred(&hub);
+    // 日志是后台线程写的：退出前尽量写完
+    crate::log::flush(300);
     ST.with(|s| s.borrow_mut().take());
     HUB.with(|h| h.borrow_mut().take());
 }
@@ -765,6 +990,11 @@ fn drain(rx: &Receiver<ToInput>) -> bool {
 
 /// 有输入发生、但钩子 1 秒以上没被调用：钩子丢了。
 fn watchdog_tripped() -> bool {
+    // 先让排队中的钩子调用跑完（PeekMessage 会处理发给本线程的钩子回调）
+    let mut m = MSG::default();
+    unsafe {
+        let _ = PeekMessageW(&mut m, None, 0, 0, PM_NOREMOVE);
+    }
     let mut lii = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
     if !unsafe { GetLastInputInfo(&mut lii) }.as_bool() {
         return false;
@@ -811,9 +1041,18 @@ mod tests {
             self.mouse(MouseKind::Move, Point::new(x, y), false)
         }
         fn mouse(&mut self, kind: MouseKind, pt: Point, injected: bool) -> (Verdict, Vec<Action>) {
+            self.mouse_cur(kind, pt, PARK, injected)
+        }
+        /// cur：回调时的真实光标位置（默认在停放点）
+        fn mouse_cur(&mut self, kind: MouseKind, pt: Point, cur: Point, injected: bool) -> (Verdict, Vec<Action>) {
             let mut out = vec![];
-            let v = self.k.mouse(MouseEv { kind, pt, time: self.t, injected }, &mut out);
+            let v = self.k.mouse(MouseEv { kind, pt, cur: Some(cur), time: self.t, injected }, &mut out);
             (v, out)
+        }
+        fn poll(&mut self, blocked: bool, desk_ok: bool) -> Vec<Action> {
+            let mut out = vec![];
+            self.k.poll(blocked, desk_ok, &mut out);
+            out
         }
         fn rel(&mut self, dx: i32, dy: i32) -> (Verdict, Vec<Action>) {
             self.t += 100; // 远离停放时间，避开旧坐标过滤
@@ -832,6 +1071,8 @@ mod tests {
             out
         }
         fn cross(&mut self) {
+            // 先离开边缘（回来/被控结束后要重新就绪）
+            assert_eq!(self.mv(1000, 500).0, Verdict::Pass);
             let (v, out) = self.mv(1919, 500);
             assert_eq!(v, Verdict::Swallow);
             assert_eq!(
@@ -1095,5 +1336,156 @@ mod tests {
         assert_eq!(scan_of(0x2E, 0, false, || 0xE053), (0x53, true));
         assert_eq!(scan_of(0x41, 0, false, || 0x1E), (0x1E, false));
         assert_eq!(scan_of(VK_PAUSE, 0x45, false, || unreachable!()), (0, false));
+    }
+
+    #[test]
+    fn no_rearm_until_cursor_leaves_edge() {
+        let mut t = setup();
+        t.cross();
+        t.rel(3, 0);
+        t.rel(-10, 0); // 回到本机
+        assert!(!t.k.driving());
+        // 还贴在边上：不跨
+        assert_eq!(t.mv(1919, 500), (Verdict::Pass, vec![]));
+        assert_eq!(t.mv(1919, 520), (Verdict::Pass, vec![]));
+        // 离开过边以后才跨
+        assert_eq!(t.mv(1918, 520), (Verdict::Pass, vec![]));
+        let (v, _) = t.mv(1919, 520);
+        assert_eq!(v, Verdict::Swallow);
+        assert!(t.k.driving());
+
+        // 热键回来也一样
+        t.key(0x91, true);
+        t.key(0x91, false);
+        assert_eq!(t.mv(1925, 520), (Verdict::Pass, vec![]));
+    }
+
+    #[test]
+    fn driven_end_disarms_crossing() {
+        let mut t = setup();
+        t.msg(ToInput::Driven(true));
+        t.msg(ToInput::Driven(false));
+        // 对方放手时光标停在共用的边上：小动一下不能把本机扔过去
+        assert_eq!(t.mv(1919, 500), (Verdict::Pass, vec![]));
+        assert_eq!(t.mv(1919, 501), (Verdict::Pass, vec![]));
+        t.cross();
+    }
+
+    #[test]
+    fn foreground_blocked_refuses_crossing() {
+        let mut t = setup();
+        assert!(t.poll(true, true).is_empty());
+        let warn = Action::Error { msg: FG_BLOCKED_MSG, on: true };
+        assert_eq!(t.mv(1919, 500), (Verdict::Pass, vec![warn.clone()]));
+        // 只提示一次
+        assert_eq!(t.mv(1919, 501), (Verdict::Pass, vec![]));
+        assert!(!t.k.driving());
+        // 前台换回普通窗口：清掉提示，可以跨
+        assert_eq!(t.poll(false, true), vec![Action::Error { msg: FG_BLOCKED_MSG, on: false }]);
+        t.cross();
+        // 驱动中前台变成管理员窗口：立刻回来并提示
+        let e = t.k.epoch;
+        let mut want = home_actions(e, Point::new(1918, 500));
+        want.push(warn);
+        assert_eq!(t.poll(true, true), want);
+        assert!(!t.k.driving());
+    }
+
+    #[test]
+    fn desktop_switch_returns_home() {
+        let mut t = setup();
+        t.cross();
+        assert!(t.poll(false, true).is_empty());
+        let e = t.k.epoch;
+        assert_eq!(t.poll(false, false), home_actions(e, Point::new(1918, 500)));
+        assert!(!t.k.driving());
+        assert!(t.poll(false, false).is_empty());
+    }
+
+    #[test]
+    fn no_return_while_remote_button_held() {
+        let mut t = setup();
+        t.cross();
+        let e = t.k.epoch;
+        t.rel(50, 0); // (50, 500)
+        t.mouse(MouseKind::Button(Button::Left, true), PARK, false);
+        // 拖向本机那条边：贴边停住，不回来
+        assert_eq!(t.rel(-100, 0), (Verdict::Swallow, vec![Action::Move { epoch: e, seq: 2, x: 0, y: 500 }]));
+        assert!(t.k.driving());
+        // 沿边仍可移动
+        assert_eq!(t.rel(-5, 10), (Verdict::Swallow, vec![Action::Move { epoch: e, seq: 3, x: 0, y: 510 }]));
+        assert!(t.k.driving());
+        // 松开后再推就回来
+        t.mouse(MouseKind::Button(Button::Left, false), PARK, false);
+        let (_, out) = t.rel(-5, 0);
+        assert_eq!(out, home_actions(e, Point::new(1918, 510)));
+    }
+
+    #[test]
+    fn delta_measured_from_real_cursor_and_reparks() {
+        let mut t = setup();
+        t.cross();
+        let e = t.k.epoch;
+        t.t += 100;
+        // 别的程序把光标挪到 (100, 100)：位移按真实位置算，并重新停放
+        let (v, out) = t.mouse_cur(MouseKind::Move, Point::new(103, 100), Point::new(100, 100), false);
+        assert_eq!(v, Verdict::Swallow);
+        assert_eq!(out, vec![Action::SetCursor(PARK), Action::Move { epoch: e, seq: 1, x: 3, y: 500 }]);
+        // 重新停放前排队的旧事件：丢弃
+        t.t += 2;
+        assert_eq!(t.mouse(MouseKind::Move, Point::new(105, 100), false), (Verdict::Swallow, vec![]));
+        // 停放点附近的正常移动
+        assert_eq!(
+            t.mouse(MouseKind::Move, Point::new(PARK.x + 2, PARK.y), false),
+            (Verdict::Swallow, vec![Action::Move { epoch: e, seq: 2, x: 5, y: 500 }])
+        );
+        // 光标停不回去（ClipCursor）：50ms 内不反复停放，位移仍正确
+        t.t += 2;
+        let (_, out) = t.mouse_cur(MouseKind::Move, Point::new(101, 100), Point::new(100, 100), false);
+        assert_eq!(out, vec![Action::Move { epoch: e, seq: 3, x: 6, y: 500 }]);
+        // 过了一阵仍在 (100, 100)：再停放一次
+        t.t += 60;
+        let (_, out) = t.mouse_cur(MouseKind::Move, Point::new(101, 101), Point::new(100, 100), false);
+        assert_eq!(out, vec![Action::SetCursor(PARK), Action::Move { epoch: e, seq: 4, x: 7, y: 501 }]);
+    }
+
+    #[test]
+    fn alt_held_at_crossing_masked_after_forwarding() {
+        // 没转发过东西：Alt 抬起照常放行
+        let mut t = setup();
+        t.held.borrow_mut()[0xA4] = true;
+        t.cross();
+        assert_eq!(t.key(0xA4, false), (Verdict::Pass, vec![]));
+
+        // 转发过按键：抬起吞掉，改为注入掩码键 + 抬起
+        let mut t = setup();
+        t.held.borrow_mut()[0xA4] = true;
+        t.cross();
+        t.key(0x41, true);
+        t.key(0x41, false);
+        assert_eq!(t.key(0xA4, false), (Verdict::Swallow, vec![Action::Mask { vk: 0xA4, scan: 0x10, ext: false }]));
+        // Shift 不需要
+        let mut t = setup();
+        t.held.borrow_mut()[0xA0] = true;
+        t.cross();
+        t.key(0x41, true);
+        assert_eq!(t.key(0xA0, false), (Verdict::Pass, vec![]));
+    }
+
+    #[test]
+    fn win_held_through_return_masked_at_home() {
+        let mut t = setup();
+        t.held.borrow_mut()[0x5B] = true;
+        t.cross();
+        t.mouse(MouseKind::Wheel { delta: 120, horizontal: false }, PARK, false);
+        t.key(0x91, true); // 热键回家，Win 还按着
+        t.key(0x91, false);
+        assert!(!t.k.driving());
+        // 自动重复的按下放行，不取消防菜单
+        assert_eq!(t.key(0x5B, true), (Verdict::Pass, vec![]));
+        assert_eq!(t.key(0x5B, false), (Verdict::Swallow, vec![Action::Mask { vk: 0x5B, scan: 0x10, ext: false }]));
+        // 只处理一次
+        assert_eq!(t.key(0x5B, true), (Verdict::Pass, vec![]));
+        assert_eq!(t.key(0x5B, false), (Verdict::Pass, vec![]));
     }
 }

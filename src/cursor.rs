@@ -4,7 +4,8 @@
 //!       OCR_SIZENS、OCR_SIZEALL、OCR_NO、OCR_HAND、OCR_APPSTARTING、OCR_HELP(32651)、OCR_PIN(32671)、OCR_PERSON(32672)
 //!       各调用 SetSystemCursor(CreateCursor(32x32 全透明：AND 掩码全 0xFF、XOR 掩码全 0), id)。
 //! show：SystemParametersInfoW(SPI_SETCURSORS, 0, None, 0)（不带 SPIF_SENDCHANGE，不广播）。
-//! 只在 desktop 线程调用（不要在钩子回调里调用）。
+//! 不要在钩子回调里直接调用 hide/show；input 线程用 request_hide/request_show（专用小线程执行，
+//! 不会被 desktop 线程的剪贴板阻塞拖住）。
 //!
 //! 守护进程：主程序启动时 `spawn_guard()` 以 `kmlink.exe guard <pid>` 启动自身（CREATE_NO_WINDOW）；
 //! `guard_main` OpenProcess(SYNCHRONIZE) 后 WaitForSingleObject 等主程序结束，然后 show() 恢复光标并退出。
@@ -69,6 +70,62 @@ pub fn show() {
     unsafe {
         if let Err(e) = SystemParametersInfoW(SPI_SETCURSORS, 0, None, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) {
             crate::log!("恢复光标失败：{e}");
+        }
+    }
+}
+
+/// 专用光标线程（第一次用时启动）。只执行最新的请求。
+fn worker() -> Option<&'static crossbeam_channel::Sender<bool>> {
+    static TX: std::sync::OnceLock<Option<crossbeam_channel::Sender<bool>>> = std::sync::OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = crossbeam_channel::unbounded::<bool>();
+        let r = std::thread::Builder::new().name("cursor".into()).spawn(move || {
+            while let Ok(mut want) = rx.recv() {
+                // 积压的请求只看最后一个
+                while let Ok(w) = rx.try_recv() {
+                    want = w;
+                }
+                if want { show() } else { hide() }
+            }
+        });
+        match r {
+            Ok(_) => Some(tx),
+            Err(e) => {
+                crate::log!("启动光标线程失败：{e}");
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// 预先启动光标线程（别在钩子回调里第一次建线程）。
+pub fn start_worker() {
+    let _ = worker();
+}
+
+/// 请求隐藏光标（不阻塞；可在钩子回调里调用）。
+pub fn request_hide() {
+    request(false);
+}
+
+/// 请求恢复光标（不阻塞；可在钩子回调里调用）。
+pub fn request_show() {
+    request(true);
+}
+
+fn request(show_it: bool) {
+    match worker() {
+        Some(tx) => {
+            let _ = tx.send(show_it);
+        }
+        // 没有线程：退回直接调用
+        None => {
+            if show_it {
+                show()
+            } else {
+                hide()
+            }
         }
     }
 }
