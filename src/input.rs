@@ -225,6 +225,9 @@ impl Drive {
 }
 
 pub struct Kvm {
+    /// 最近一次顶在跨屏边上没过去的原因（"" = 没被拒）；refuse_why 是 try_cross_at 的工作变量。
+    pub refused: &'static str,
+    refuse_why: &'static str,
     /// 诊断（KMLINK_TRACE=1）：跨屏后前 32 个移动事件 (time, pt.x, pt.y, cur.x, cur.y, parked, vc.x)。
     pub trace: [(u32, i32, i32, i32, i32, i32, i32); 32],
     pub trace_n: usize,
@@ -287,6 +290,8 @@ impl Kvm {
             yield_acc_at: None,
             yielded_at: None,
             home_note: None,
+            refused: "",
+            refuse_why: "",
             trace: [(0, 0, 0, 0, 0, 0, 0); 32],
             trace_n: 0,
             probe,
@@ -388,26 +393,39 @@ impl Kvm {
     fn try_cross(&mut self, pt: Point, cur: Option<Point>, time: u32, out: &mut Vec<Action>) -> bool {
         // 钩子里的坐标可能越出屏幕：先钳回桌面（钳在当前所在的显示器里）
         let p = self.mine.clamp_from(cur.unwrap_or(pt), pt);
+        let r = self.try_cross_at(p, time, out);
+        // 顶在跨屏那条边上却没过去：记下原因（定时器里原因变化时写一行日志，钩子里不写）
+        self.refused = if !r && self.mine.on_outer_edge(self.layout.side, p) { self.refuse_why } else { "" };
+        r
+    }
+
+    fn try_cross_at(&mut self, p: Point, time: u32, out: &mut Vec<Action>) -> bool {
+        self.refuse_why = "";
         if !self.armed {
             // 回来后先要离开过跨屏那条边
             if !self.mine.on_outer_edge(self.layout.side, p) {
                 self.armed = true;
             }
+            self.refuse_why = "刚回到本机，先离开这条边再过去";
             return false;
         }
         if self.paused || self.driven {
+            self.refuse_why = if self.paused { "已暂停共享" } else { "本机正被对方控制" };
             return false;
         }
         if let Some(t) = self.yielded_at {
             if (0..YIELD_COOLDOWN_MS).contains(&since(time, t)) {
+                self.refuse_why = "对方刚请本机放手，1.5 秒内不过去";
                 return false; // 对方刚请本机放手：先别再过去抢
             }
             self.yielded_at = None;
         }
         let Some(peer) = self.peer.as_ref() else {
+            self.refuse_why = "还没连上对方";
             return false;
         };
         if peer.is_empty() || self.mine.is_empty() {
+            self.refuse_why = "不知道对方的显示器";
             return false;
         }
         let Some(entry) = self.layout.exit_to_peer(&self.mine, peer, p) else {
@@ -415,10 +433,12 @@ impl Kvm {
         };
         if self.fg_blocked {
             // 前台是管理员窗口：钩子收不到它的按键，跨过去键盘会落在本机
+            self.refuse_why = "前台是管理员窗口";
             self.warn(out);
             return false;
         }
         if MOUSE_VKS.iter().any(|&v| (self.probe)(v)) {
+            self.refuse_why = "鼠标键按着（拖动中）";
             return false; // 拖动中不跨屏
         }
         let mut held = [false; 256];
@@ -1136,6 +1156,7 @@ pub fn run(hub: Arc<Hub>, rx: Receiver<ToInput>) {
     let mut ticks: u32 = 0;
     let mut trips: u32 = 0;
     let mut lost_streak: u32 = 0;
+    let mut last_refused: &'static str = "";
     let mut desk_was_ok = true;
     let mut quitting = false;
     loop {
@@ -1165,6 +1186,12 @@ pub fn run(hub: Arc<Hub>, rx: Receiver<ToInput>) {
                 let blocked = desk_ok && crate::elev::foreground_blocked();
                 dispatch(|k, out| {
                     k.poll(blocked, desk_ok, out);
+                    if k.refused != last_refused {
+                        if !k.refused.is_empty() {
+                            crate::log!("顶在边上没跨过去：{}", k.refused);
+                        }
+                        last_refused = k.refused;
+                    }
                     if let Some((loc, p)) = k.home_note.take() {
                         crate::log!("回到本机（input.rs:{}，对方光标 {},{}）", loc.line(), p.x, p.y);
                         if TRACE.load(Ordering::Relaxed) {

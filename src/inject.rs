@@ -201,6 +201,7 @@ impl Injector {
             return;
         }
         g.fail_yield = Some(now);
+        crate::log!("注入失败（前台是管理员窗口、锁屏或 UAC？），请对方放手");
         self.hub.send(Msg::Yield { epoch: g.epoch });
     }
 
@@ -229,6 +230,7 @@ impl Injector {
                 g.active = false;
                 self.set_driven(&g, false);
             }
+            crate::log!("{}，不接管，请对方回去", if paused { "本机已暂停共享" } else { "本机刚有人在用键鼠" });
             self.hub.send(Msg::Yield { epoch });
             return;
         }
