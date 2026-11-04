@@ -3,14 +3,20 @@
 //!   - desktop：隐藏窗口 + 消息循环：剪贴板监听/读写、托盘、显示器变化、配置文件变化、隐藏/恢复系统光标。
 //!   - net：会话（TCP 可靠通道 + UDP 低延迟通道），以及被控端的注入（`inject::Injector`，可在任意线程调用）。
 //! 发给 input/desktop 的消息走 channel，再 PostThreadMessage(WM_APP_WAKE) 叫醒对方的消息循环。
+//!
+//! 剪贴板图片 / 大段文字的发送是一条“压缩流”（`clip_stream`）：desktop 的压缩工作线程边压缩边 `StreamTx::send`，
+//! net-tcp 从 `StreamRx` 取分片发出。有界：还没发出的压缩数据超过上限时压缩线程等着（net 发走一片就叫醒它）；
+//! net 不要了（CancelClip、新内容顶掉、会话断开 —— StreamRx 被丢弃）、内容过时或 30 秒没进展时压缩线程立刻放弃，不会死等。
 
 use crate::config::Config;
 use crate::geom::Desk;
 use crate::proto::Msg;
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_APP};
 
@@ -51,8 +57,9 @@ pub enum ToDesktop {
     ClipText(String),
     /// 对方剪贴板已和本机不一致：清掉“已同步”记录。
     ClipForget,
-    /// 对方发来的剪贴板图片（已解压）：format 为 CF_DIB(8) 或 CF_DIBV5(17)。
-    ClipImage { format: u32, data: Vec<u8> },
+    /// 对方发来的图片（CF_DIB / CF_DIBV5，已校验）或大段文字（CF_UNICODETEXT）：已解压进 GlobalAlloc 的内存，
+    /// 可以直接交给剪贴板；摘要在接收时边解压边算好。
+    ClipData(crate::clip::Blob),
     /// 隐藏本机系统光标（开始驱动对方）/ 恢复（回到本机）。
     HideCursor,
     ShowCursor,
@@ -68,11 +75,191 @@ pub enum Out {
     Msg(Msg),
     /// UDP：被控端光标绝对位置。net 线程只发最新的一个。
     Move { epoch: u32, seq: u32, x: i32, y: i32 },
-    /// 剪贴板图片：deflate 后的数据（在可靠通道上分片、低优先级发送）。
-    ClipImage { format: u32, raw_len: u32, deflated: Vec<u8> },
+    /// 剪贴板图片 / 大段文字（format 13）开始发送：raw_len = 原始长度，压缩分片随后从 data 流出
+    /// （在可靠通道上分片、低优先级发送）。
+    ClipStream { format: u32, raw_len: u32, data: StreamRx },
     /// 剪贴板已被更新的内容取代（本机复制了新东西，或刚写入了对方发来的内容）：
     /// 丢掉还没发完的图片，也丢掉正在接收的对方图片。
     CancelClip,
+}
+
+// ---------- 剪贴板压缩流（压缩线程 → net-tcp，有界） ----------
+
+/// 压缩线程等 net 发走数据时，每隔这么久看一次内容是否已过时。
+const STREAM_POLL: Duration = Duration::from_millis(100);
+/// 这么久一片都没发出去：放弃（正常情况下会话早已因写超时断开）。
+const STREAM_STALL: Duration = Duration::from_secs(30);
+
+/// 叫醒 net-tcp（有新分片 / 流结束了）。
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct PipeState {
+    q: VecDeque<Vec<u8>>,
+    /// q 里的字节数。
+    bytes: usize,
+    /// 压缩线程已送完全部分片。
+    done: bool,
+    /// 压缩线程没送完就放弃了。
+    tx_gone: bool,
+    /// net 不要了（StreamRx 已丢弃）。
+    rx_gone: bool,
+    waker: Option<Waker>,
+}
+
+struct Pipe {
+    limit: usize,
+    st: Mutex<PipeState>,
+    /// 压缩线程在这里等 net 取走分片。
+    cv: Condvar,
+}
+
+impl Pipe {
+    fn lock(&self) -> MutexGuard<'_, PipeState> {
+        self.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// 一条剪贴板压缩流：limit = 还没发出的压缩数据上限（字节）。
+pub fn clip_stream(limit: usize) -> (StreamTx, StreamRx) {
+    let p = Arc::new(Pipe { limit, st: Mutex::new(PipeState::default()), cv: Condvar::new() });
+    (StreamTx(p.clone()), StreamRx(p))
+}
+
+/// 压缩线程这一端。没 `finish` 就丢弃 = 放弃（net 随后发 Abort）。
+pub struct StreamTx(Arc<Pipe>);
+
+/// net 这一端。丢弃 = 不要了：压缩线程的 `send` 立刻返回 false。
+pub struct StreamRx(Arc<Pipe>);
+
+/// `StreamRx::take` 的结果。
+#[derive(Debug, PartialEq, Eq)]
+pub enum Piece {
+    Data(Vec<u8>),
+    /// 全部送完。
+    End,
+    /// 压缩线程中途放弃了。
+    Gone,
+    /// 暂时没有。
+    Wait,
+}
+
+impl StreamTx {
+    /// 交出一片压缩数据。还没发出的超过上限时等 net 取走；等待期间 net 不要了、live() 为假（内容已过时）、
+    /// 或 30 秒没有进展：返回 false（调用方放弃）。叫醒 net 时不持有本流的锁。
+    pub fn send(&self, piece: Vec<u8>, live: &dyn Fn() -> bool) -> bool {
+        let len = piece.len();
+        let mut moved = Instant::now();
+        let mut g = self.0.lock();
+        loop {
+            if g.rx_gone {
+                return false;
+            }
+            if g.bytes == 0 || g.bytes + len <= self.0.limit {
+                break;
+            }
+            let before = g.bytes;
+            g = self.0.cv.wait_timeout(g, STREAM_POLL).unwrap_or_else(|e| e.into_inner()).0;
+            if g.bytes < before {
+                moved = Instant::now();
+            }
+            if g.rx_gone || moved.elapsed() >= STREAM_STALL {
+                return false;
+            }
+            // 问 live 时不持有本流的锁（它会去拿别的锁）
+            drop(g);
+            if !live() {
+                return false;
+            }
+            g = self.0.lock();
+        }
+        g.q.push_back(piece);
+        g.bytes += len;
+        let w = g.waker.clone();
+        drop(g);
+        if let Some(w) = w {
+            w();
+        }
+        true
+    }
+
+    /// 全部送完。
+    pub fn finish(self) {
+        self.0.lock().done = true;
+        // Drop 里叫醒 net
+    }
+}
+
+impl Drop for StreamTx {
+    fn drop(&mut self) {
+        let w = {
+            let mut g = self.0.lock();
+            if !g.done {
+                g.tx_gone = true;
+            }
+            g.waker.clone()
+        };
+        if let Some(w) = w {
+            w();
+        }
+    }
+}
+
+impl StreamRx {
+    /// 登记叫醒 net-tcp 的办法（net-out 收下这条流时）。
+    pub fn set_waker(&self, w: Waker) {
+        self.0.lock().waker = Some(w);
+    }
+
+    /// 有东西可取（分片、结束或放弃）。
+    pub fn ready(&self) -> bool {
+        let g = self.0.lock();
+        !g.q.is_empty() || g.done || g.tx_gone
+    }
+
+    /// 排队中（还没取走）的压缩字节数。
+    #[cfg(test)]
+    pub fn queued(&self) -> usize {
+        self.0.lock().bytes
+    }
+
+    /// 取一片；取走后叫醒可能在等的压缩线程。
+    pub fn take(&self) -> Piece {
+        let mut g = self.0.lock();
+        if let Some(v) = g.q.pop_front() {
+            g.bytes -= v.len();
+            drop(g);
+            self.0.cv.notify_all();
+            return Piece::Data(v);
+        }
+        if g.done {
+            Piece::End
+        } else if g.tx_gone {
+            Piece::Gone
+        } else {
+            Piece::Wait
+        }
+    }
+}
+
+impl Drop for StreamRx {
+    fn drop(&mut self) {
+        {
+            let mut g = self.0.lock();
+            g.rx_gone = true;
+            g.q = VecDeque::new();
+            g.bytes = 0;
+            g.waker = None;
+        }
+        self.0.cv.notify_all();
+    }
+}
+
+impl std::fmt::Debug for StreamRx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let g = self.0.lock();
+        write!(f, "StreamRx {{ queued: {}, done: {}, gone: {} }}", g.bytes, g.done, g.tx_gone)
+    }
 }
 
 #[derive(Clone, Debug, Default)]

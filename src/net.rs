@@ -7,6 +7,8 @@
 //! - net-out（常驻，独占 hub 的 net 通道）：分拣要发的东西。鼠标位置由它直接发 UDP，不经过 TCP 写路径（传图时也不受影响）；
 //!   两次至少隔 2ms，只发最新的，间隔一到立刻补发最新值（不丢最后一个位置）。其余进可靠队列。每秒 Ping / UDP Hi / 检查。
 //! - net-tcp（常驻）：从可靠队列取：先发全部消息，再发至多一个 16 KiB 图片分片，如此循环 —— 按键等消息最多等一个分片。
+//!   图片 / 大段文字是压缩流（hub::clip_stream）：压缩线程边压缩边交分片，交来一片就叫醒 net-tcp；
+//!   net-tcp 发走一片，压缩线程才能再交（未发出的至多 1 MiB）。流被丢弃（CancelClip、新内容、会话断开）时压缩线程立刻停下。
 //! - udp：UdpSocket 绑 0.0.0.0:cfg.port（失败则每 5 秒重试；SO_RCVBUF 256 KiB），一个接收线程。
 //!
 //! 握手见 crypto.rs（KML2：预共享密钥 + X25519 临时密钥，前向保密）。握手 + 第一帧有 2 秒绝对期限，第一帧（认证前）≤ 64 KiB。
@@ -32,9 +34,13 @@
 //!     peer.json / config.toml 内容变了才写，每秒至多一次（来得太快就攒着，下一帧或会话结束时写最新的）。
 //!   Enter/Leave/Button/Wheel/Key/Move → injector
 //!   Yield → hub.to_input(Yield)
-//!   ClipText → hub.to_desktop(ClipText)；ClipImage + 分片 → 按 total 预分配、拼齐后解压到 raw_len 大小的缓冲 → hub.to_desktop(ClipImage)
+//!   ClipText → hub.to_desktop(ClipText)；ClipStart → 按 raw_len（受上限管）GlobalAlloc 好最终的那块内存，
+//!     之后每个分片直接解压进去（不环绕的输出缓冲），同时边解边算摘要、图片一收到头就校验 DIB；
+//!     结束帧到了核对压缩总长、解压长度，做完整的 DIB 校验 → hub.to_desktop(ClipData)，desktop 直接交给剪贴板。
+//!     全程只有 raw_len 这一份（另有约 10 KiB 的解压器状态）。
 //!     format = 13（CF_UNICODETEXT，大段文字）受 clipboard.enabled 管，图片另受 clipboard.images 管。
-//!     30 秒没进展的半截传输释放掉；Out::CancelClip 时丢掉正在接收的（之后这个 id 的分片都忽略）。
+//!     解压出错、超长、分片错位、头不对、对方作废（FRAME_ABORT）、30 秒没进展：立刻释放。
+//!     Out::CancelClip 时丢掉正在接收的（之后这个 id 的分片都忽略）；新的 ClipStart 顶掉旧的。
 //!   Ping → 经可靠队列回 Pong
 //! 会话结束：injector.end_session；hub.to_input(PeerDown)；hub.set_status(connected=false)。
 //! UDP：对方地址 = TCP 对端 IP + Hello 里的 udp_port；之后以最近一个认证通过的 UDP 包源地址为准。每秒发 UdpMsg::Hi。
@@ -43,16 +49,17 @@
 //!   本机 UDP 不可用、还没收到过对方的 UDP 包、或 2.5 秒没收到（对方每秒发 Hi）：鼠标位置同时走 TCP（Msg::Move，
 //!   排在已排队的消息之后、图片分片之前，只留最新的一个）；UDP 包再来就自动切回只走 UDP。
 //!   最后一个 Move 在 100ms 内没有更新的就补发一次（同 seq，接收方去重），之后 3 秒内每秒再补一次。
-//! 发送端 Out::Msg 在没有会话时直接丢弃（不排队），Out::ClipImage 同样丢弃。
+//! 发送端 Out::Msg 在没有会话时直接丢弃（不排队），Out::ClipStream 同样丢弃（压缩线程随之停下）。
+//! 已发出开始帧的流没发完就被丢弃（取消/被新内容顶掉/压缩线程放弃）：在同一会话里补发 FRAME_ABORT，对方立刻释放。
 //!
-//! 内存：没有常驻的大缓冲。读帧按帧长分配、用完即还；发图片的数据发完就丢；UDP 接收缓冲 128 字节。
+//! 内存：没有常驻的大缓冲。读帧按帧长分配、用完即还；发送端只排着 ≤ 1 MiB 的压缩分片；UDP 接收缓冲 128 字节。
 
 use crate::config::{self, ClipCfg, Config};
 use crate::crypto::{self, Opener, Sealer, UdpOpener, UdpSealer};
 use crate::geom::{Desk, Layout};
-use crate::hub::{Hub, Out, ToDesktop, ToInput};
+use crate::hub::{Hub, Out, Piece, StreamRx, ToDesktop, ToInput};
 use crate::inject::Injector;
-use crate::proto::{self, CHUNK, Frame, MAGIC, MAGIC_V1, Msg, PROTO_VERSION, UdpMsg};
+use crate::proto::{self, Frame, MAGIC, MAGIC_V1, Msg, PROTO_VERSION, UdpMsg};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
@@ -1040,11 +1047,13 @@ impl Net {
             }
             match proto::decode_frame(&plain) {
                 Some(Frame::Msg(m)) => self.handle(&sess, m, &mut st),
-                Some(Frame::Chunk { id, offset, data }) => {
-                    if let Some((format, data)) = st.clip.chunk(id, offset, data) {
-                        self.hub.to_desktop(ToDesktop::ClipImage { format, data });
+                Some(Frame::Chunk { id, offset, data }) => st.clip.chunk(id, offset, data),
+                Some(Frame::End { id, total }) => {
+                    if let Some(b) = st.clip.end(id, total) {
+                        self.hub.to_desktop(ToDesktop::ClipData(b));
                     }
                 }
+                Some(Frame::Abort { id }) => st.clip.abort(id),
                 None => crate::log!("忽略无法解析的帧（{} 字节）", plain.len()),
             }
             drop(plain);
@@ -1112,10 +1121,10 @@ impl Net {
                     self.hub.to_desktop(ToDesktop::ClipText(text));
                 }
             }
-            Msg::ClipImage { id, format, total, raw_len } => match clip_limit(&self.hub.cfg().clipboard, format) {
+            Msg::ClipStart { id, format, raw_len } => match clip_limit(&self.hub.cfg().clipboard, format) {
                 Some(max) => {
-                    if !st.clip.start(id, format, total, raw_len, max) {
-                        crate::log!("忽略对方的剪贴板数据（格式 {format}，{total} / {raw_len} 字节，超过上限）");
+                    if let Err(e) = st.clip.start(id, format, raw_len, max) {
+                        crate::log!("忽略对方的剪贴板数据（格式 {format}，{raw_len} 字节，{e}）");
                     }
                 }
                 None => st.clip.reset(),
@@ -1384,12 +1393,24 @@ impl Net {
     }
 
     /// 分拣一个要发的东西。
-    fn route(&self, o: Out, mover: &mut Mover) {
+    fn route(self: &Arc<Self>, o: Out, mover: &mut Mover) {
         match o {
             Out::Move { epoch, seq, x, y } => mover.push(UdpMsg::Move { epoch, seq, x, y }),
             Out::CancelClip => {
                 self.clip_gen.fetch_add(1, Ordering::Relaxed);
                 self.enqueue(Out::CancelClip);
+            }
+            Out::ClipStream { format, raw_len, data } => {
+                // 压缩线程交来新分片 / 结束时叫醒 net-tcp。先拿一下队列锁再通知：net-tcp 查过“没活”到开始等待
+                // 之间一直持有这把锁，所以通知不会落在两者之间丢掉
+                let w = Arc::downgrade(self);
+                data.set_waker(Arc::new(move || {
+                    if let Some(n) = w.upgrade() {
+                        drop(lock(&n.tq));
+                        n.tq_cv.notify_one();
+                    }
+                }));
+                self.enqueue(Out::ClipStream { format, raw_len, data });
             }
             o => self.enqueue(o),
         }
@@ -1446,7 +1467,7 @@ impl Net {
         }
     }
 
-    /// 常驻 net-tcp：从可靠队列取，阻塞写 TCP。每轮先发全部消息，再发至多一个图片分片。
+    /// 常驻 net-tcp：从可靠队列取，阻塞写 TCP。每轮先发全部消息，再发至多一个图片分片（压缩流暂时没有分片就等）。
     fn run_tcp(self: Arc<Self>) {
         let mut img_id = u32::from_le_bytes([crypto::random32()[0], 0, 0, 0]);
         loop {
@@ -1487,8 +1508,10 @@ struct ImgTx {
     id: u32,
     format: u32,
     raw_len: u32,
-    data: Vec<u8>,
+    /// 压缩流：丢弃 ImgTx 即告诉压缩线程不要了。
+    data: StreamRx,
     header_sent: bool,
+    /// 已发出的压缩字节数。
     off: usize,
 }
 
@@ -1496,6 +1519,8 @@ struct ImgTx {
 struct OutQueue {
     msgs: VecDeque<Msg>,
     img: Option<ImgTx>,
+    /// 已发出开始帧、没发完就被丢弃的流：(会话, id)，下一轮在同一会话里发 FRAME_ABORT。
+    abort: Option<(u64, u32)>,
     /// hub 通道已关闭（进程退出）：net-tcp 结束。
     quit: bool,
 }
@@ -1506,7 +1531,7 @@ impl OutQueue {
             Out::Msg(m) => {
                 // 新复制的文字顶掉还没发完的图片/大段文字，免得对方最后收到旧内容
                 if matches!(m, Msg::ClipText { .. }) {
-                    self.img = None;
+                    self.drop_img();
                 }
                 self.msgs.push_back(m)
             }
@@ -1515,69 +1540,152 @@ impl OutQueue {
                 self.msgs.retain(|m| !matches!(m, Msg::Move { .. }));
                 self.msgs.push_back(Msg::Move { epoch, seq, x, y });
             }
-            Out::ClipImage { format, raw_len, deflated } => {
-                if deflated.is_empty() || u32::try_from(deflated.len()).is_err() {
-                    return;
+            Out::ClipStream { format, raw_len, data } => {
+                // 新图片顶掉还没发完的旧图片（接收方见到新 id 也会丢弃旧的）
+                self.drop_img();
+                if raw_len == 0 {
+                    return; // data 随之丢弃，压缩线程停下
                 }
-                // 新图片顶掉还没发完的旧图片（接收方见到新 id 会丢弃旧的）
-                self.img = Some(ImgTx { sess: None, id: 0, format, raw_len, data: deflated, header_sent: false, off: 0 });
+                self.img = Some(ImgTx { sess: None, id: 0, format, raw_len, data, header_sent: false, off: 0 });
             }
-            Out::CancelClip => self.img = None,
+            Out::CancelClip => self.drop_img(),
+        }
+    }
+
+    /// 丢掉正在发的流（压缩线程随之停下）；对方已开始接收的，记下要补发作废。
+    fn drop_img(&mut self) {
+        if let Some(i) = self.img.take()
+            && i.header_sent
+            && let Some(s) = i.sess
+        {
+            self.abort = Some((s, i.id));
         }
     }
 
     fn has_work(&self) -> bool {
-        !self.msgs.is_empty() || self.img.is_some()
+        !self.msgs.is_empty() || self.abort.is_some() || self.img.as_ref().is_some_and(|i| !i.header_sent || i.data.ready())
     }
 
     fn clear(&mut self) {
         self.msgs.clear();
         self.img = None;
+        self.abort = None;
         if self.msgs.capacity() > 256 {
             self.msgs.shrink_to_fit();
         }
     }
 
-    /// 取出这一轮要发的 TCP 明文帧：全部消息，然后至多一个图片帧（头或一个分片）。
+    /// 取出这一轮要发的 TCP 明文帧：全部消息、待补发的作废，然后至多一个图片帧（开始、一个分片、结束或作废）。
     fn take_batch(&mut self, sess_id: u64, img_id: &mut u32) -> Vec<Vec<u8>> {
         let mut frames: Vec<Vec<u8>> = self.msgs.drain(..).map(|m| proto::encode_msg(&m)).collect();
         if self.msgs.capacity() > 256 {
             self.msgs.shrink_to_fit();
         }
+        // 旧会话的作废不用发（对方那边的会话已经没了）
+        if let Some((s, id)) = self.abort.take()
+            && s == sess_id
+        {
+            frames.push(proto::encode_abort(id));
+        }
         if self.img.as_ref().is_some_and(|i| i.sess.is_some_and(|s| s != sess_id)) {
             self.img = None;
         }
-        if let Some(img) = self.img.as_mut() {
-            img.sess = Some(sess_id);
-            if !img.header_sent {
-                *img_id = img_id.wrapping_add(1);
-                img.id = *img_id;
-                img.header_sent = true;
-                let total = img.data.len() as u32;
-                frames.push(proto::encode_msg(&Msg::ClipImage { id: img.id, format: img.format, total, raw_len: img.raw_len }));
-            } else {
-                let end = (img.off + CHUNK).min(img.data.len());
-                frames.push(proto::encode_chunk(img.id, img.off as u32, &img.data[img.off..end]));
-                img.off = end;
-                if end >= img.data.len() {
-                    self.img = None; // 发完即释放整块数据
+        let Some(img) = self.img.as_mut() else { return frames };
+        img.sess = Some(sess_id);
+        if !img.header_sent {
+            *img_id = img_id.wrapping_add(1);
+            img.id = *img_id;
+            img.header_sent = true;
+            frames.push(proto::encode_msg(&Msg::ClipStart { id: img.id, format: img.format, raw_len: img.raw_len }));
+            return frames;
+        }
+        match img.data.take() {
+            Piece::Data(v) => match u32::try_from(img.off) {
+                Ok(off) if u32::try_from(img.off + v.len()).is_ok() => {
+                    frames.push(proto::encode_chunk(img.id, off, &v));
+                    img.off += v.len();
                 }
+                _ => {
+                    frames.push(proto::encode_abort(img.id));
+                    self.img = None;
+                }
+            },
+            Piece::End => {
+                frames.push(proto::encode_end(img.id, img.off as u32));
+                self.img = None;
             }
+            Piece::Gone => {
+                frames.push(proto::encode_abort(img.id));
+                self.img = None;
+            }
+            Piece::Wait => {}
         }
         frames
     }
 }
 
-// ---------------------------------------------------------------- 剪贴板分片拼装（纯逻辑）
+// ---------------------------------------------------------------- 剪贴板压缩流的接收（纯逻辑）
 
+/// 正在接收的一条流：最终的内存一次分配好，每片直接解压进去，边解边算摘要。
 struct Incoming {
     id: u32,
     format: u32,
-    total: usize,
     raw_len: usize,
-    buf: Vec<u8>,
+    /// raw_len 字节（文字另加 2 字节结尾 0），收齐后整块交给剪贴板。
+    mem: crate::clip::Global,
+    z: proto::Inflater,
+    digest: crate::clip::Digest,
+    /// 已收到的压缩字节数。
+    off: usize,
     /// 最近一次有进展的时间（30 秒不动就释放）。
     at: Instant,
+}
+
+impl Incoming {
+    /// 压缩数据至多这么长（level 1 对不可压缩数据只多出很少）：防止对方用不出数据的空块拖住。
+    fn max_compressed(&self) -> usize {
+        self.raw_len + self.raw_len / 16 + 4096
+    }
+
+    fn feed(&mut self, offset: u32, data: &[u8]) -> Result<(), &'static str> {
+        if offset as usize != self.off {
+            return Err("分片错位");
+        }
+        self.off += data.len();
+        if self.off > self.max_compressed() {
+            return Err("压缩数据过长");
+        }
+        let Incoming { mem, z, digest, raw_len, .. } = self;
+        mem.with(|b| {
+            let out = &mut b[..*raw_len];
+            z.feed(data, out)?;
+            digest.update(&out[..z.written()])
+        })
+        .ok_or("内存锁定失败")??;
+        self.at = Instant::now();
+        Ok(())
+    }
+
+    /// 结束帧：核对总长与解压长度，做完整的 DIB 校验，算完摘要。
+    fn finish(self, total: u32) -> Result<crate::clip::Blob, &'static str> {
+        if total as usize != self.off {
+            return Err("压缩数据总长不符");
+        }
+        if !self.z.done() || self.z.written() != self.raw_len {
+            return Err("解压后的长度不符");
+        }
+        let Incoming { format, raw_len, mut mem, digest, .. } = self;
+        let (hash, text_len) = mem
+            .with(|b| {
+                let data = &b[..raw_len];
+                if format != crate::clip::CF_UNICODETEXT {
+                    crate::clip::dib(data)?;
+                }
+                digest.finish(data)
+            })
+            .ok_or("内存锁定失败")??;
+        Ok(crate::clip::Blob { format, mem, hash, text_len })
+    }
 }
 
 #[derive(Default)]
@@ -1586,21 +1694,36 @@ struct ClipRx {
 }
 
 impl ClipRx {
-    /// 丢掉正在接收的（之后这个 id 的分片都不认）。
+    /// 丢掉正在接收的（之后这个 id 的分片都不认），内存立刻释放。
     fn reset(&mut self) {
         self.cur = None;
     }
 
-    /// 新传输开始（丢弃未完成的旧传输）。超过上限返回 false。
-    /// 按 total 一次分配好（不倍增扩容；total 已受 max 限制，分配的页要写入时才真正占内存）。
-    fn start(&mut self, id: u32, format: u32, total: u32, raw_len: u32, max: usize) -> bool {
+    /// 新传输开始（先丢弃未完成的旧传输）：按 raw_len 一次分配好最终内存。
+    /// 只收图片（CF_DIB / CF_DIBV5）和大段文字（CF_UNICODETEXT，长度须为偶数）；超过上限、分配失败：Err。
+    fn start(&mut self, id: u32, format: u32, raw_len: u32, max: usize) -> Result<(), &'static str> {
+        use crate::clip::{CF_DIB, CF_DIBV5, CF_UNICODETEXT, Digest, Global};
         self.cur = None;
-        let (total, raw_len) = (total as usize, raw_len as usize);
-        if total == 0 || raw_len == 0 || total > max || raw_len > max {
-            return false;
+        let raw_len = raw_len as usize;
+        let text = format == CF_UNICODETEXT;
+        if !text && format != CF_DIB && format != CF_DIBV5 {
+            return Err("格式不支持");
         }
-        self.cur = Some(Incoming { id, format, total, raw_len, buf: Vec::with_capacity(total), at: Instant::now() });
-        true
+        if raw_len == 0 || raw_len > max {
+            return Err("超过上限");
+        }
+        if text && raw_len % 2 != 0 {
+            return Err("文字长度不对");
+        }
+        // 文字另留 2 字节结尾 0（CF_UNICODETEXT 要求）
+        let size = if text { raw_len + 2 } else { raw_len };
+        let mut mem = Global::alloc(size).ok_or("内存分配失败")?;
+        if text {
+            mem.with(|b| b[raw_len..].fill(0)).ok_or("内存锁定失败")?;
+        }
+        let digest = if text { Digest::text() } else { Digest::image(raw_len) };
+        self.cur = Some(Incoming { id, format, raw_len, mem, z: proto::Inflater::new(), digest, off: 0, at: Instant::now() });
+        Ok(())
     }
 
     /// 半截的传输 30 秒没进展：释放。
@@ -1611,35 +1734,36 @@ impl ClipRx {
         }
     }
 
-    /// 收到一片；拼齐并解压成功时返回 (format, 原始数据)。
-    fn chunk(&mut self, id: u32, offset: u32, data: &[u8]) -> Option<(u32, Vec<u8>)> {
-        let inc = self.cur.as_mut()?;
+    /// 收到一片：直接解压进最终内存。出错（错位、损坏、超长、图片头不对）就整条丢弃。
+    fn chunk(&mut self, id: u32, offset: u32, data: &[u8]) {
+        let Some(inc) = self.cur.as_mut() else { return };
         if inc.id != id {
-            return None; // 旧传输的残片
+            return; // 旧传输的残片
         }
-        if offset as usize != inc.buf.len() || inc.buf.len() + data.len() > inc.total {
-            crate::log!("剪贴板分片错位，丢弃");
+        if let Err(e) = inc.feed(offset, data) {
+            crate::log!("对方的剪贴板数据有误（{e}），丢弃");
             self.cur = None;
+        }
+    }
+
+    /// 结束帧：一切核对无误时交出整块内容。
+    fn end(&mut self, id: u32, total: u32) -> Option<crate::clip::Blob> {
+        if self.cur.as_ref()?.id != id {
             return None;
         }
-        inc.buf.extend_from_slice(data);
-        inc.at = Instant::now();
-        if inc.buf.len() < inc.total {
-            return None;
-        }
-        let inc = self.cur.take()?;
-        // 按 raw_len 一次分配好解压缓冲；数据比声称的长会报 HasMoreOutput
-        let mut out = vec![0u8; inc.raw_len];
-        match miniz_oxide::inflate::decompress_slice_iter_to_slice(&mut out, std::iter::once(&inc.buf[..]), false, false) {
-            Ok(n) if n == inc.raw_len => Some((inc.format, out)),
-            Ok(n) => {
-                crate::log!("剪贴板数据长度不符（{n} ≠ {}），丢弃", inc.raw_len);
-                None
-            }
+        match self.cur.take()?.finish(total) {
+            Ok(b) => Some(b),
             Err(e) => {
-                crate::log!("剪贴板数据解压失败：{e:?}");
+                crate::log!("对方的剪贴板数据有误（{e}），丢弃");
                 None
             }
+        }
+    }
+
+    /// 对方作废了这条流。
+    fn abort(&mut self, id: u32) {
+        if self.cur.as_ref().is_some_and(|c| c.id == id) {
+            self.cur = None;
         }
     }
 }
@@ -1651,6 +1775,7 @@ mod tests {
     use super::*;
     use crate::geom::Side;
     use crate::hub::{HubRx, ToDesktop, ToInput};
+    use crate::proto::CHUNK;
 
     fn psk() -> [u8; 32] {
         [0x42; 32]
@@ -1877,22 +2002,42 @@ mod tests {
         frames
             .iter()
             .map(|f| match proto::decode_frame(f) {
-                Some(Frame::Msg(Msg::ClipImage { .. })) => "hdr".into(),
+                Some(Frame::Msg(Msg::ClipStart { .. })) => "hdr".into(),
                 Some(Frame::Msg(Msg::Ping { t })) => format!("p{t}"),
                 Some(Frame::Msg(Msg::Move { seq, .. })) => format!("m{seq}"),
                 Some(Frame::Msg(_)) => "msg".into(),
                 Some(Frame::Chunk { offset, .. }) => format!("c{offset}"),
+                Some(Frame::End { total, .. }) => format!("end{total}"),
+                Some(Frame::Abort { id }) => format!("abort{id}"),
                 None => "?".into(),
             })
             .collect()
+    }
+
+    /// 测试用的流：pieces 先排好（不限量）；finish = 已送完。返回还没送完时的发送端。
+    fn queued_stream(pieces: &[Vec<u8>], finish: bool) -> (Option<crate::hub::StreamTx>, StreamRx) {
+        let (tx, rx) = crate::hub::clip_stream(usize::MAX);
+        for p in pieces {
+            assert!(tx.send(p.clone(), &|| true));
+        }
+        if finish {
+            tx.finish();
+            (None, rx)
+        } else {
+            (Some(tx), rx)
+        }
+    }
+
+    fn stream_out(format: u32, pieces: &[Vec<u8>]) -> Out {
+        Out::ClipStream { format, raw_len: 999, data: queued_stream(pieces, true).1 }
     }
 
     #[test]
     fn queue_priority_and_coalescing() {
         let mut q = OutQueue::default();
         let mut id = 0u32;
-        let data: Vec<u8> = (0..CHUNK * 2 + 10).map(|i| i as u8).collect();
-        q.push(Out::ClipImage { format: 8, raw_len: 999, deflated: data.clone() });
+        let pieces = vec![vec![1u8; CHUNK], vec![2u8; CHUNK], vec![3u8; 10]];
+        q.push(stream_out(8, &pieces));
         q.push(mv(1));
         q.push(Out::Msg(Msg::Ping { t: 1 }));
         q.push(mv(2));
@@ -1905,31 +2050,89 @@ mod tests {
         q.push(mv(3));
         assert_eq!(kinds(&q.take_batch(7, &mut id)), ["p3".to_string(), "m3".into(), format!("c{CHUNK}")]);
         assert_eq!(kinds(&q.take_batch(7, &mut id)), [format!("c{}", CHUNK * 2)]);
+        assert_eq!(kinds(&q.take_batch(7, &mut id)), [format!("end{}", CHUNK * 2 + 10)]);
         assert!(q.img.is_none());
         assert!(!q.has_work());
         assert!(q.take_batch(7, &mut id).is_empty());
-        // 取消：丢掉待发的图片
-        q.push(Out::ClipImage { format: 8, raw_len: 1, deflated: vec![1; 10] });
+        // 取消：丢掉待发的图片（还没发开始帧：不用告诉对方）
+        q.push(stream_out(8, &pieces));
         q.push(Out::CancelClip);
         assert!(!q.has_work());
+    }
+
+    #[test]
+    fn queue_waits_for_stream() {
+        let mut q = OutQueue::default();
+        let mut id = 0u32;
+        let (tx, rx) = queued_stream(&[], false);
+        let tx = tx.unwrap();
+        q.push(Out::ClipStream { format: 17, raw_len: 100, data: rx });
+        assert!(q.has_work());
+        assert_eq!(kinds(&q.take_batch(1, &mut id)), ["hdr"]);
+        // 压缩线程还没交分片：没活（net-tcp 等着，不空转）
+        assert!(!q.has_work());
+        assert!(q.take_batch(1, &mut id).is_empty());
+        assert!(tx.send(vec![5; 100], &|| true));
+        assert!(q.has_work());
+        // 消息照样插在分片前面
+        q.push(Out::Msg(Msg::Ping { t: 9 }));
+        assert_eq!(kinds(&q.take_batch(1, &mut id)), ["p9", "c0"]);
+        assert!(!q.has_work());
+        tx.finish();
+        assert!(q.has_work());
+        assert_eq!(kinds(&q.take_batch(1, &mut id)), ["end100"]);
+        assert!(!q.has_work());
+
+        // 压缩线程中途放弃：告诉对方作废
+        let (tx, rx) = queued_stream(&[vec![1; 10]], false);
+        q.push(Out::ClipStream { format: 17, raw_len: 100, data: rx });
+        assert_eq!(kinds(&q.take_batch(1, &mut id)), ["hdr"]);
+        assert_eq!(kinds(&q.take_batch(1, &mut id)), ["c0"]);
+        drop(tx);
+        assert!(q.has_work());
+        assert_eq!(kinds(&q.take_batch(1, &mut id)), ["abort2"]);
+        assert!(!q.has_work());
+
+        // 发到一半被取消 / 被新文字顶掉：压缩线程那边立刻知道，下一轮告诉对方作废
+        for cancel in [Out::CancelClip, Out::Msg(Msg::ClipText { text: "新".into() })] {
+            let (tx, rx) = queued_stream(&[vec![1; 10]], false);
+            let tx = tx.unwrap();
+            q.push(Out::ClipStream { format: 8, raw_len: 100, data: rx });
+            assert_eq!(kinds(&q.take_batch(1, &mut id)), ["hdr"]);
+            let n = id;
+            q.push(cancel);
+            assert!(!tx.send(vec![1], &|| true), "流已被丢弃");
+            let k = kinds(&q.take_batch(1, &mut id));
+            assert_eq!(k.last().unwrap(), &format!("abort{n}"));
+            assert!(!q.has_work());
+        }
     }
 
     #[test]
     fn queue_drops_image_on_session_change() {
         let mut q = OutQueue::default();
         let mut id = 0u32;
-        q.push(Out::ClipImage { format: 8, raw_len: 1, deflated: vec![1; CHUNK * 3] });
+        let (tx, rx) = queued_stream(&[vec![1; CHUNK]], false);
+        let tx = tx.unwrap();
+        q.push(Out::ClipStream { format: 8, raw_len: 1, data: rx });
         assert_eq!(kinds(&q.take_batch(1, &mut id)), ["hdr"]);
+        // 会话换了：丢掉（旧会话的作废不用发），压缩线程随之停下
         assert!(q.take_batch(2, &mut id).is_empty());
         assert!(q.img.is_none());
-        // 新图片替换旧图片，id 递增
-        q.push(Out::ClipImage { format: 8, raw_len: 1, deflated: vec![1; 10] });
-        q.push(Out::ClipImage { format: 17, raw_len: 1, deflated: vec![2; 10] });
+        assert!(!tx.send(vec![1], &|| true));
+        // 新图片替换旧图片，id 递增；旧的发过开始帧，先补发作废
+        q.push(stream_out(8, &[vec![1; 10]]));
+        assert_eq!(kinds(&q.take_batch(2, &mut id)), ["hdr"]);
+        q.push(stream_out(17, &[vec![2; 10]]));
         let f = q.take_batch(2, &mut id);
-        match proto::decode_frame(&f[0]) {
-            Some(Frame::Msg(Msg::ClipImage { id, format, total, .. })) => assert_eq!((id, format, total), (2, 17, 10)),
+        assert_eq!(kinds(&f), ["abort2", "hdr"]);
+        match proto::decode_frame(&f[1]) {
+            Some(Frame::Msg(Msg::ClipStart { id, format, raw_len })) => assert_eq!((id, format, raw_len), (3, 17, 999)),
             _ => panic!(),
         }
+        // 断开（clear）：什么都不留
+        q.clear();
+        assert!(!q.has_work());
     }
 
     #[test]
@@ -2007,61 +2210,146 @@ mod tests {
         assert!(a.per_ip.is_empty());
     }
 
-    fn deflate(raw: &[u8]) -> Vec<u8> {
-        miniz_oxide::deflate::compress_to_vec(raw, 1)
+    /// 流式压缩成分片（和发送端同一个压缩器）。
+    fn deflate(raw: &[u8]) -> Vec<Vec<u8>> {
+        crate::proto::tests::deflate_pieces(raw, 0)
+    }
+
+    /// 合法的 DIB（CF_DIB 头），像素 n 字节：前 1/3 可压缩，其余随机。
+    fn test_dib(n: usize) -> Vec<u8> {
+        let w = 100;
+        let n = n / (w * 4) * (w * 4);
+        let mut d = crate::clip::tests::make_dib(40, w as i32, (n / (w * 4)) as i32, 32, 0, 0, 0, n);
+        let k = d.len() / 3;
+        getrandom::fill(&mut d[k..]).unwrap();
+        d
+    }
+
+    /// 把分片按顺序喂给 rx（偏移按压缩数据累计），最后发结束帧。
+    fn feed_all(rx: &mut ClipRx, id: u32, pieces: &[Vec<u8>]) -> Option<crate::clip::Blob> {
+        let mut off = 0;
+        for p in pieces {
+            rx.chunk(id, off as u32, p);
+            off += p.len();
+        }
+        rx.end(id, off as u32)
+    }
+
+    fn bytes(b: &mut crate::clip::Blob) -> Vec<u8> {
+        b.mem.with(|m| m.to_vec()).unwrap()
     }
 
     #[test]
-    fn clip_reassembly() {
-        let raw: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8 ^ (i / 1000) as u8).collect();
+    fn clip_stream_receive() {
+        use crate::clip::{CF_DIB, CF_DIBV5, hash_image};
+        let raw = test_dib(300_000);
         let z = deflate(&raw);
+        assert!(z.len() > 3);
         let mut rx = ClipRx::default();
-        assert!(rx.start(5, 8, z.len() as u32, raw.len() as u32, 1 << 20));
-        assert_eq!(rx.cur.as_ref().unwrap().buf.capacity(), z.len()); // 一次按 total 分配
-        let mut out = None;
-        for (i, part) in z.chunks(1000).enumerate() {
-            assert!(out.is_none());
-            out = rx.chunk(5, (i * 1000) as u32, part);
-        }
-        assert_eq!(out, Some((8, raw.clone())));
-
-        // 超上限
-        assert!(!rx.start(6, 8, z.len() as u32, raw.len() as u32, 1000));
-        assert!(rx.chunk(6, 0, &z).is_none());
-        // 新 id 丢弃旧传输
-        assert!(rx.start(7, 8, z.len() as u32, raw.len() as u32, 1 << 20));
-        assert!(rx.chunk(7, 0, &z[..10]).is_none());
-        assert!(rx.start(8, 17, z.len() as u32, raw.len() as u32, 1 << 20));
-        assert!(rx.chunk(7, 10, &z[10..]).is_none());
-        assert_eq!(rx.chunk(8, 0, &z), Some((17, raw.clone())));
-        // 偏移错位
-        assert!(rx.start(9, 8, z.len() as u32, raw.len() as u32, 1 << 20));
-        assert!(rx.chunk(9, 5, &z[..10]).is_none());
+        assert!(rx.start(5, CF_DIB, raw.len() as u32, 1 << 20).is_ok());
+        assert_eq!(rx.cur.as_ref().unwrap().mem.len(), raw.len()); // 一次按 raw_len 分配最终内存
+        let mut b = feed_all(&mut rx, 5, &z).expect("收齐");
         assert!(rx.cur.is_none());
-        // raw_len 声称比实际小：解压超限 → 丢弃
-        assert!(rx.start(10, 8, z.len() as u32, 100, 1 << 20));
-        assert!(rx.chunk(10, 0, &z).is_none());
-        // raw_len 声称比实际大：长度不符 → 丢弃
-        assert!(rx.start(12, 8, z.len() as u32, raw.len() as u32 + 1, 1 << 20));
-        assert!(rx.chunk(12, 0, &z).is_none());
+        assert_eq!((b.format, b.text_len), (CF_DIB, 0));
+        assert_eq!(b.hash, hash_image(CF_DIB, &raw)); // 边收边算的摘要
+        assert!(bytes(&mut b) == raw);
+        // 任意切分（含 1 字节一片、恰好跨分片边界）
+        let all = z.concat();
+        for cut in [1, 333, CHUNK - 1, CHUNK, CHUNK + 1] {
+            if all.len() / cut > 50_000 {
+                continue;
+            }
+            let re: Vec<Vec<u8>> = all.chunks(cut).map(|c| c.to_vec()).collect();
+            assert!(rx.start(6, CF_DIBV5, raw.len() as u32, 1 << 20).is_ok());
+            let mut b = feed_all(&mut rx, 6, &re).expect("收齐");
+            assert!(bytes(&mut b) == raw);
+        }
+
+        // 超上限、格式不对、长度 0：不分配
+        assert!(rx.start(6, CF_DIB, raw.len() as u32, 1000).is_err());
+        assert!(rx.cur.is_none());
+        assert!(rx.start(6, 2, 100, 1 << 20).is_err());
+        assert!(rx.start(6, CF_DIB, 0, 1 << 20).is_err());
+        assert!(rx.start(6, 13, 101, 1 << 20).is_err()); // 文字长度须为偶数
+        // 新 id 丢弃旧传输；旧 id 的残片、结束都不认
+        assert!(rx.start(7, CF_DIB, raw.len() as u32, 1 << 20).is_ok());
+        rx.chunk(7, 0, &z[0]);
+        assert!(rx.start(8, CF_DIBV5, raw.len() as u32, 1 << 20).is_ok());
+        rx.chunk(7, z[0].len() as u32, &z[1]);
+        assert!(rx.end(7, 0).is_none());
+        assert!(rx.cur.is_some());
+        let mut b = feed_all(&mut rx, 8, &z).expect("收齐");
+        assert_eq!(b.format, CF_DIBV5);
+        assert!(bytes(&mut b) == raw);
+    }
+
+    #[test]
+    fn clip_stream_rejects_and_frees() {
+        use crate::clip::CF_DIB;
+        let raw = test_dib(100_000);
+        let z = deflate(&raw);
+        let all = z.concat();
+        let n = raw.len() as u32;
+        let mut rx = ClipRx::default();
+        // 偏移错位：立刻释放
+        assert!(rx.start(9, CF_DIB, n, 1 << 20).is_ok());
+        rx.chunk(9, 5, &all[..10]);
+        assert!(rx.cur.is_none());
+        // raw_len 声称比实际小：解压超长 → 立刻释放（不等结束）
+        assert!(rx.start(10, CF_DIB, n - 1, 1 << 20).is_ok());
+        rx.chunk(10, 0, &all);
+        assert!(rx.cur.is_none());
+        // raw_len 声称比实际大：结束时长度不符
+        assert!(rx.start(12, CF_DIB, n + 1, 1 << 20).is_ok());
+        assert!(feed_all(&mut rx, 12, &z).is_none());
+        assert!(rx.cur.is_none());
+        // 结束帧的总长不符 / 截断
+        assert!(rx.start(13, CF_DIB, n, 1 << 20).is_ok());
+        rx.chunk(13, 0, &all);
+        assert!(rx.end(13, all.len() as u32 + 1).is_none());
+        assert!(rx.start(14, CF_DIB, n, 1 << 20).is_ok());
+        rx.chunk(14, 0, &all[..all.len() - 20]);
+        assert!(rx.cur.is_some());
+        assert!(rx.end(14, all.len() as u32 - 20).is_none());
         // 垃圾数据
-        assert!(rx.start(11, 8, 4, 100, 1 << 20));
-        assert!(rx.chunk(11, 0, &[0xff; 4]).is_none());
+        assert!(rx.start(11, CF_DIB, 100, 1 << 20).is_ok());
+        rx.chunk(11, 0, &[0xff; 64]);
+        assert!(rx.cur.is_none());
+        // 图片头不对：收到头就丢弃，不等收完
+        let mut bad = raw.clone();
+        bad[12] = 2; // planes
+        let zb = deflate(&bad).concat();
+        assert!(rx.start(15, CF_DIB, n, 1 << 20).is_ok());
+        rx.chunk(15, 0, &zb[..zb.len().min(4096)]);
+        assert!(rx.cur.is_none());
+        // 对方作废
+        assert!(rx.start(16, CF_DIB, n, 1 << 20).is_ok());
+        rx.chunk(16, 0, &all[..10]);
+        rx.abort(15);
+        assert!(rx.cur.is_some());
+        rx.abort(16);
+        assert!(rx.cur.is_none());
+        // 压缩数据长得离谱（不出数据的空块拖时间）
+        assert!(rx.start(17, CF_DIB, 10, 1 << 20).is_ok());
+        let max = rx.cur.as_ref().unwrap().max_compressed();
+        rx.chunk(17, 0, &vec![0u8; max + 1]);
+        assert!(rx.cur.is_none());
     }
 
     #[test]
     fn clip_cancel_and_stall() {
-        let raw: Vec<u8> = (0..50_000u32).map(|i| (i % 7) as u8).collect();
-        let z = deflate(&raw);
+        let raw = test_dib(50_000);
+        let z = deflate(&raw).concat();
         let mut rx = ClipRx::default();
         // 取消：之后这个 id 的分片都忽略
-        assert!(rx.start(3, 8, z.len() as u32, raw.len() as u32, 1 << 20));
-        assert!(rx.chunk(3, 0, &z[..10]).is_none());
+        assert!(rx.start(3, 8, raw.len() as u32, 1 << 20).is_ok());
+        rx.chunk(3, 0, &z[..10]);
         rx.reset();
-        assert!(rx.chunk(3, 10, &z[10..]).is_none());
+        rx.chunk(3, 10, &z[10..]);
+        assert!(rx.end(3, z.len() as u32).is_none());
         assert!(rx.cur.is_none());
         // 30 秒没进展：释放
-        assert!(rx.start(4, 8, z.len() as u32, raw.len() as u32, 1 << 20));
+        assert!(rx.start(4, 8, raw.len() as u32, 1 << 20).is_ok());
         rx.expire(Instant::now() + Duration::from_secs(20));
         assert!(rx.cur.is_some());
         rx.expire(Instant::now() + CLIP_STALL + Duration::from_secs(1));
@@ -2078,12 +2366,19 @@ mod tests {
         c.enabled = false;
         assert_eq!(clip_limit(&c, 13), None);
         assert_eq!(clip_limit(&c, 8), None);
-        // 文字分片拼装
-        let raw: Vec<u8> = "大段文字".repeat(100).encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-        let z = deflate(&raw);
+        // 大段文字：解进末尾带 0 的内存，可直接当 CF_UNICODETEXT；摘要、UTF-8 长度与整段算的一致
+        let text = "大段文字😀".repeat(100);
+        let raw = crate::clip::utf16le(&text);
         let mut rx = ClipRx::default();
-        assert!(rx.start(1, 13, z.len() as u32, raw.len() as u32, 1 << 20));
-        assert_eq!(rx.chunk(1, 0, &z), Some((13, raw)));
+        assert!(rx.start(1, 13, raw.len() as u32, 1 << 20).is_ok());
+        let mut b = feed_all(&mut rx, 1, &deflate(&raw)).expect("收齐");
+        assert_eq!(b.format, 13);
+        assert_eq!(b.text_len, text.len());
+        assert_eq!(b.hash, crate::clip::hash_text(&text));
+        let m = bytes(&mut b);
+        assert_eq!(m.len(), raw.len() + 2);
+        assert_eq!(&m[..raw.len()], &raw[..]);
+        assert_eq!(&m[raw.len()..], &[0, 0]);
     }
 
     // ------------------------------------------------ 两个进程内的“对等端”
@@ -2145,6 +2440,24 @@ mod tests {
         panic!("超时：{what}");
     }
 
+    /// 像压缩工作线程那样：开始一条流（未发出的至多 1 MiB），边压缩边交分片。线程结果 = 是否送完。
+    fn send_stream(hub: &Arc<Hub>, format: u32, raw: Vec<u8>) -> std::thread::JoinHandle<bool> {
+        let (tx, rx) = crate::hub::clip_stream(1 << 20);
+        hub.to_net(Out::ClipStream { format, raw_len: raw.len() as u32, data: rx });
+        std::thread::spawn(move || {
+            let mut z = proto::Deflater::new();
+            let mut ok = true;
+            let mut it = raw.chunks(64 * 1024).peekable();
+            while ok && let Some(b) = it.next() {
+                ok = z.write(b, it.peek().is_none(), &mut |p| tx.send(p, &|| true));
+            }
+            if ok {
+                tx.finish();
+            }
+            ok
+        })
+    }
+
     fn next_desktop(rx: &Receiver<ToDesktop>, secs: u64) -> ToDesktop {
         next_desktop_opt(rx, secs).expect("desktop 消息超时")
     }
@@ -2203,26 +2516,36 @@ mod tests {
             m => panic!("{m:?}"),
         }
 
-        // 图片：多片，中间夹着文字
-        let mut raw = vec![0u8; 300_000];
-        getrandom::fill(&mut raw).unwrap();
-        raw[..100_000].fill(7); // 一部分可压缩
-        let z = deflate(&raw);
-        assert!(z.len() > CHUNK);
+        // 图片：多片流式，中间夹着文字
+        let raw = test_dib(300_000);
+        assert!(deflate(&raw).len() > 1);
         // 多片图片完整到达；期间插进来的控制消息（Yield）不用等图片发完
-        b.hub.to_net(Out::ClipImage { format: 17, raw_len: raw.len() as u32, deflated: z.clone() });
+        let t = send_stream(&b.hub, 17, raw.clone());
         b.hub.send(Msg::Yield { epoch: 0 });
         wait("Yield 先到", 10, || matches!(a.input.try_recv(), Ok(ToInput::Yield(_))));
         match next_desktop(&a.desktop, 10) {
-            ToDesktop::ClipImage { format, data } => {
-                assert_eq!(format, 17);
-                assert!(data == raw);
+            ToDesktop::ClipData(mut d) => {
+                assert_eq!(d.format, 17);
+                assert_eq!(d.hash, crate::clip::hash_image(17, &raw));
+                assert!(bytes(&mut d) == raw);
             }
             m => panic!("{m:?}"),
         }
+        assert!(t.join().unwrap());
+
+        // 大段文字走同一条路
+        let text = "大段文字 abc\n".repeat(20_000);
+        let t = send_stream(&b.hub, 13, crate::clip::utf16le(&text));
+        match next_desktop(&a.desktop, 10) {
+            ToDesktop::ClipData(d) => {
+                assert_eq!((d.format, d.text_len, d.hash), (13, text.len(), crate::clip::hash_text(&text)));
+            }
+            m => panic!("{m:?}"),
+        }
+        assert!(t.join().unwrap());
 
         // 图片还没发完时又复制了文字：文字是最新内容，对方最后拿到的必须是文字（旧图片作废）
-        b.hub.to_net(Out::ClipImage { format: 17, raw_len: raw.len() as u32, deflated: z });
+        let t = send_stream(&b.hub, 17, raw.clone());
         b.hub.send(Msg::ClipText { text: "插队".into() });
         loop {
             match next_desktop(&a.desktop, 10) {
@@ -2230,11 +2553,12 @@ mod tests {
                     assert_eq!(t, "插队");
                     break;
                 }
-                ToDesktop::ClipImage { .. } => continue, // 若图片抢在文字之前发完也可以，但不能在文字之后
+                ToDesktop::ClipData(_) => continue, // 若图片抢在文字之前发完也可以，但不能在文字之后
                 m => panic!("{m:?}"),
             }
         }
         assert!(next_desktop_opt(&a.desktop, 1).is_none(), "文字之后不应再收到旧图片");
+        let _ = t.join().unwrap(); // 被顶掉时压缩线程放弃（false），已发完则 true
 
         // UDP：双方通过 Hi 学到对方地址
         let learned = |n: &Node| n.net.current().is_some_and(|s| lock(&s.udp_peer).learned);
@@ -2261,18 +2585,45 @@ mod tests {
         let learned = |n: &Node| n.net.current().is_some_and(|s| lock(&s.udp_peer).learned);
         wait("UDP 打通", 5, || learned(&a) && learned(&b));
         let sb = b.net.current().unwrap();
-        let mut raw = vec![0u8; 4_000_000];
-        getrandom::fill(&mut raw).unwrap();
-        let z = deflate(&raw);
+        let raw = test_dib(4_000_000);
         let u0 = a.net.stats.udp_moves.load(Ordering::Relaxed);
+        let t;
         {
             // 卡住 B 的 TCP 发送（模拟 WiFi 上分片排不出去）
             let _g = lock(&sb.tx);
-            b.hub.to_net(Out::ClipImage { format: 8, raw_len: raw.len() as u32, deflated: z });
+            t = send_stream(&b.hub, 8, raw.clone());
             std::thread::sleep(Duration::from_millis(50));
             b.hub.to_net(Out::Move { epoch: 1, seq: 1, x: 1, y: 1 });
             wait("TCP 卡着时 UDP Move 照样到", 2, || a.net.stats.udp_moves.load(Ordering::Relaxed) > u0);
+            // 压缩线程填满 1 MiB 后等着（背压），不会把整张图压完堆在内存里
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!t.is_finished());
         }
+        // 放开后照常发完
+        match next_desktop(&a.desktop, 20) {
+            ToDesktop::ClipData(mut d) => assert!(bytes(&mut d) == raw),
+            m => panic!("{m:?}"),
+        }
+        assert!(t.join().unwrap());
+    }
+
+    #[test]
+    fn stream_stops_when_session_drops() {
+        // 传图时会话断了：压缩线程不会死等，立刻放弃
+        let (_a, b) = pair();
+        let sb = b.net.current().unwrap();
+        let raw = test_dib(8_000_000);
+        let t;
+        {
+            let _g = lock(&sb.tx);
+            t = send_stream(&b.hub, 8, raw);
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!t.is_finished(), "应在等 net 发走");
+            sb.close();
+        }
+        let t0 = Instant::now();
+        assert!(!t.join().unwrap());
+        assert!(t0.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
@@ -2322,12 +2673,11 @@ mod tests {
     fn cancel_clip_drops_incoming_image() {
         let (a, b) = pair();
         let sb = b.net.current().unwrap();
-        let mut raw = vec![0u8; 100_000];
-        getrandom::fill(&mut raw).unwrap();
-        let z = deflate(&raw);
+        let raw = test_dib(100_000);
+        let z = deflate(&raw).concat();
         assert!(z.len() > CHUNK);
-        let hdr = |id: u32| proto::encode_msg(&Msg::ClipImage { id, format: 8, total: z.len() as u32, raw_len: raw.len() as u32 });
-        // B 发了图片头和第一片
+        let hdr = |id: u32| proto::encode_msg(&Msg::ClipStart { id, format: 8, raw_len: raw.len() as u32 });
+        // B 发了开始帧和第一片
         sb.send_plain(&hdr(777)).unwrap();
         sb.send_plain(&proto::encode_chunk(777, 0, &z[..CHUNK])).unwrap();
         std::thread::sleep(Duration::from_millis(300));
@@ -2335,14 +2685,23 @@ mod tests {
         a.hub.to_net(Out::CancelClip);
         wait("A 处理取消", 5, || a.net.clip_gen.load(Ordering::Relaxed) == 1);
         sb.send_plain(&proto::encode_chunk(777, CHUNK as u32, &z[CHUNK..])).unwrap();
+        sb.send_plain(&proto::encode_end(777, z.len() as u32)).unwrap();
         assert!(next_desktop_opt(&a.desktop, 1).is_none(), "取消后不应再拼出这张图");
-        // 之后新的传输照常
+        // 对方作废的流也拼不出来
         sb.send_plain(&hdr(778)).unwrap();
-        sb.send_plain(&proto::encode_chunk(778, 0, &z)).unwrap();
+        sb.send_plain(&proto::encode_chunk(778, 0, &z[..CHUNK])).unwrap();
+        sb.send_plain(&proto::encode_abort(778)).unwrap();
+        sb.send_plain(&proto::encode_chunk(778, CHUNK as u32, &z[CHUNK..])).unwrap();
+        sb.send_plain(&proto::encode_end(778, z.len() as u32)).unwrap();
+        assert!(next_desktop_opt(&a.desktop, 1).is_none(), "作废后不应再拼出这张图");
+        // 之后新的传输照常
+        sb.send_plain(&hdr(779)).unwrap();
+        sb.send_plain(&proto::encode_chunk(779, 0, &z)).unwrap();
+        sb.send_plain(&proto::encode_end(779, z.len() as u32)).unwrap();
         match next_desktop(&a.desktop, 5) {
-            ToDesktop::ClipImage { format, data } => {
-                assert_eq!(format, 8);
-                assert!(data == raw);
+            ToDesktop::ClipData(mut d) => {
+                assert_eq!(d.format, 8);
+                assert!(bytes(&mut d) == raw);
             }
             m => panic!("{m:?}"),
         }
