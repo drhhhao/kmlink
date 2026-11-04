@@ -1105,6 +1105,7 @@ impl Net {
                 self.injector.moved(sess.id, epoch, seq, x, y)
             }
             Msg::Yield { epoch } => self.hub.to_input(ToInput::Yield(epoch)),
+            Msg::ClipForget => self.hub.to_desktop(ToDesktop::ClipForget),
             Msg::ClipText { text } => {
                 let c = self.hub.cfg().clipboard;
                 if c.enabled && text.len() <= c.max_text_kb as usize * 1024 {

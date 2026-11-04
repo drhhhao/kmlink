@@ -75,6 +75,9 @@ pub enum Msg {
     /// UDP 不可用（绑定失败/还没学到对方地址）时，鼠标位置改走可靠通道。语义同 UdpMsg::Move。
     Move { epoch: u32, seq: u32, x: i32, y: i32 },
     ClipText { text: String },
+    /// 本机剪贴板变成了不同步的内容（敏感/超限/暂停期间复制的等）：两边不再一致，对方清掉“已同步”记录，
+    /// 之后对方再复制和之前同样的内容也会照常发过来。只在“已同步 → 不一致”时发一次，收到不回发，不会来回。
+    ClipForget,
     /// 剪贴板图片开始：之后跟 total 字节的 FRAME_CHUNK（deflate 压缩后的 CF_DIB/CF_DIBV5 数据）。
     ClipImage { id: u32, format: u32, total: u32, raw_len: u32 },
     Ping { t: u64 },

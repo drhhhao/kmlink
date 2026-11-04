@@ -702,6 +702,7 @@ impl State {
             ToDesktop::HideCursor => cursor::hide(),
             ToDesktop::ShowCursor => cursor::show(),
             ToDesktop::Status => self.refresh_tray(),
+            ToDesktop::ClipForget => sync(|s| s.forget()),
             ToDesktop::Quit => return false,
         }
         true
@@ -797,10 +798,16 @@ impl State {
     /// 本机有了不同步的内容：待写的对方内容作废（本机的更新），两边不再一致。
     fn local_other(&mut self) {
         self.drop_pending();
-        sync(|s| {
+        let was_synced = sync(|s| {
             s.local();
+            let had = s.synced.is_some();
             s.forget();
+            had
         });
+        // 告诉对方两边已不一致（只在“已同步 → 不一致”时发一次），免得对方之后复制同样内容时被当成回声不发
+        if was_synced && self.hub.status().connected {
+            self.hub.send(Msg::ClipForget);
+        }
     }
 
     /// 菜单事件；返回 false 表示退出。

@@ -49,6 +49,8 @@ pub enum ToInput {
 pub enum ToDesktop {
     /// 对方发来的剪贴板文字。
     ClipText(String),
+    /// 对方剪贴板已和本机不一致：清掉“已同步”记录。
+    ClipForget,
     /// 对方发来的剪贴板图片（已解压）：format 为 CF_DIB(8) 或 CF_DIBV5(17)。
     ClipImage { format: u32, data: Vec<u8> },
     /// 隐藏本机系统光标（开始驱动对方）/ 恢复（回到本机）。
