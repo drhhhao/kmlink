@@ -13,15 +13,18 @@
 //!    - “配对密钥”编辑框（cfg.key，64 位十六进制）+ “复制”按钮（复制到剪贴板）+ “新密钥”按钮。
 //!      提示：“两台必须相同：在一台复制，粘贴到另一台。”
 //!    - “本机地址”只读文字：列出本机 IPv4（GetAdaptersAddresses 或 std 解析主机名均可；没有就省略）。
-//! 3. 底部按钮：“保存”（校验密钥是 64 位十六进制，否则提示；layout.rev = config::now_ms()；Config::save()；关闭窗口）
+//! 3. 底部按钮：“保存”（校验密钥；config::update 只改 peer/key，排布真被改过才写 layout 并 rev = next_rev；关闭窗口）
 //!    和“取消”。主程序会在 1 秒内发现配置变化并重新加载、把排布同步给对方。
+//! 只允许一个设置窗口（命名互斥量 Local\kmlink-settings），再打开就把已有的窗口提到前面。
 //! 文字要简洁。所有坐标是物理像素（进程已 PerMonitorV2），字体大小按 GetDpiForWindow 缩放。
 
 use crate::config::{self, Config};
 use crate::geom::{Desk, Layout, Rect, Side};
 use crate::sys;
 use std::cell::RefCell;
-use windows::Win32::Foundation::{COLORREF, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, ERROR_ALREADY_EXISTS, GetLastError, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, COLOR_WINDOWTEXT, CreateCompatibleBitmap, CreateCompatibleDC,
     CreateFontW, CreatePen, DC_BRUSH, DC_PEN, DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC,
@@ -29,16 +32,17 @@ use windows::Win32::Graphics::Gdi::{
     HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_DOT,
     Rectangle, SRCCOPY, SelectObject, SetBkColor, SetBkMode, SetDCBrushColor, SetDCPenColor, SetTextColor, TRANSPARENT,
 };
-use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetDlgCtrlID, GetDlgItem,
-    GetMessageW, GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, IDC_SIZEALL, IsDialogMessageW, LoadCursorW, MB_ICONWARNING, MB_OK,
-    MSG, MessageBoxW, MoveWindow, PostQuitMessage, RegisterClassExW, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetCursor,
-    SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND,
+    BN_CLICKED, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClientRect, GetDlgCtrlID,
+    GetDlgItem, GetMessageW, GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, IDC_SIZEALL, IsDialogMessageW, IsIconic, LoadCursorW,
+    MB_ICONWARNING, MB_OK, MSG, MessageBoxW, MoveWindow, PostQuitMessage, RegisterClassExW, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
+    SWP_NOZORDER, SendMessageW, SetCursor, SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND,
     WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR,
     WM_SETFONT, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
     WS_TABSTOP, WS_VISIBLE,
@@ -90,6 +94,37 @@ fn step_scale(s: f64, steps: i32) -> f64 {
     let n = (sanitize_scale(s) / SCALE_STEP).round() as i32 + steps;
     let v = (n as f64 * SCALE_STEP).clamp(SCALE_MIN, SCALE_MAX);
     (v * 100.0).round() / 100.0
+}
+
+/// 用户在窗口里改过排布没有（和打开时比）。没改就不动文件里的排布和 rev。
+fn layout_changed(opened: &Layout, now: &Layout) -> bool {
+    opened.side != now.side || opened.offset != now.offset || (opened.scale - now.scale).abs() > 1e-9
+}
+
+/// 保存时对磁盘上最新配置的修改：只改 peer/key；排布真改了才写排布并递增 rev。
+fn apply_save(c: &mut Config, peer: &str, key: String, opened: &Layout, now: &Layout) {
+    c.peer = peer.trim().to_string();
+    c.key = key;
+    if layout_changed(opened, now) {
+        c.layout.layout = *now;
+        c.layout.rev = config::next_rev(c.layout.rev);
+    }
+}
+
+/// 对方地址是不是本机（回环或本机网卡地址）。
+fn is_own_addr(peer: &str, ips: &[String]) -> bool {
+    let p = peer.trim();
+    let host = p.split_once(':').map_or(p, |(h, _)| h).trim();
+    if host.is_empty() {
+        return false;
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => ip.is_loopback() || ip.is_unspecified() || ips.iter().any(|s| s == host),
+        Err(_) => false,
+    }
 }
 
 /// 画布下方的说明：“对方在右侧，下移 120 像素” / “对方在左侧，对齐”。
@@ -248,8 +283,12 @@ struct App {
     peer_name: String,
     peer_known: bool,
     layout: Layout,
+    /// 打开时的排布（判断用户改没改）
+    layout0: Layout,
     /// 打开时的配置（保存时若重新读取失败就用它）
     cfg: Config,
+    /// 本机 IPv4（保存时检查对方 IP 不是本机）
+    ips: Vec<String>,
     drag: Option<Drag>,
     hover: bool,
 }
@@ -425,9 +464,28 @@ fn refresh() {
     }
 }
 
+/// 已有设置窗口：提到前面，返回 true（本进程该退出）。
+fn already_running() -> bool {
+    unsafe {
+        // 句柄不关，进程结束时系统回收
+        let m = CreateMutexW(None, false, w!("Local\\kmlink-settings"));
+        if m.is_err() || GetLastError() != ERROR_ALREADY_EXISTS {
+            return false;
+        }
+        if let Ok(h) = FindWindowW(MAIN_CLASS, PCWSTR::null()) {
+            let _ = ShowWindow(h, if IsIconic(h).as_bool() { SW_RESTORE } else { SW_SHOW });
+            let _ = SetForegroundWindow(h);
+        }
+        true
+    }
+}
+
 pub fn run() {
-    // 配置（没有就建一个带新密钥的）
-    let cfg = Config::load().unwrap_or_else(|| Config::load_or_create().0);
+    if already_running() {
+        return;
+    }
+    // 配置：缺失就新建；解析失败由 load_or_create 备份并保留密钥，不会悄悄换钥
+    let (cfg, _) = Config::load_or_create();
     let mut mine = sys::monitors();
     if mine.is_empty() {
         mine = Desk::new(vec![Rect::new(0, 0, 1920, 1080)]);
@@ -549,7 +607,9 @@ pub fn run() {
                 peer_name,
                 peer_known,
                 layout,
+                layout0: layout,
                 cfg: cfg.clone(),
+                ips: ips.clone(),
                 drag: None,
                 hover: false,
             })
@@ -663,14 +723,18 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
                 }
                 layout_controls(hwnd, dpi);
-                apply_fonts(hwnd, font, bold);
                 match old {
                     Some((f, b)) => {
+                        // 先换上新字体，再删旧的
+                        apply_fonts(hwnd, font, bold);
                         let _ = DeleteObject(f.into());
                         let _ = DeleteObject(b.into());
                     }
-                    // 没存进状态（极少见）：新字体已在控件上用着，不能删；只是泄漏一次
-                    None => {}
+                    // 没存进状态（极少见）：控件继续用旧字体，新的删掉
+                    None => {
+                        let _ = DeleteObject(font.into());
+                        let _ = DeleteObject(bold.into());
+                    }
                 }
                 refresh();
                 LRESULT(0)
@@ -717,21 +781,21 @@ fn on_save(main: HWND) {
         }
         return;
     }
-    let Some((layout, opened)) = with_app(|a| (a.layout, a.cfg.clone())) else {
+    let Some((layout, layout0, opened, ips)) = with_app(|a| (a.layout, a.layout0, a.cfg.clone(), a.ips.clone())) else {
         return;
     };
-    // 重新读一次，别把主程序期间写入的其他字段覆盖掉
-    let mut cfg = Config::load().unwrap_or_else(|| opened.clone());
-    cfg.peer = peer.trim().to_string();
-    cfg.key = key;
-    let changed_meanwhile = cfg.layout.rev != opened.layout.rev && cfg.layout.layout != opened.layout.layout;
-    if layout != opened.layout.layout || !changed_meanwhile {
-        // 用户改了排布，或文件里的排布没被别人改过：写入并更新版本
-        cfg.layout.layout = layout;
-        cfg.layout.rev = config::now_ms();
+    if is_own_addr(&peer, &ips) {
+        warn(main, "对方 IP 是本机地址，请填另一台的 IP");
+        if let Some(h) = dlg(main, ID_PEER) {
+            unsafe {
+                let _ = SetFocus(Some(h));
+            }
+        }
+        return;
     }
-    match cfg.save() {
-        Ok(()) => unsafe {
+    // 加锁读-改-写：只改自己负责的字段，主程序期间写入的（含对方同步来的排布）都保留
+    match config::update(&opened, |c| apply_save(c, &peer, key, &layout0, &layout)) {
+        Ok(_) => unsafe {
             let _ = DestroyWindow(main);
         },
         Err(e) => {
@@ -849,8 +913,8 @@ fn paint_canvas(hwnd: HWND) {
             if !mem.is_invalid() && !bmp.is_invalid() {
                 let old = SelectObject(mem, bmp.into());
                 let rc = RECT { left: 0, top: 0, right: w, bottom: h };
-                SelectObject(mem, GetStockObject(DC_BRUSH));
-                SelectObject(mem, GetStockObject(DC_PEN));
+                let old_brush = SelectObject(mem, GetStockObject(DC_BRUSH));
+                let old_pen = SelectObject(mem, GetStockObject(DC_PEN));
                 SetDCBrushColor(mem, C_BG);
                 FillRect(mem, &rc, HBRUSH(GetStockObject(DC_BRUSH).0));
                 APP.with(|a| {
@@ -866,6 +930,9 @@ fn paint_canvas(hwnd: HWND) {
                 SetDCPenColor(mem, C_FRAME);
                 let _ = Rectangle(mem, 0, 0, w, h);
                 let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
+                // 全部换回原来的对象，再删位图和 DC
+                SelectObject(mem, old_pen);
+                SelectObject(mem, old_brush);
                 SelectObject(mem, old);
             }
             if !bmp.is_invalid() {
@@ -917,7 +984,7 @@ fn draw(hdc: HDC, a: &App, w: i32, h: i32) {
         None => a.fit_view(w, h),
     };
     unsafe {
-        SelectObject(hdc, a.font.into());
+        let old_font = SelectObject(hdc, a.font.into());
         SetBkMode(hdc, TRANSPARENT);
 
         // 本机
@@ -973,6 +1040,7 @@ fn draw(hdc: HDC, a: &App, w: i32, h: i32) {
             SetTextColor(hdc, C_HINT);
             DrawTextW(hdc, &mut t, &mut rc, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
         }
+        SelectObject(hdc, old_font);
     }
 }
 
@@ -995,6 +1063,9 @@ fn copy_text(owner: HWND, s: &str) -> bool {
                 let _ = GlobalUnlock(hmem);
                 if SetClipboardData(CF_UNICODETEXT, Some(HANDLE(hmem.0))).is_ok() {
                     ok = true; // 成功后内存归系统
+                    // 密钥不进 Win+V 历史、不上云剪贴板
+                    set_clip_dword(w!("CanIncludeInClipboardHistory"), 0);
+                    set_clip_dword(w!("CanUploadToCloudClipboard"), 0);
                 } else {
                     let _ = GlobalFree(Some(hmem));
                 }
@@ -1002,6 +1073,27 @@ fn copy_text(owner: HWND, s: &str) -> bool {
         }
         let _ = CloseClipboard();
         ok
+    }
+}
+
+/// 剪贴板已打开时，放一个 DWORD 值的注册格式。
+unsafe fn set_clip_dword(name: PCWSTR, v: u32) {
+    unsafe {
+        let f = RegisterClipboardFormatW(name);
+        if f == 0 {
+            return;
+        }
+        let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, 4) else { return };
+        let p = GlobalLock(h) as *mut u32;
+        if p.is_null() {
+            let _ = GlobalFree(Some(h));
+            return;
+        }
+        *p = v;
+        let _ = GlobalUnlock(h);
+        if SetClipboardData(f, Some(HANDLE(h.0))).is_err() {
+            let _ = GlobalFree(Some(h));
+        }
     }
 }
 
@@ -1129,6 +1221,46 @@ mod tests {
             s = step_scale(s, 1);
         }
         assert_eq!(s, 2.0);
+    }
+
+    #[test]
+    fn save_keeps_layout_when_untouched() {
+        let l0 = Layout { side: Side::Right, offset: 0, scale: 1.0 };
+        assert!(!layout_changed(&l0, &l0));
+        assert!(layout_changed(&l0, &Layout { offset: 1, ..l0 }));
+        assert!(layout_changed(&l0, &Layout { side: Side::Left, ..l0 }));
+        assert!(layout_changed(&l0, &Layout { scale: 1.05, ..l0 }));
+
+        // 磁盘上已有对方同步来的排布；只改 IP/密钥不能动它和 rev
+        let theirs = Layout { side: Side::Left, offset: 200, scale: 1.0 };
+        let mut c = Config::default();
+        c.layout.layout = theirs;
+        c.layout.rev = 123;
+        apply_save(&mut c, " 10.0.0.2 ", "ab".repeat(32), &l0, &l0);
+        assert_eq!(c.peer, "10.0.0.2");
+        assert_eq!(c.key, "ab".repeat(32));
+        assert_eq!(c.layout.layout, theirs);
+        assert_eq!(c.layout.rev, 123);
+
+        // 改了排布：写入，rev 严格大于磁盘上的（即使磁盘 rev 来自时钟快的对方）
+        let mine = Layout { side: Side::Bottom, offset: -10, scale: 1.0 };
+        let far = config::now_ms() + 10_000_000;
+        c.layout.rev = far;
+        apply_save(&mut c, "", "ab".repeat(32), &l0, &mine);
+        assert_eq!(c.layout.layout, mine);
+        assert_eq!(c.layout.rev, far + 1);
+    }
+
+    #[test]
+    fn own_addr() {
+        let ips = vec!["192.168.1.5".to_string()];
+        assert!(is_own_addr("192.168.1.5", &ips));
+        assert!(is_own_addr(" 192.168.1.5:47900 ", &ips));
+        assert!(is_own_addr("127.0.0.1", &ips));
+        assert!(is_own_addr("localhost:1", &ips));
+        assert!(!is_own_addr("192.168.1.6", &ips));
+        assert!(!is_own_addr("", &ips));
+        assert!(!is_own_addr("pc-b", &ips));
     }
 
     #[test]
