@@ -88,6 +88,17 @@ const STALE_AFTER: Duration = Duration::from_millis(1500);
 /// 这么久没收到对方任何帧：本机若正在控制对方，先回到本机（会话不断；断线要等 READ_TIMEOUT）。
 /// WiFi 的正常停顿在几百毫秒以内，2.5 秒足够不误判，又不让用户对着“失灵”的鼠标干等 6 秒。
 const GOHOME_AFTER: Duration = Duration::from_millis(2500);
+/// 鼠标正在两台之间移动时，图片分片的发送速率上限（字节/秒）。WiFi 实际吞吐约 15~20 MB/s，4 MB/s 只占一小部分，
+/// 路由器/网卡队列不会积压；一般截图压缩后 1~3 MB，限速下也只要不到 1 秒。鼠标不动时全速。
+const PACE_BPS: f64 = 4.0 * 1024.0 * 1024.0;
+/// 最近这么久内有鼠标移动经过本机，就算“鼠标正在移动”。
+const MOUSE_ACTIVE_MS: u64 = 500;
+
+/// 进程内单调毫秒（从第一次调用起算，+1 保证不为 0）。
+fn mono_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
 /// 同时进行中的入站握手上限（防止局域网里有东西乱连把线程堆满）。
 const MAX_PENDING_HANDSHAKES: usize = 8;
 /// 同一源 IP 同时进行中的入站握手上限。
@@ -175,6 +186,8 @@ struct Net {
     tq_cv: Condvar,
     /// 每次 Out::CancelClip 加一：reader 看到变化就丢掉正在接收的对方图片。
     clip_gen: AtomicU64,
+    /// 最近一次有鼠标移动经过本机（发出或收到）的时间（mono_ms）：这时图片限速发，别把 WiFi 占满让移动排队。
+    mouse_at: AtomicU64,
     #[cfg(test)]
     stats: TestStats,
 }
@@ -293,6 +306,21 @@ fn set_rcvbuf(s: &UdpSocket, bytes: i32) {
     }
 }
 
+/// TCP 发送缓冲上限。Windows 默认会把发送缓冲自动调到几百 KB 甚至几 MB：传图时内核里积压一大堆分片，
+/// 之后的 Enter / 按键 / 点击都排在它们后面（实测传 14MB 图时跨屏要等约 90ms）。限成 64 KiB：
+/// 排在前面的至多 64 KiB（WiFi 上约 10ms）；局域网往返只有几毫秒，64 KiB 的窗口传图仍有十几 MB/s。
+const TCP_SNDBUF: i32 = 64 * 1024;
+
+fn set_sndbuf(s: &TcpStream, bytes: i32) {
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::Networking::WinSock::{SO_SNDBUF, SOCKET, SOL_SOCKET, setsockopt};
+    let v = bytes.to_le_bytes();
+    // SAFETY：s 存活期间套接字句柄有效；optval 指向 4 字节的 int
+    unsafe {
+        let _ = setsockopt(SOCKET(s.as_raw_socket() as usize), SOL_SOCKET, SO_SNDBUF, Some(&v));
+    }
+}
+
 fn start(hub: Arc<Hub>, rx: Receiver<Out>, injector: Arc<Injector>, opts: Opts) -> Arc<Net> {
     let port = hub.cfg().port;
     let udp = OnceLock::new();
@@ -323,6 +351,7 @@ fn start(hub: Arc<Hub>, rx: Receiver<Out>, injector: Arc<Injector>, opts: Opts) 
         tq: Mutex::new(OutQueue::default()),
         tq_cv: Condvar::new(),
         clip_gen: AtomicU64::new(0),
+        mouse_at: AtomicU64::new(0),
         #[cfg(test)]
         stats: TestStats::default(),
     });
@@ -887,6 +916,7 @@ impl Net {
         let peer = stream.peer_addr().ok()?;
         let ip = peer.ip();
         let _ = stream.set_nodelay(true);
+        set_sndbuf(&stream, TCP_SNDBUF);
 
         let mut dl = Deadline { s: &mut stream, until: Instant::now() + HANDSHAKE_TIMEOUT };
         let my_nc = crypto::random32();
@@ -1116,6 +1146,7 @@ impl Net {
             Msg::Wheel { epoch, x, y, delta, horizontal } => self.injector.wheel(sess.id, epoch, x, y, delta, horizontal),
             Msg::Key { epoch, scan, ext, vk, down } => self.injector.key(sess.id, epoch, scan, ext, vk, down),
             Msg::Move { epoch, seq, x, y } => {
+                self.mark_mouse();
                 #[cfg(test)]
                 self.stats.tcp_moves.fetch_add(1, Ordering::Relaxed);
                 self.injector.moved(sess.id, epoch, seq, x, y)
@@ -1328,6 +1359,7 @@ impl Net {
             let Some(plain) = lock(&sess.udp_rx).open(&buf[..n]) else { continue };
             lock(&sess.udp_peer).heard(src, Instant::now());
             if let Some(UdpMsg::Move { epoch, seq, x, y }) = UdpMsg::decode(&plain) {
+                self.mark_mouse();
                 #[cfg(test)]
                 self.stats.udp_moves.fetch_add(1, Ordering::Relaxed);
                 self.injector.moved(sess.id, epoch, seq, x, y);
@@ -1339,6 +1371,15 @@ impl Net {
         if let Some(sock) = self.udp.get() {
             s.send_udp(sock, m);
         }
+    }
+
+    fn mark_mouse(&self) {
+        self.mouse_at.store(mono_ms(), Ordering::Relaxed);
+    }
+
+    fn mouse_active(&self) -> bool {
+        let t = self.mouse_at.load(Ordering::Relaxed);
+        t != 0 && mono_ms().saturating_sub(t) < MOUSE_ACTIVE_MS
     }
 
     /// 放进可靠队列，叫醒 net-tcp。
@@ -1406,7 +1447,10 @@ impl Net {
     /// 分拣一个要发的东西。
     fn route(self: &Arc<Self>, o: Out, mover: &mut Mover) {
         match o {
-            Out::Move { epoch, seq, x, y } => mover.push(UdpMsg::Move { epoch, seq, x, y }),
+            Out::Move { epoch, seq, x, y } => {
+                self.mark_mouse();
+                mover.push(UdpMsg::Move { epoch, seq, x, y })
+            }
             Out::CancelClip => {
                 self.clip_gen.fetch_add(1, Ordering::Relaxed);
                 self.enqueue(Out::CancelClip);
@@ -1483,21 +1527,42 @@ impl Net {
     /// 常驻 net-tcp：从可靠队列取，阻塞写 TCP。每轮先发全部消息，再发至多一个图片分片（压缩流暂时没有分片就等）。
     fn run_tcp(self: Arc<Self>) {
         let mut img_id = u32::from_le_bytes([crypto::random32()[0], 0, 0, 0]);
+        // 鼠标正在两台之间移动时，图片分片限速发（PACE_BPS）：分片发得太快会把 WiFi 占满，
+        // UDP 移动包在网卡/路由器队列里排在图片后面（实测传 14MB 图期间跨屏停顿从 6ms 涨到 90ms）。消息不受限。
+        let mut next_chunk = Instant::now();
         loop {
+            let allow_chunk;
             {
                 let mut q = lock(&self.tq);
-                while !q.quit && !q.has_work() {
+                loop {
+                    if q.quit {
+                        return;
+                    }
+                    let now = Instant::now();
+                    let paced = now < next_chunk && self.mouse_active();
+                    if q.has_msgs() {
+                        allow_chunk = !paced;
+                        break;
+                    }
+                    if q.has_work() {
+                        if paced {
+                            q = self.tq_cv.wait_timeout(q, next_chunk - now).unwrap_or_else(|e| e.into_inner()).0;
+                            continue;
+                        }
+                        allow_chunk = true;
+                        break;
+                    }
                     q = self.tq_cv.wait(q).unwrap_or_else(|e| e.into_inner());
-                }
-                if q.quit {
-                    return;
                 }
             }
             let Some(s) = self.current() else {
                 lock(&self.tq).clear();
                 continue;
             };
-            let frames = lock(&self.tq).take_batch(s.id, &mut img_id);
+            let (frames, chunk) = lock(&self.tq).take_batch_paced(s.id, &mut img_id, allow_chunk);
+            if chunk > 0 && self.mouse_active() {
+                next_chunk = Instant::now() + Duration::from_secs_f64(chunk as f64 / PACE_BPS);
+            }
             for f in frames {
                 if let Err(e) = s.send_plain(&f) {
                     if e.kind() == io::ErrorKind::InvalidInput {
@@ -1575,6 +1640,11 @@ impl OutQueue {
         }
     }
 
+    /// 有消息要发（不受图片限速影响）。
+    fn has_msgs(&self) -> bool {
+        !self.msgs.is_empty() || self.abort.is_some()
+    }
+
     fn has_work(&self) -> bool {
         !self.msgs.is_empty() || self.abort.is_some() || self.img.as_ref().is_some_and(|i| !i.header_sent || i.data.ready())
     }
@@ -1589,7 +1659,19 @@ impl OutQueue {
     }
 
     /// 取出这一轮要发的 TCP 明文帧：全部消息、待补发的作废，然后至多一个图片帧（开始、一个分片、结束或作废）。
+    #[cfg(test)]
     fn take_batch(&mut self, sess_id: u64, img_id: &mut u32) -> Vec<Vec<u8>> {
+        self.take_batch_paced(sess_id, img_id, true).0
+    }
+
+    /// 取一批要发的帧：全部消息 + （allow_chunk 时）至多一个图片分片。返回 (帧, 本批图片分片的数据字节数)。
+    fn take_batch_paced(&mut self, sess_id: u64, img_id: &mut u32, allow_chunk: bool) -> (Vec<Vec<u8>>, usize) {
+        let frames = self.take_inner(sess_id, img_id, allow_chunk);
+        let chunk = frames.iter().filter(|f| f.first() == Some(&proto::FRAME_CHUNK)).map(|f| f.len()).sum();
+        (frames, chunk)
+    }
+
+    fn take_inner(&mut self, sess_id: u64, img_id: &mut u32, allow_chunk: bool) -> Vec<Vec<u8>> {
         let mut frames: Vec<Vec<u8>> = self.msgs.drain(..).map(|m| proto::encode_msg(&m)).collect();
         if self.msgs.capacity() > 256 {
             self.msgs.shrink_to_fit();
@@ -1610,6 +1692,9 @@ impl OutQueue {
             img.id = *img_id;
             img.header_sent = true;
             frames.push(proto::encode_msg(&Msg::ClipStart { id: img.id, format: img.format, raw_len: img.raw_len }));
+            return frames;
+        }
+        if !allow_chunk {
             return frames;
         }
         match img.data.take() {
