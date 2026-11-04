@@ -60,7 +60,11 @@ pub enum Msg {
     /// 扫描码 + 扩展键标志；scan 为 0 时用 vk。
     Key { epoch: u32, scan: u16, ext: bool, vk: u16, down: bool },
     /// 被控端本地有人动了鼠标/键盘（或被控端处于暂停）：请控制端放手。
-    Yield,
+    /// epoch = 被控端当前（或刚拒绝的）接管轮次；控制端只认当前这一轮的 Yield（0 = 不确定，总是接受）。
+    Yield {
+        #[serde(default)]
+        epoch: u32,
+    },
     /// UDP 不可用（绑定失败/还没学到对方地址）时，鼠标位置改走可靠通道。语义同 UdpMsg::Move。
     Move { epoch: u32, seq: u32, x: i32, y: i32 },
     ClipText { text: String },

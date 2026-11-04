@@ -32,8 +32,10 @@ pub enum ToInput {
     LocalDesk(Desk),
     /// 排布或输入设置变化（配置重新加载、对方同步来的排布）。
     Config(Box<Config>),
-    /// 对方请求放手（对方本地有人动了键鼠）。
-    Yield,
+    /// 对方请求放手（对方本地有人动了键鼠）。参数 = 对方报告的接管轮次（0 = 不确定）。
+    Yield(u32),
+    /// 立刻回到本机（系统即将睡眠/注销等）。不在驱动时什么都不做。
+    GoHome,
     /// 本机正在被对方控制（true）/ 控制结束（false）。被控期间本机的物理输入会发 Yield。
     Driven(bool),
     /// 托盘“暂停共享”。
@@ -66,6 +68,9 @@ pub enum Out {
     Move { epoch: u32, seq: u32, x: i32, y: i32 },
     /// 剪贴板图片：deflate 后的数据（在可靠通道上分片、低优先级发送）。
     ClipImage { format: u32, raw_len: u32, deflated: Vec<u8> },
+    /// 剪贴板已被更新的内容取代（本机复制了新东西，或刚写入了对方发来的内容）：
+    /// 丢掉还没发完的图片，也丢掉正在接收的对方图片。
+    CancelClip,
 }
 
 #[derive(Clone, Debug, Default)]

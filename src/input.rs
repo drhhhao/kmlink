@@ -253,7 +253,7 @@ impl Kvm {
         };
         if due {
             self.last_yield = Some(time);
-            out.push(Action::Send(Msg::Yield));
+            out.push(Action::Send(Msg::Yield { epoch: 0 }));
         }
     }
 
@@ -546,7 +546,8 @@ impl Kvm {
                 }
             }
             ToInput::Config(cfg) => self.apply_config(&cfg),
-            ToInput::Yield => self.go_home_exit(out),
+            ToInput::Yield(_epoch) => self.go_home_exit(out),
+            ToInput::GoHome => self.go_home_exit(out),
             ToInput::Driven(b) => {
                 self.driven = b;
                 self.last_yield = None;
@@ -1254,7 +1255,7 @@ mod tests {
 
     #[test]
     fn yield_pause_and_quit_return_home() {
-        for m in [ToInput::Yield, ToInput::Pause(true), ToInput::Quit, ToInput::Driven(true)] {
+        for m in [ToInput::Yield(0), ToInput::Pause(true), ToInput::Quit, ToInput::Driven(true)] {
             let mut t = setup();
             t.cross();
             let out = t.msg(m);
@@ -1263,7 +1264,7 @@ mod tests {
         }
         // 不在驱动时 Yield 什么都不做
         let mut t = setup();
-        assert!(t.msg(ToInput::Yield).is_empty());
+        assert!(t.msg(ToInput::Yield(0)).is_empty());
     }
 
     #[test]
@@ -1296,13 +1297,13 @@ mod tests {
     fn driven_sends_yield_and_does_not_cross() {
         let mut t = setup();
         t.msg(ToInput::Driven(true));
-        assert_eq!(t.mv(1919, 500), (Verdict::Pass, vec![Action::Send(Msg::Yield)]));
+        assert_eq!(t.mv(1919, 500), (Verdict::Pass, vec![Action::Send(Msg::Yield { epoch: 0 })]));
         // 300ms 内不重复
         assert_eq!(t.mv(1919, 501), (Verdict::Pass, vec![]));
         // 别的程序注入的输入不算
         t.t += 400;
         assert_eq!(t.mouse(MouseKind::Move, Point::new(10, 10), true), (Verdict::Pass, vec![]));
-        assert_eq!(t.key(0x41, true), (Verdict::Pass, vec![Action::Send(Msg::Yield)]));
+        assert_eq!(t.key(0x41, true), (Verdict::Pass, vec![Action::Send(Msg::Yield { epoch: 0 })]));
         t.msg(ToInput::Driven(false));
         t.cross();
     }
@@ -1317,7 +1318,7 @@ mod tests {
         assert_eq!(t.key(VK_PACKET, true), (Verdict::Swallow, vec![]));
         assert!(out.is_empty());
         // 在本机时假 LCtrl 放行
-        t.msg(ToInput::Yield);
+        t.msg(ToInput::Yield(0));
         assert_eq!(t.k.key(ev, &mut out), Verdict::Pass);
     }
 

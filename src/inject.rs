@@ -142,7 +142,7 @@ impl Injector {
                 g.active = false;
                 self.set_driven(&g, false);
             }
-            self.hub.send(Msg::Yield);
+            self.hub.send(Msg::Yield { epoch });
             return;
         }
         // 上一次接管没正常结束，或上次抬起没注入成功：先把残留的按键抬起来

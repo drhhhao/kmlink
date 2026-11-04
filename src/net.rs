@@ -708,7 +708,7 @@ impl Net {
                 self.stats.tcp_moves.fetch_add(1, Ordering::Relaxed);
                 self.injector.moved(sess.id, epoch, seq, x, y)
             }
-            Msg::Yield => self.hub.to_input(ToInput::Yield),
+            Msg::Yield { epoch } => self.hub.to_input(ToInput::Yield(epoch)),
             Msg::ClipText { text } => {
                 let c = self.hub.cfg().clipboard;
                 if c.enabled && text.len() <= c.max_text_kb as usize * 1024 {
@@ -1058,6 +1058,8 @@ impl OutQueue {
                 // 新图片顶掉还没发完的旧图片（接收方见到新 id 会丢弃旧的）
                 self.img = Some(ImgTx { sess: None, id: 0, format, raw_len, data: deflated, header_sent: false, off: 0 });
             }
+            // TODO（net 负责人）：同时丢掉正在接收的对方图片
+            Out::CancelClip => self.img = None,
         }
     }
 
@@ -1206,8 +1208,8 @@ mod tests {
             _ => panic!("expected chunk"),
         }
         // s → c
-        write_frame(&mut s, &mut sc.tx, &proto::encode_msg(&Msg::Yield)).unwrap();
-        assert!(matches!(proto::decode_frame(&read_frame(&mut c, &mut cc.rx, MAX_FRAME).unwrap()), Some(Frame::Msg(Msg::Yield))));
+        write_frame(&mut s, &mut sc.tx, &proto::encode_msg(&Msg::Yield { epoch: 0 })).unwrap();
+        assert!(matches!(proto::decode_frame(&read_frame(&mut c, &mut cc.rx, MAX_FRAME).unwrap()), Some(Frame::Msg(Msg::Yield { .. }))));
         // 篡改：直接写一个用错误计数器加密的帧（重放第 0 帧的密文）
         let mut fresh = Sealer::new(&crypto::derive(&psk(), &cc.nonce_c, &[0; 32]).c2s);
         write_frame(&mut c, &mut fresh, b"\0{}").unwrap();
@@ -1217,7 +1219,7 @@ mod tests {
     #[test]
     fn wrong_key_fails_first_frame() {
         let (mut c, mut cc, mut s, mut sc) = hs_pair(psk(), [0x43; 32]);
-        write_frame(&mut c, &mut cc.tx, &proto::encode_msg(&Msg::Yield)).unwrap();
+        write_frame(&mut c, &mut cc.tx, &proto::encode_msg(&Msg::Yield { epoch: 0 })).unwrap();
         assert_eq!(read_frame(&mut s, &mut sc.rx, MAX_FRAME).unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
@@ -1493,8 +1495,8 @@ mod tests {
         assert!(z.len() > CHUNK);
         // 多片图片完整到达；期间插进来的控制消息（Yield）不用等图片发完
         b.hub.to_net(Out::ClipImage { format: 17, raw_len: raw.len() as u32, deflated: z.clone() });
-        b.hub.send(Msg::Yield);
-        wait("Yield 先到", 10, || matches!(a.input.try_recv(), Ok(ToInput::Yield)));
+        b.hub.send(Msg::Yield { epoch: 0 });
+        wait("Yield 先到", 10, || matches!(a.input.try_recv(), Ok(ToInput::Yield(_))));
         match next_desktop(&a.desktop, 10) {
             ToDesktop::ClipImage { format, data } => {
                 assert_eq!(format, 17);
@@ -1586,7 +1588,7 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert!(!is_auth_fail(&e));
         let (mut c, mut cc, mut s, mut sc) = hs_pair(psk(), [0x43; 32]);
-        write_frame(&mut c, &mut cc.tx, &proto::encode_msg(&Msg::Yield)).unwrap();
+        write_frame(&mut c, &mut cc.tx, &proto::encode_msg(&Msg::Yield { epoch: 0 })).unwrap();
         assert!(is_auth_fail(&read_frame(&mut s, &mut sc.rx, MAX_FIRST_FRAME).unwrap_err()));
     }
 
