@@ -122,7 +122,24 @@ fn peer_ip(peer: &str) -> Result<Option<IpAddr>, ()> {
         return if sa.port() == 0 { Err(()) } else { Ok(Some(sa.ip())) };
     }
     let bare = p.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(p);
-    bare.parse::<IpAddr>().map(Some).map_err(|_| ())
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(Some(ip));
+    }
+    // 电脑名（net 会做名字解析）：主机名[:端口]。全是数字和点的必须是合法 IP（防 10.0.0 这种笔误被当成名字）。
+    let (host, port) = match p.rsplit_once(':') {
+        Some((h, ps)) => (h, Some(ps)),
+        None => (p, None),
+    };
+    if let Some(ps) = port
+        && !matches!(ps.parse::<u16>(), Ok(n) if n > 0)
+    {
+        return Err(());
+    }
+    let label_ok = |l: &str| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if host.is_empty() || host.len() > 253 || host.bytes().all(|b| b.is_ascii_digit() || b == b'.') || !host.split('.').all(label_ok) {
+        return Err(());
+    }
+    Ok(None)
 }
 
 /// 对方地址是不是本机（回环、0.0.0.0/::、或本机网卡地址；IPv4 映射的 IPv6 按 IPv4 看）。
@@ -797,7 +814,7 @@ fn on_save(main: HWND) {
         return;
     };
     let bad_peer = if peer_ip(&peer).is_err() {
-        Some("对方 IP 格式不对，例：192.168.1.8")
+        Some("对方地址格式不对，例：192.168.1.8")
     } else if is_own_addr(&peer, &ips) {
         Some("对方 IP 是本机地址，请填另一台的 IP")
     } else {
@@ -1318,8 +1335,13 @@ mod tests {
         assert!(!ok("10.0.0.256"));
         assert!(!ok("[::1]:0"));
         assert!(ok("::1:9")); // 没有方括号就整段当 IPv6 地址（::1:9），也合法
-        assert!(!ok("pc-b"));
-        assert!(!ok("localhost:47900"));
+        assert!(ok("pc-b"));
+        assert!(ok("DESKTOP-5KP5N07:47900"));
+        assert!(ok("pc-b.local"));
+        assert!(!ok("pc-b:0"));
+        assert!(!ok("pc b"));
+        assert!(!ok("-pc"));
+        assert!(ok("localhost:47900")); // 格式合法，由 is_own_addr 拦下
         assert!(!ok("http://10.0.0.2"));
     }
 

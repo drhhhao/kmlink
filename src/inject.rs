@@ -311,7 +311,6 @@ impl Injector {
     }
 
     /// 对方好一阵没有任何消息（net 判断）：会话不断、接管不结束，只把按着的键和按钮抬起来。
-    #[allow(dead_code)] // net 线程调用（合并后去掉这行）
     pub fn stale(&self, sid: u64) {
         let mut g = self.lock();
         if g.session(sid) {
@@ -327,10 +326,6 @@ impl Injector {
         g.sid = sid;
         self.set_driven(&g, false);
     }
-
-    /// 临时空实现（net 负责人加的，合并时以 inject 负责人的真实现为准）：
-    /// 对方太久没有任何帧时调用 —— 会话不断，只抬起当前按着的键和按钮。
-    pub fn stale(&self, _sid: u64) {}
 
     /// 会话结束：只有它仍是当前会话时才抬起一切。
     pub fn end_session(&self, sid: u64) {
