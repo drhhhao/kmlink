@@ -1,12 +1,14 @@
 //! 加密：两台共用一个 32 字节预共享密钥（config.key）。
 //!
-//! 握手（明文）：客户端发 MAGIC + 32 字节随机 nonce_c；服务端回 MAGIC + 32 字节随机 nonce_s。
-//! 会话密钥 = HKDF-SHA256(ikm = psk, salt = nonce_c ‖ nonce_s)，info 分别为
+//! 握手（明文）：客户端发 MAGIC + 32 字节随机 nonce_c + 32 字节 X25519 临时公钥；
+//! 服务端回 MAGIC + 32 字节随机 nonce_s + 32 字节 X25519 临时公钥。
+//! 会话密钥 = HKDF-SHA256(ikm = psk ‖ DH 共享密钥, salt = nonce_c ‖ nonce_s)，info 分别为
 //!   "kmlink c2s" / "kmlink s2c" / "kmlink udp c2s" / "kmlink udp s2c"，各 32 字节。
+//! 临时私钥用完即清零：日后密钥泄露也解不开录下来的旧会话（前向保密）。
 //! 之后每个方向一个 ChaCha20-Poly1305：
 //!   TCP：nonce = 4 字节 0 ‖ u64 LE 计数器（从 0 开始，每帧 +1，接收方要求严格递增 —— 防重放/乱序）。
 //!   UDP：包 = u64 LE 计数器 ‖ 密文；nonce = 4 字节 0 ‖ 计数器；接收方只接受比见过的最大值更大的计数器。
-//! 第一帧（Hello）能解开即证明对方有同一个密钥。
+//! 第一帧（Hello）能解开即证明对方有同一个密钥。计数器用 checked_add，溢出就失败（会话断开），绝不复用 nonce。
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -20,11 +22,15 @@ pub struct SessionKeys {
     pub udp_s2c: [u8; 32],
 }
 
-pub fn derive(psk: &[u8; 32], nonce_c: &[u8; 32], nonce_s: &[u8; 32]) -> SessionKeys {
+pub fn derive(psk: &[u8; 32], dh: &[u8; 32], nonce_c: &[u8; 32], nonce_s: &[u8; 32]) -> SessionKeys {
     let mut salt = [0u8; 64];
     salt[..32].copy_from_slice(nonce_c);
     salt[32..].copy_from_slice(nonce_s);
-    let hk = Hkdf::<Sha256>::new(Some(&salt), psk);
+    let mut ikm = [0u8; 64];
+    ikm[..32].copy_from_slice(psk);
+    ikm[32..].copy_from_slice(dh);
+    let hk = Hkdf::<Sha256>::new(Some(&salt), &ikm);
+    wipe(&mut ikm);
     let k = |info: &[u8]| {
         let mut out = [0u8; 32];
         // 32 字节远小于 HKDF-SHA256 上限（255*32），不会失败
@@ -36,6 +42,40 @@ pub fn derive(psk: &[u8; 32], nonce_c: &[u8; 32], nonce_s: &[u8; 32]) -> Session
         s2c: k(b"kmlink s2c"),
         udp_c2s: k(b"kmlink udp c2s"),
         udp_s2c: k(b"kmlink udp s2c"),
+    }
+}
+
+/// X25519 临时密钥对（每次握手一个）。私钥在 Drop 时清零。
+pub struct Ephemeral {
+    sk: [u8; 32],
+    pub pk: [u8; 32],
+}
+
+impl Ephemeral {
+    pub fn new() -> Ephemeral {
+        let sk = random32();
+        let pk = x25519_dalek::x25519(sk, x25519_dalek::X25519_BASEPOINT_BYTES);
+        Ephemeral { sk, pk }
+    }
+
+    /// 与对方公钥算共享密钥；对方给的是小阶点（结果全 0）时返回 None。
+    pub fn agree(self, peer_pk: &[u8; 32]) -> Option<[u8; 32]> {
+        let dh = x25519_dalek::x25519(self.sk, *peer_pk);
+        if dh.iter().fold(0u8, |a, b| a | b) == 0 { None } else { Some(dh) }
+    }
+}
+
+impl Drop for Ephemeral {
+    fn drop(&mut self) {
+        wipe(&mut self.sk);
+    }
+}
+
+/// 清零（volatile 写，不会被优化掉）。
+pub fn wipe(b: &mut [u8]) {
+    for x in b.iter_mut() {
+        // SAFETY：x 是有效的 &mut u8
+        unsafe { std::ptr::write_volatile(x, 0) };
     }
 }
 
@@ -58,11 +98,12 @@ impl Sealer {
     pub fn new(key: &[u8; 32]) -> Self {
         Self { aead: cipher(key), counter: 0 }
     }
-    pub fn seal(&mut self, plaintext: &[u8]) -> Vec<u8> {
+    /// 计数器用尽（2^64 帧，实际不可能）返回 None。
+    pub fn seal(&mut self, plaintext: &[u8]) -> Option<Vec<u8>> {
         let n = nonce(self.counter);
-        self.counter += 1;
+        self.counter = self.counter.checked_add(1)?;
         // 只有明文超过 ~256 GiB 才会失败
-        self.aead.encrypt(&n, plaintext).expect("chacha20poly1305 encrypt")
+        self.aead.encrypt(&n, plaintext).ok()
     }
 }
 
@@ -77,8 +118,9 @@ impl Opener {
     }
     /// 失败（篡改/重放/乱序/密钥不对）返回 None，计数器不前进。
     pub fn open(&mut self, ciphertext: &[u8]) -> Option<Vec<u8>> {
+        let next = self.counter.checked_add(1)?;
         let p = self.aead.decrypt(&nonce(self.counter), ciphertext).ok()?;
-        self.counter += 1;
+        self.counter = next;
         Some(p)
     }
 }
@@ -92,14 +134,15 @@ impl UdpSealer {
     pub fn new(key: &[u8; 32]) -> Self {
         Self { aead: cipher(key), counter: 0 }
     }
-    pub fn seal(&mut self, plaintext: &[u8]) -> Vec<u8> {
+    /// 计数器用尽返回 None（不发）。
+    pub fn seal(&mut self, plaintext: &[u8]) -> Option<Vec<u8>> {
         let c = self.counter;
-        self.counter += 1;
-        let ct = self.aead.encrypt(&nonce(c), plaintext).expect("chacha20poly1305 encrypt");
+        self.counter = c.checked_add(1)?;
+        let ct = self.aead.encrypt(&nonce(c), plaintext).ok()?;
         let mut p = Vec::with_capacity(8 + ct.len());
         p.extend_from_slice(&c.to_le_bytes());
         p.extend_from_slice(&ct);
-        p
+        Some(p)
     }
 }
 
@@ -137,7 +180,7 @@ mod tests {
     use super::*;
 
     fn keys() -> SessionKeys {
-        derive(&[7u8; 32], &[1u8; 32], &[2u8; 32])
+        derive(&[7u8; 32], &[5u8; 32], &[1u8; 32], &[2u8; 32])
     }
 
     #[test]
@@ -152,9 +195,36 @@ mod tests {
         let k2 = keys();
         assert_eq!(k.c2s, k2.c2s);
         assert_eq!(k.udp_s2c, k2.udp_s2c);
-        // 不同 nonce / 不同密钥 → 不同会话密钥
-        assert_ne!(derive(&[7u8; 32], &[1u8; 32], &[3u8; 32]).c2s, k.c2s);
-        assert_ne!(derive(&[8u8; 32], &[1u8; 32], &[2u8; 32]).c2s, k.c2s);
+        // 不同 nonce / 不同密钥 / 不同 DH → 不同会话密钥
+        assert_ne!(derive(&[7u8; 32], &[5u8; 32], &[1u8; 32], &[3u8; 32]).c2s, k.c2s);
+        assert_ne!(derive(&[8u8; 32], &[5u8; 32], &[1u8; 32], &[2u8; 32]).c2s, k.c2s);
+        assert_ne!(derive(&[7u8; 32], &[6u8; 32], &[1u8; 32], &[2u8; 32]).c2s, k.c2s);
+    }
+
+    #[test]
+    fn x25519_agreement() {
+        let (a, b) = (Ephemeral::new(), Ephemeral::new());
+        let (apk, bpk) = (a.pk, b.pk);
+        assert_ne!(apk, bpk);
+        let s1 = a.agree(&bpk).unwrap();
+        let s2 = b.agree(&apk).unwrap();
+        assert_eq!(s1, s2);
+        // 小阶点（全 0）被拒绝
+        assert!(Ephemeral::new().agree(&[0u8; 32]).is_none());
+    }
+
+    #[test]
+    fn counter_overflow_fails() {
+        let k = keys();
+        let mut s = Sealer::new(&k.c2s);
+        s.counter = u64::MAX;
+        assert!(s.seal(b"x").is_none());
+        let mut o = Opener::new(&k.c2s);
+        o.counter = u64::MAX;
+        assert!(o.open(&[0u8; 32]).is_none());
+        let mut u = UdpSealer::new(&k.udp_c2s);
+        u.counter = u64::MAX;
+        assert!(u.seal(b"x").is_none());
     }
 
     #[test]
@@ -164,7 +234,7 @@ mod tests {
         let mut o = Opener::new(&k.c2s);
         for i in 0..5u8 {
             let msg = vec![i; i as usize * 10];
-            let ct = s.seal(&msg);
+            let ct = s.seal(&msg).unwrap();
             assert_eq!(ct.len(), msg.len() + 16);
             assert_eq!(o.open(&ct).unwrap(), msg);
         }
@@ -175,14 +245,14 @@ mod tests {
         let k = keys();
         let mut s = Sealer::new(&k.c2s);
         let mut o = Opener::new(&k.c2s);
-        let mut ct = s.seal(b"hello");
+        let mut ct = s.seal(b"hello").unwrap();
         ct[0] ^= 1;
         assert!(o.open(&ct).is_none());
         ct[0] ^= 1;
         // 计数器没有因失败前进
         assert_eq!(o.open(&ct).unwrap(), b"hello");
         // 截断
-        let ct2 = s.seal(b"world");
+        let ct2 = s.seal(b"world").unwrap();
         assert!(o.open(&ct2[..ct2.len() - 1]).is_none());
         assert!(o.open(&[]).is_none());
     }
@@ -192,9 +262,9 @@ mod tests {
         let k = keys();
         let mut s = Sealer::new(&k.c2s);
         let mut o = Opener::new(&k.c2s);
-        let a = s.seal(b"a");
-        let b = s.seal(b"b");
-        let c = s.seal(b"c");
+        let a = s.seal(b"a").unwrap();
+        let b = s.seal(b"b").unwrap();
+        let c = s.seal(b"c").unwrap();
         assert!(o.open(&b).is_none()); // 乱序
         assert_eq!(o.open(&a).unwrap(), b"a");
         assert!(o.open(&a).is_none()); // 重放
@@ -207,13 +277,13 @@ mod tests {
         let k = keys();
         let mut s = Sealer::new(&k.c2s);
         let mut o = Opener::new(&k.s2c);
-        assert!(o.open(&s.seal(b"x")).is_none());
+        assert!(o.open(&s.seal(b"x").unwrap()).is_none());
         let mut us = UdpSealer::new(&k.udp_c2s);
         let mut uo = UdpOpener::new(&k.udp_s2c);
-        assert!(uo.open(&us.seal(b"x")).is_none());
+        assert!(uo.open(&us.seal(b"x").unwrap()).is_none());
         // TCP 密钥不能用于 UDP
         let mut uo2 = UdpOpener::new(&k.c2s);
-        assert!(uo2.open(&UdpSealer::new(&k.udp_c2s).seal(b"x")).is_none());
+        assert!(uo2.open(&UdpSealer::new(&k.udp_c2s).seal(b"x").unwrap()).is_none());
     }
 
     #[test]
@@ -221,10 +291,10 @@ mod tests {
         let k = keys();
         let mut s = UdpSealer::new(&k.udp_c2s);
         let mut o = UdpOpener::new(&k.udp_c2s);
-        let p0 = s.seal(b"0");
-        let p1 = s.seal(b"1");
-        let p2 = s.seal(b"2");
-        let p3 = s.seal(b"3");
+        let p0 = s.seal(b"0").unwrap();
+        let p1 = s.seal(b"1").unwrap();
+        let p2 = s.seal(b"2").unwrap();
+        let p3 = s.seal(b"3").unwrap();
         assert_eq!(&p1[..8], &1u64.to_le_bytes());
         assert_eq!(o.open(&p2).unwrap(), b"2"); // 丢包可以跳过
         assert!(o.open(&p0).is_none()); // 旧的不要
@@ -238,7 +308,7 @@ mod tests {
         let k = keys();
         let mut s = UdpSealer::new(&k.udp_c2s);
         let mut o = UdpOpener::new(&k.udp_c2s);
-        let mut p = s.seal(b"move");
+        let mut p = s.seal(b"move").unwrap();
         // 改计数器 → nonce 不同，认证失败；且不应抬高 max_seen
         p[0] ^= 0x10;
         assert!(o.open(&p).is_none());

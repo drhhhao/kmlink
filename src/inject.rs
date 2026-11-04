@@ -220,6 +220,10 @@ impl Injector {
         self.set_driven(&g, false);
     }
 
+    /// 临时空实现（net 负责人加的，合并时以 inject 负责人的真实现为准）：
+    /// 对方太久没有任何帧时调用 —— 会话不断，只抬起当前按着的键和按钮。
+    pub fn stale(&self, _sid: u64) {}
+
     /// 会话结束：只有它仍是当前会话时才抬起一切。
     pub fn end_session(&self, sid: u64) {
         let mut g = self.lock();
