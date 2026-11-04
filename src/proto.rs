@@ -15,16 +15,23 @@
 use crate::geom::{Rect, Side};
 use serde::{Deserialize, Serialize};
 
-pub const PROTO_VERSION: u32 = 1;
-/// TCP 握手魔数。
-pub const MAGIC: &[u8; 4] = b"KML1";
+pub const PROTO_VERSION: u32 = 2;
+/// TCP 握手魔数（KML2：握手带 X25519 临时公钥）。
+pub const MAGIC: &[u8; 4] = b"KML2";
+/// 旧版魔数：收到它说明对方版本太旧。
+pub const MAGIC_V1: &[u8; 4] = b"KML1";
 /// 我们自己注入的输入事件带这个 dwExtraInfo，钩子据此忽略。
 pub const INJECT_MARK: usize = 0x4B4D_4C4E;
 
 pub const FRAME_MSG: u8 = 0;
 pub const FRAME_CHUNK: u8 = 1;
-/// 剪贴板图片分片大小（明文数据部分）。
-pub const CHUNK: usize = 64 * 1024;
+/// 剪贴板图片分片大小（明文数据部分）。小一点：按键等消息最多排在一个分片后面。
+pub const CHUNK: usize = 16 * 1024;
+/// 对方显示器：最多这么多块，坐标绝对值不超过这个数。
+pub const MAX_MONITORS: usize = 16;
+pub const MAX_COORD: i32 = 1 << 20;
+/// 对方名字最多这么多个字符。
+pub const MAX_NAME: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Button {
@@ -136,20 +143,40 @@ pub fn encode_chunk(id: u32, offset: u32, data: &[u8]) -> Vec<u8> {
     v
 }
 
-pub enum Frame {
+/// 解出来的帧；分片数据直接借用明文缓冲（不复制）。
+pub enum Frame<'a> {
     Msg(Msg),
-    Chunk { id: u32, offset: u32, data: Vec<u8> },
+    Chunk { id: u32, offset: u32, data: &'a [u8] },
 }
 
-pub fn decode_frame(b: &[u8]) -> Option<Frame> {
+pub fn decode_frame(b: &[u8]) -> Option<Frame<'_>> {
     match *b.first()? {
         FRAME_MSG => serde_json::from_slice(&b[1..]).ok().map(Frame::Msg),
         FRAME_CHUNK if b.len() >= 9 => Some(Frame::Chunk {
             id: u32::from_le_bytes(b[1..5].try_into().unwrap()),
             offset: u32::from_le_bytes(b[5..9].try_into().unwrap()),
-            data: b[9..].to_vec(),
+            data: &b[9..],
         }),
         _ => None,
+    }
+}
+
+/// 清洗对方 Hello 里的显示器：坐标限制在 ±MAX_COORD 内，丢掉空/反向矩形，最多 MAX_MONITORS 块。
+/// （下游 geom 里有 clamp(min, max)，min > max 会 panic；release 是 panic=abort。）结果可能为空 = 当没有显示器。
+pub fn sanitize_monitors(v: Vec<Rect>) -> Vec<Rect> {
+    let c = |x: i32| x.clamp(-MAX_COORD, MAX_COORD);
+    v.into_iter()
+        .map(|r| Rect::new(c(r.l), c(r.t), c(r.r), c(r.b)))
+        .filter(|r| r.r > r.l && r.b > r.t)
+        .take(MAX_MONITORS)
+        .collect()
+}
+
+/// 名字截到 MAX_NAME 个字符（按字符截，不会切坏 UTF-8）。
+pub fn sanitize_name(s: String) -> String {
+    match s.char_indices().nth(MAX_NAME) {
+        Some((i, _)) => s[..i].to_string(),
+        None => s,
     }
 }
 
@@ -171,8 +198,26 @@ mod tests {
             _ => panic!(),
         }
         match decode_frame(&encode_chunk(3, 65536, b"abc")) {
-            Some(Frame::Chunk { id, offset, data }) => assert_eq!((id, offset, data.as_slice()), (3, 65536, &b"abc"[..])),
+            Some(Frame::Chunk { id, offset, data }) => assert_eq!((id, offset, data), (3, 65536, &b"abc"[..])),
             _ => panic!(),
         }
+    }
+    #[test]
+    fn hello_monitors_sanitized() {
+        let big = i32::MAX;
+        let v = vec![
+            Rect::new(0, 0, 1920, 1080),     // 正常
+            Rect::new(10, 0, 10, 100),       // 宽 0
+            Rect::new(0, 50, 100, 20),       // 反向
+            Rect::new(-big, -big, big, big), // 超大：限制到 ±2^20
+            Rect::new(big - 5, 0, big, 100), // 整块在范围外：限制后宽 0，丢掉
+        ];
+        let s = sanitize_monitors(v);
+        assert_eq!(s, vec![Rect::new(0, 0, 1920, 1080), Rect::new(-MAX_COORD, -MAX_COORD, MAX_COORD, MAX_COORD)]);
+        let many: Vec<Rect> = (0..100).map(|i| Rect::new(i, 0, i + 1, 1)).collect();
+        assert_eq!(sanitize_monitors(many).len(), MAX_MONITORS);
+        assert!(sanitize_monitors(vec![Rect::new(5, 5, 1, 1)]).is_empty());
+        assert_eq!(sanitize_name("中".repeat(100)).chars().count(), MAX_NAME);
+        assert_eq!(sanitize_name("PC".into()), "PC");
     }
 }

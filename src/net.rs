@@ -3,48 +3,62 @@
 //! 线程：
 //! - listener：TcpListener 绑 0.0.0.0:cfg.port；dialer：cfg.peer 有值且当前没有会话时，每 2 秒（加 0~500ms 抖动）连一次，超时 2 秒。
 //!   对方地址先按 IP 字面量解析（裸 IPv6 用默认端口）；套接字只有 IPv4，只解析出 IPv6 时明确报错。
-//! - 每个会话：reader 线程（读帧、分发；绝不写 socket）+ 常驻 writer 线程（可靠消息优先，剪贴板分片低优先级穿插）。
-//! - udp：UdpSocket 绑 0.0.0.0:cfg.port（失败则每 5 秒重试），一个接收线程；发送在 writer 里做（Out::Move 只发最新的那个）。
+//! - 每个会话：reader 线程（读帧、分发；绝不写 socket）。
+//! - net-out（常驻，独占 hub 的 net 通道）：分拣要发的东西。鼠标位置由它直接发 UDP，不经过 TCP 写路径（传图时也不受影响）；
+//!   两次至少隔 2ms，只发最新的，间隔一到立刻补发最新值（不丢最后一个位置）。其余进可靠队列。每秒 Ping / UDP Hi / 检查。
+//! - net-tcp（常驻）：从可靠队列取：先发全部消息，再发至多一个 16 KiB 图片分片，如此循环 —— 按键等消息最多等一个分片。
+//! - udp：UdpSocket 绑 0.0.0.0:cfg.port（失败则每 5 秒重试；SO_RCVBUF 256 KiB），一个接收线程。
 //!
-//! 握手见 crypto.rs。握手 + 第一帧有 5 秒绝对期限，第一帧（认证前）≤ 64 KiB。
-//! 之后双方先发 Hello（sys::monitors()、cfg.name、udp_port、id = proto::instance_id()），再发 Layout。
-//! Hello.id 等于本进程 id：连到了自己 → 断开，报“对方地址指向本机”，在 cfg.peer 改变前不再拨它。
+//! 握手见 crypto.rs（KML2：预共享密钥 + X25519 临时密钥，前向保密）。握手 + 第一帧有 2 秒绝对期限，第一帧（认证前）≤ 64 KiB。
+//! 认证前的入站连接：每个源 IP 同时至多 2 个，总共至多 8 个（cfg.peer 的 IP 和上次连上的 IP 总数满了也放进来）。
+//! 握手后客户端先发 Hello（sys::monitors()、cfg.name、udp_port、id = proto::instance_id()）+ Layout；
+//! 服务端验证这第一帧（= 对方有密钥）之后才发自己的 Hello + Layout —— 认证前服务端只发随机数和临时公钥。
+//! 收到旧版魔数 KML1：报“对方版本太旧，请两台都更新”。
+//! 连到自己：dialer 记住最近 10 秒发出的 nonce_c，listener 收到相同的 nonce_c 立即拒绝（认证前就识别，也挡住反射）；
+//!   Hello.id 等于本进程 id 同样算。报“对方地址指向本机”，60 秒内不再拨同一个 cfg.peer；任何会话建立后解除。
 //! TCP：set_nodelay(true)。读超时 6 秒；每 1 秒发 Ping；6 秒收不到任何帧就断开。
+//!   1.5 秒收不到任何帧：injector.stale（会话不断，只抬起按着的键和按钮，防卡键）。
 //! 同时只保留一个会话：新会话认证成功时，若旧会话不到 2 秒，保留 nonce_c 字典序更大的那个（两边会选同一个）；
 //! 若旧会话连着另一台（Hello.id 不同）且仍活跃，拒绝新来的；否则用新的替换旧的。
-//! 密钥/对方地址/端口变了（writer 每秒检查）→ 结束当前会话，用新设置重连。
+//! 登记/结束会话时 injector 和 input 的通知都在 holder 锁内发出，并发时顺序一致。
+//! 密钥/对方地址/端口变了（每秒检查）→ 结束当前会话，用新设置重连。
+//! “密钥不一致”“版本太旧”这类认证前的错误：只有当前没有会话、且来自 cfg.peer / 上次连上的 IP（或没填 cfg.peer）时才显示在状态里。
 //!
 //! 收到的消息：
-//!   Hello → config::save_peer_desk；hub.to_input(PeerUp{name, desk})；hub.set_status(connected=true, peer_name, peer_addr)
+//!   Hello → 清洗显示器（proto::sanitize_monitors，清洗后为空 = 没有显示器）；config::save_peer_desk；
+//!     hub.to_input(PeerUp{name, desk})；hub.set_status(connected=true, peer_name, peer_addr)
 //!   Layout{rev 比本机新} → 镜像后只改 hub.cfg 的排布，config::update 只写排布字段，再 hub.to_input(Config(..))
-//!     rev 相同但排布不一致：instance id 较小的一方采用对方的（确定性，不回发）。
+//!     rev 相同但排布不一致：instance id 较小的一方采用对方的（确定性，不回发）。rev 超前本机时间 1 天以上、数值离谱的不要。
+//!     peer.json / config.toml 内容变了才写，每秒至多一次（来得太快就攒着，下一帧或会话结束时写最新的）。
 //!   Enter/Leave/Button/Wheel/Key/Move → injector
 //!   Yield → hub.to_input(Yield)
-//!   ClipText → hub.to_desktop(ClipText)；ClipImage + 分片 → 拼齐后解压 → hub.to_desktop(ClipImage)
+//!   ClipText → hub.to_desktop(ClipText)；ClipImage + 分片 → 按 total 预分配、拼齐后解压到 raw_len 大小的缓冲 → hub.to_desktop(ClipImage)
 //!     format = 13（CF_UNICODETEXT，大段文字）受 clipboard.enabled 管，图片另受 clipboard.images 管。
-//!   Ping → 经 writer 回 Pong
+//!     30 秒没进展的半截传输释放掉；Out::CancelClip 时丢掉正在接收的（之后这个 id 的分片都忽略）。
+//!   Ping → 经可靠队列回 Pong
 //! 会话结束：injector.end_session；hub.to_input(PeerDown)；hub.set_status(connected=false)。
 //! UDP：对方地址 = TCP 对端 IP + Hello 里的 udp_port；之后以最近一个认证通过的 UDP 包源地址为准。每秒发 UdpMsg::Hi。
-//!   收到 Move → injector.moved。没有会话时丢弃所有 UDP。
-//!   本机 UDP 不可用或还没收到过对方的 UDP 包：鼠标位置同时走 TCP（Msg::Move）。
+//!   收包先过滤再解密：长度不在 25..=64、源 IP 不是当前会话 TCP 对端的 IP，直接丢。没有会话时丢弃所有 UDP。
+//!   收到 Move → injector.moved。
+//!   本机 UDP 不可用、还没收到过对方的 UDP 包、或 2.5 秒没收到（对方每秒发 Hi）：鼠标位置同时走 TCP（Msg::Move，
+//!   排在已排队的消息之后、图片分片之前，只留最新的一个）；UDP 包再来就自动切回只走 UDP。
 //!   最后一个 Move 在 100ms 内没有更新的就补发一次（同 seq，接收方去重），之后 3 秒内每秒再补一次。
 //! 发送端 Out::Msg 在没有会话时直接丢弃（不排队），Out::ClipImage 同样丢弃。
 //!
-//! 实现说明：writer 是整个进程只有一个的常驻线程（独占 hub 的 net 通道），每次发送前看 `Net::holder` 里的当前会话；
-//! 会话来来去去，writer 不变。reader 线程每个会话一个（就是握手的那个线程）。
+//! 内存：没有常驻的大缓冲。读帧按帧长分配、用完即还；发图片的数据发完就丢；UDP 接收缓冲 128 字节。
 
 use crate::config::{self, ClipCfg, Config};
 use crate::crypto::{self, Opener, Sealer, UdpOpener, UdpSealer};
 use crate::geom::{Desk, Layout};
 use crate::hub::{Hub, Out, ToDesktop, ToInput};
 use crate::inject::Injector;
-use crate::proto::{self, CHUNK, Frame, MAGIC, Msg, PROTO_VERSION, UdpMsg};
-use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError};
+use crate::proto::{self, CHUNK, Frame, MAGIC, MAGIC_V1, Msg, PROTO_VERSION, UdpMsg};
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 /// 帧（密文）长度上限。
@@ -54,7 +68,7 @@ const MAX_FIRST_FRAME: usize = 64 * 1024;
 /// 明文上限（密文 = 明文 + 16 字节 tag）。
 const MAX_PLAIN: usize = MAX_FRAME - 16;
 /// 握手 + 第一帧的绝对期限。
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_TIMEOUT: Duration = Duration::from_secs(6);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_EVERY: Duration = Duration::from_secs(1);
@@ -62,20 +76,48 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 const TIE_WINDOW: Duration = Duration::from_secs(2);
 /// 旧会话这么久内收到过帧 = 仍活跃（另一台同密钥的电脑连进来时不替换它）。
 const ALIVE_WINDOW: Duration = Duration::from_secs(2);
+/// 这么久没收到对方任何帧（对方每秒 Ping）：抬起本机按着的键和按钮（会话不断）。
+const STALE_AFTER: Duration = Duration::from_millis(1500);
 /// 同时进行中的入站握手上限（防止局域网里有东西乱连把线程堆满）。
 const MAX_PENDING_HANDSHAKES: usize = 8;
+/// 同一源 IP 同时进行中的入站握手上限。
+const MAX_PENDING_PER_IP: u8 = 2;
 /// 同一 IP 的同类错误日志至多每分钟一次。
 const IP_LOG_EVERY: Duration = Duration::from_secs(60);
 /// 最后一个 Move 之后多久补发一次。
 const REPAIR_AFTER: Duration = Duration::from_millis(100);
 /// 最后一个 Move 之后多久内还补发。
 const REPAIR_FOR: Duration = Duration::from_secs(3);
+/// 两次发鼠标位置的最小间隔（1000Hz/8000Hz 鼠标不至于每个事件一个包挤占 WiFi）。
+const MOVE_GAP: Duration = Duration::from_millis(2);
 /// 会话建立后这么久还没收到对方 UDP 包：报 UDP 不通。
 const UDP_GRACE: Duration = Duration::from_secs(3);
 const UDP_RETRY: Duration = Duration::from_secs(5);
-const UDP_BUF: usize = 64 * 1024;
+/// 这么久没收到认证通过的 UDP 包（对方每秒发 Hi）：鼠标位置回落到 TCP。
+const UDP_STALE: Duration = Duration::from_millis(2500);
+/// 合法 UDP 包长度：8 字节计数器 + 明文（Hi 1 字节 / Move 17 字节）+ 16 字节 tag。
+const UDP_MIN_PKT: usize = 8 + 1 + 16;
+const UDP_MAX_PKT: usize = 64;
+/// UDP 接收缓冲：比合法包大就行（更大的包 recv_from 报 WSAEMSGSIZE，按单包错误跳过）。
+const UDP_BUF: usize = 128;
+/// UDP 套接字的内核接收缓冲（WiFi 停顿后一下子涌来的包不至于被丢）。
+const UDP_RCVBUF: i32 = 256 * 1024;
+/// 发现连到自己后多久内不再拨同一个地址。
+const SELF_BACKOFF: Duration = Duration::from_secs(60);
+/// 记住本机作为客户端发出的 nonce_c 多久 / 最多几个。
+const SENT_NC_KEEP: Duration = Duration::from_secs(10);
+const SENT_NC_MAX: usize = 16;
+/// 半截的接收传输这么久没进展就释放。
+const CLIP_STALL: Duration = Duration::from_secs(30);
+/// peer.json / config.toml 每秒至多写一次。
+const PERSIST_EVERY: Duration = Duration::from_secs(1);
+/// 对方排布的 rev 至多比本机时间超前这么多（毫秒）。
+const MAX_REV_AHEAD: u64 = 24 * 3600 * 1000;
 const DECRYPT_FAIL: &str = "解密失败";
+const ERR_REFLECT: &str = "收到本机自己发出的握手";
+const ERR_PEER_KEY: &str = "对方的临时公钥无效";
 pub const ERR_SELF: &str = "对方地址指向本机";
+pub const ERR_OLD: &str = "对方版本太旧，请两台都更新";
 pub const ERR_UDP_DOWN: &str = "UDP 不可用，已改走 TCP";
 
 pub fn spawn(hub: Arc<Hub>, rx: Receiver<Out>, injector: Arc<Injector>) {
@@ -103,14 +145,26 @@ struct Net {
     /// 绑定成功后才有（失败时 net-udp 线程每 5 秒重试）。
     udp: OnceLock<UdpSocket>,
     next_id: AtomicU64,
-    pending: AtomicUsize,
+    /// 认证前的入站连接（每 IP / 总数）。
+    admit: Mutex<Admission>,
     key_warned: AtomicBool,
     /// 最近一次记下的错误（相同错误不重复写日志）。
     last_err: Mutex<String>,
-    /// 发现“连到了自己”时的 cfg.peer：它不变就不再拨。
-    self_peer: Mutex<Option<String>>,
+    /// 发现“连到了自己”时的 (cfg.peer, 到期时间)：到期前 cfg.peer 不变就不拨。
+    self_peer: Mutex<Option<(String, Instant)>>,
+    /// 本机作为客户端最近发出的 nonce_c（listener 收到相同的 = 连到了自己 / 被反射）。
+    sent_nc: Mutex<SentNonces>,
+    /// dialer 最近一次解析出的 cfg.peer 的 IP。
+    peer_ips: Mutex<Vec<IpAddr>>,
+    /// 上次成功建立会话的对方 IP。
+    last_ok: Mutex<Option<IpAddr>>,
     /// (IP, 类别) → 上次写日志的时间。
     ip_log: Mutex<HashMap<(IpAddr, &'static str), Instant>>,
+    /// 可靠通道的发送队列：net-out 放，net-tcp 取。
+    tq: Mutex<OutQueue>,
+    tq_cv: Condvar,
+    /// 每次 Out::CancelClip 加一：reader 看到变化就丢掉正在接收的对方图片。
+    clip_gen: AtomicU64,
     #[cfg(test)]
     stats: TestStats,
 }
@@ -120,6 +174,8 @@ struct Net {
 struct TestStats {
     tcp_moves: std::sync::atomic::AtomicU32,
     udp_moves: std::sync::atomic::AtomicU32,
+    reflect_rejects: std::sync::atomic::AtomicU32,
+    stales: std::sync::atomic::AtomicU32,
 }
 
 /// 会话建立时用的设置：变了就断开重连。
@@ -145,7 +201,7 @@ struct Session {
     peer_id: u64,
     sig: CfgSig,
     /// 最近一次收到帧的时间。
-    last_rx: Mutex<Instant>,
+    last_rx: Mutex<RxClock>,
     /// 本会话已记过“UDP 不通”的日志。
     udp_warned: AtomicBool,
     /// 只用来 shutdown。
@@ -156,6 +212,12 @@ struct Session {
     udp_peer: Mutex<UdpPeer>,
 }
 
+struct RxClock {
+    at: Instant,
+    /// 这段安静已经抬起过按键（有新帧来才重新计时）。
+    staled: bool,
+}
+
 struct TcpTx {
     stream: TcpStream,
     sealer: Sealer,
@@ -164,24 +226,65 @@ struct TcpTx {
 #[derive(Default)]
 struct UdpPeer {
     addr: Option<SocketAddr>,
-    /// 已从认证通过的 UDP 包学到源地址（之后 Hello 不再覆盖）。
+    /// UDP 通着：最近 2.5 秒内收到过认证通过的包（此时 Hello 不再覆盖 addr，鼠标位置只走 UDP）。
     learned: bool,
+    /// 最近一次认证通过的 UDP 包的时间。
+    last: Option<Instant>,
+}
+
+impl UdpPeer {
+    /// 收到一个认证通过的 UDP 包。
+    fn heard(&mut self, src: SocketAddr, now: Instant) {
+        self.addr = Some(src);
+        self.learned = true;
+        self.last = Some(now);
+    }
+
+    /// UDP 现在还算通吗？2.5 秒没收到就退回“不通”（鼠标改走 TCP），再收到包时 heard 会切回来。
+    fn live(&mut self, now: Instant) -> bool {
+        if self.learned && self.last.is_none_or(|t| now.saturating_duration_since(t) > UDP_STALE) {
+            self.learned = false;
+        }
+        self.learned
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) {
-    if let Err(e) = std::thread::Builder::new().name(name.into()).spawn(f) {
-        crate::log!("net：创建线程 {name} 失败：{e}");
+/// 起线程；失败返回 false（闭包已丢弃）。
+fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) -> bool {
+    match std::thread::Builder::new().name(name.into()).spawn(f) {
+        Ok(_) => true,
+        Err(e) => {
+            crate::log!("net：创建线程 {name} 失败：{e}");
+            false
+        }
+    }
+}
+
+fn bind_udp(ip: IpAddr, port: u16) -> io::Result<UdpSocket> {
+    let s = UdpSocket::bind((ip, port))?;
+    set_rcvbuf(&s, UDP_RCVBUF);
+    Ok(s)
+}
+
+/// 调大 UDP 接收缓冲。失败无所谓（用系统默认）。
+fn set_rcvbuf(s: &UdpSocket, bytes: i32) {
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::Networking::WinSock::{SO_RCVBUF, SOCKET, SOL_SOCKET, setsockopt};
+    let v = bytes.to_le_bytes();
+    // SAFETY：s 存活期间套接字句柄有效；optval 指向 4 字节的 int
+    unsafe {
+        let _ = setsockopt(SOCKET(s.as_raw_socket() as usize), SOL_SOCKET, SO_RCVBUF, Some(&v));
     }
 }
 
 fn start(hub: Arc<Hub>, rx: Receiver<Out>, injector: Arc<Injector>, opts: Opts) -> Arc<Net> {
     let port = hub.cfg().port;
     let udp = OnceLock::new();
-    match UdpSocket::bind((opts.bind_ip, port)) {
+    match bind_udp(opts.bind_ip, port) {
         Ok(s) => {
             let _ = udp.set(s);
         }
@@ -197,16 +300,24 @@ fn start(hub: Arc<Hub>, rx: Receiver<Out>, injector: Arc<Injector>, opts: Opts) 
         holder: Mutex::new(None),
         udp,
         next_id: AtomicU64::new(1),
-        pending: AtomicUsize::new(0),
+        admit: Mutex::new(Admission::default()),
         key_warned: AtomicBool::new(false),
         last_err: Mutex::new(String::new()),
         self_peer: Mutex::new(None),
+        sent_nc: Mutex::new(SentNonces::default()),
+        peer_ips: Mutex::new(Vec::new()),
+        last_ok: Mutex::new(None),
         ip_log: Mutex::new(HashMap::new()),
+        tq: Mutex::new(OutQueue::default()),
+        tq_cv: Condvar::new(),
+        clip_gen: AtomicU64::new(0),
         #[cfg(test)]
         stats: TestStats::default(),
     });
     let n = net.clone();
-    spawn_named("net-writer", move || n.run_writer(rx));
+    spawn_named("net-out", move || n.run_out(rx));
+    let n = net.clone();
+    spawn_named("net-tcp", move || n.run_tcp());
     let n = net.clone();
     spawn_named("net-listener", move || n.run_listener());
     let n = net.clone();
@@ -258,32 +369,76 @@ impl Write for Deadline<'_> {
     }
 }
 
-fn read_hs<S: Read>(s: &mut S) -> io::Result<[u8; 32]> {
-    let mut b = [0u8; 36];
-    s.read_exact(&mut b)?;
-    if &b[..4] != MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "握手魔数不对"));
+/// 带固定说明的 InvalidData 错误（用 is_err 识别）。
+fn err(msg: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+fn is_err(e: &io::Error, msg: &str) -> bool {
+    e.kind() == io::ErrorKind::InvalidData && e.to_string() == msg
+}
+
+/// 对方断开了连接（EOF / RST）。
+fn is_closed(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted)
+}
+
+/// 读对方的握手：MAGIC + nonce + 临时公钥。
+fn read_hs<S: Read>(s: &mut S) -> io::Result<([u8; 32], [u8; 32])> {
+    let mut m = [0u8; 4];
+    s.read_exact(&mut m)?;
+    if &m == MAGIC_V1 {
+        return Err(err(ERR_OLD));
     }
-    let mut n = [0u8; 32];
-    n.copy_from_slice(&b[4..]);
-    Ok(n)
+    if &m != MAGIC {
+        return Err(err("握手魔数不对"));
+    }
+    let mut b = [0u8; 64];
+    s.read_exact(&mut b)?;
+    let (mut n, mut pk) = ([0u8; 32], [0u8; 32]);
+    n.copy_from_slice(&b[..32]);
+    pk.copy_from_slice(&b[32..]);
+    Ok((n, pk))
+}
+
+/// 握手里本端的角色。
+enum Role<'a> {
+    /// 客户端：带上自己的 nonce_c（发之前已登记，见 SentNonces）。
+    Client([u8; 32]),
+    /// 服务端：判断收到的 nonce_c 是不是本机刚作为客户端发出去的。
+    Server(&'a dyn Fn(&[u8; 32]) -> bool),
 }
 
 /// 明文握手 + 派生密钥。client 先发。
-fn handshake<S: Read + Write>(s: &mut S, psk: &[u8; 32], client: bool) -> io::Result<Chans> {
-    let mine = crypto::random32();
-    let mut hello = [0u8; 36];
-    hello[..4].copy_from_slice(MAGIC);
-    hello[4..].copy_from_slice(&mine);
-    let (nc, ns) = if client {
-        s.write_all(&hello)?;
-        (mine, read_hs(s)?)
-    } else {
-        let theirs = read_hs(s)?;
-        s.write_all(&hello)?;
-        (theirs, mine)
+fn handshake<S: Read + Write>(s: &mut S, psk: &[u8; 32], role: Role) -> io::Result<Chans> {
+    let eph = crypto::Ephemeral::new();
+    let client = matches!(role, Role::Client(_));
+    let mine = match role {
+        Role::Client(n) => n,
+        Role::Server(_) => crypto::random32(),
     };
-    let k = crypto::derive(psk, &nc, &ns);
+    let mut hello = [0u8; 68];
+    hello[..4].copy_from_slice(MAGIC);
+    hello[4..36].copy_from_slice(&mine);
+    hello[36..].copy_from_slice(&eph.pk);
+    let (nc, ns, their_pk) = match role {
+        Role::Client(_) => {
+            s.write_all(&hello)?;
+            let (ns, pk) = read_hs(s)?;
+            (mine, ns, pk)
+        }
+        Role::Server(seen) => {
+            let (nc, pk) = read_hs(s)?;
+            if seen(&nc) {
+                return Err(err(ERR_REFLECT));
+            }
+            s.write_all(&hello)?;
+            (nc, mine, pk)
+        }
+    };
+    let mut dh = eph.agree(&their_pk).ok_or_else(|| err(ERR_PEER_KEY))?;
+    let k = crypto::derive(psk, &dh, &nc, &ns);
+    crypto::wipe(&mut dh);
     Ok(if client {
         Chans { nonce_c: nc, tx: Sealer::new(&k.c2s), rx: Opener::new(&k.s2c), utx: UdpSealer::new(&k.udp_c2s), urx: UdpOpener::new(&k.udp_s2c) }
     } else {
@@ -295,14 +450,15 @@ fn write_frame<W: Write>(w: &mut W, sealer: &mut Sealer, plain: &[u8]) -> io::Re
     if plain.len() > MAX_PLAIN {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "帧太大"));
     }
-    let ct = sealer.seal(plain);
+    // 计数器用尽（实际不可能）：返回非 InvalidInput 的错误，会话随之断开
+    let ct = sealer.seal(plain).ok_or_else(|| io::Error::other("发送计数器用尽"))?;
     let mut buf = Vec::with_capacity(4 + ct.len());
     buf.extend_from_slice(&(ct.len() as u32).to_le_bytes());
     buf.extend_from_slice(&ct);
     w.write_all(&buf)
 }
 
-/// 读一帧（密文 ≤ max）并解密。解不开（篡改/重放/密钥不同）返回 InvalidData + DECRYPT_FAIL。
+/// 读一帧（密文 ≤ max）并解密。解不开（篡改/重放/密钥不同/计数器用尽）返回 InvalidData + DECRYPT_FAIL。
 fn read_frame<R: Read>(r: &mut R, opener: &mut Opener, max: usize) -> io::Result<Vec<u8>> {
     let mut lb = [0u8; 4];
     r.read_exact(&mut lb)?;
@@ -312,11 +468,11 @@ fn read_frame<R: Read>(r: &mut R, opener: &mut Opener, max: usize) -> io::Result
     }
     let mut ct = vec![0u8; len];
     r.read_exact(&mut ct)?;
-    opener.open(&ct).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, DECRYPT_FAIL))
+    opener.open(&ct).ok_or_else(|| err(DECRYPT_FAIL))
 }
 
 fn is_auth_fail(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::InvalidData && e.to_string() == DECRYPT_FAIL
+    is_err(e, DECRYPT_FAIL)
 }
 
 /// 新会话是否应让位给旧会话（tie-break）。
@@ -334,10 +490,19 @@ fn adopt_layout(cur_rev: u64, cur: &Layout, theirs: &Layout, rev: u64, my_id: u6
     rev > cur_rev || (rev == cur_rev && cur != theirs && peer_id != 0 && my_id < peer_id)
 }
 
-/// 发现自连时记下的 peer：配置的 peer 还是它就不拨；变了就清掉。
-fn self_blocked(slot: &mut Option<String>, peer: &str) -> bool {
-    match slot.as_deref() {
-        Some(p) if p == peer => true,
+/// 对方发来的排布是否像样：rev 不明显超前（> 本机时间 + 1 天就不要，免得它永远压住本机的修改）、数值在合理范围。
+fn layout_sane(l: &Layout, rev: u64, now_ms: u64) -> bool {
+    rev <= now_ms.saturating_add(MAX_REV_AHEAD)
+        && l.offset.unsigned_abs() <= proto::MAX_COORD as u32
+        && l.scale.is_finite()
+        && l.scale > 0.0
+        && l.scale < 1000.0
+}
+
+/// 发现自连时记下的 (peer, 到期时间)：到期前配置的 peer 还是它就不拨；变了或到期就清掉。
+fn self_blocked(slot: &mut Option<(String, Instant)>, peer: &str, now: Instant) -> bool {
+    match slot {
+        Some((p, until)) if p == peer && now < *until => true,
         Some(_) => {
             *slot = None;
             false
@@ -346,9 +511,24 @@ fn self_blocked(slot: &mut Option<String>, peer: &str) -> bool {
     }
 }
 
-/// 鼠标位置走哪条路：(UDP, TCP)。UDP 可用就发 UDP；还没收到过对方 UDP 包（可能不通）时同时走 TCP。
-fn move_route(udp_bound: bool, learned: bool) -> (bool, bool) {
-    (udp_bound, !(udp_bound && learned))
+/// 认证前的错误（密钥不一致/版本太旧）要不要显示在状态里：已有会话时不改；
+/// 填了对方地址时只认对方地址 / 上次连上的地址 —— 否则没有密钥的人随便连一下就能把状态改掉。
+fn show_notice(has_session: bool, no_peer_cfg: bool, known_ip: bool) -> bool {
+    !has_session && (no_peer_cfg || known_ip)
+}
+
+/// cfg.peer 若是 IP 字面量（可带端口），取出 IP（不做 DNS）。
+fn peer_literal_ip(peer: &str) -> Option<IpAddr> {
+    let p = peer.trim();
+    if let Ok(sa) = p.parse::<SocketAddr>() {
+        return Some(sa.ip());
+    }
+    p.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(p).parse().ok()
+}
+
+/// 鼠标位置走哪条路：(UDP, TCP)。UDP 可用就发 UDP；UDP 不通（还没收到过 / 2.5 秒没收到对方 UDP 包）时同时走 TCP。
+fn move_route(udp_bound: bool, udp_live: bool) -> (bool, bool) {
+    (udp_bound, !(udp_bound && udp_live))
 }
 
 /// 剪贴板分片传输的上限；None = 不接收。format 13 是大段文字（UTF-16LE）。
@@ -389,6 +569,77 @@ fn resolve_peer(peer: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     Ok((host, port).to_socket_addrs()?.collect())
 }
 
+// ---------------------------------------------------------------- 认证前的防护（纯逻辑）
+
+/// 认证前的入站连接计数：每个源 IP 至多 MAX_PENDING_PER_IP 个；总数至多 MAX_PENDING_HANDSHAKES 个，
+/// 但 reserved（cfg.peer 的 IP、上次连上的 IP）总数满了也放进来 —— 别人乱连挤不掉真正的对方。
+#[derive(Default)]
+struct Admission {
+    per_ip: HashMap<IpAddr, u8>,
+    total: usize,
+}
+
+impl Admission {
+    fn admit(&mut self, ip: IpAddr, reserved: bool) -> bool {
+        let n = self.per_ip.get(&ip).copied().unwrap_or(0);
+        if n >= MAX_PENDING_PER_IP || (self.total >= MAX_PENDING_HANDSHAKES && !reserved) {
+            return false;
+        }
+        self.per_ip.insert(ip, n + 1);
+        self.total += 1;
+        true
+    }
+
+    fn release(&mut self, ip: IpAddr) {
+        if let Some(n) = self.per_ip.get_mut(&ip) {
+            *n -= 1;
+            if *n == 0 {
+                self.per_ip.remove(&ip);
+            }
+            self.total -= 1;
+        }
+    }
+}
+
+struct SentNc {
+    nc: [u8; 32],
+    at: Instant,
+    /// listener 收到过它（= 连到了自己 / 被反射）。
+    hit: bool,
+}
+
+/// 本机作为客户端最近 10 秒发出的 nonce_c（至多 16 个）。
+#[derive(Default)]
+struct SentNonces(VecDeque<SentNc>);
+
+impl SentNonces {
+    fn remember(&mut self, nc: [u8; 32], now: Instant) {
+        self.0.retain(|x| now.saturating_duration_since(x.at) < SENT_NC_KEEP);
+        if self.0.len() >= SENT_NC_MAX {
+            self.0.pop_front();
+        }
+        self.0.push_back(SentNc { nc, at: now, hit: false });
+    }
+
+    /// listener 用：这个 nonce_c 是本机最近发出去的吗？是就记下（dialer 据此知道“连到了自己”）。
+    fn reflected(&mut self, nc: &[u8; 32], now: Instant) -> bool {
+        match self.0.iter_mut().find(|x| x.nc == *nc && now.saturating_duration_since(x.at) < SENT_NC_KEEP) {
+            Some(x) => {
+                x.hit = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// dialer 用：自己发出的这个 nonce_c 被本机 listener 收到过吗？
+    fn hit(&self, nc: &[u8; 32]) -> bool {
+        self.0.iter().any(|x| x.nc == *nc && x.hit)
+    }
+}
+
+// ---------------------------------------------------------------- 鼠标位置（纯逻辑）
+
 /// 最近发出的 Move（用于补发）。
 struct LastMove {
     sid: u64,
@@ -402,6 +653,51 @@ impl LastMove {
     fn due(&self, now: Instant, tick: bool) -> bool {
         let age = now.saturating_duration_since(self.at);
         age < REPAIR_FOR && ((!self.repaired && age >= REPAIR_AFTER) || tick)
+    }
+}
+
+/// 鼠标位置的发送节奏：只保留最新的一个；两次发送至少隔 MOVE_GAP，间隔一到立刻发最新值；之后按 LastMove 补发。
+#[derive(Default)]
+struct Mover {
+    pending: Option<UdpMsg>,
+    sent: Option<Instant>,
+    last: Option<LastMove>,
+}
+
+impl Mover {
+    fn push(&mut self, m: UdpMsg) {
+        self.pending = Some(m);
+    }
+
+    /// 下次需要醒来的时间（没有要做的返回 None）。
+    fn wake(&self) -> Option<Instant> {
+        if self.pending.is_some() {
+            return Some(self.sent.map_or_else(Instant::now, |t| t + MOVE_GAP));
+        }
+        self.last.as_ref().filter(|l| !l.repaired).map(|l| l.at + REPAIR_AFTER)
+    }
+
+    /// 现在该发的那个（新位置或补发）。sid = 当前会话。
+    fn poll(&mut self, now: Instant, tick: bool, sid: u64) -> Option<UdpMsg> {
+        if self.last.as_ref().is_some_and(|l| l.sid != sid || now.saturating_duration_since(l.at) >= REPAIR_FOR) {
+            self.last = None;
+        }
+        if let Some(m) = self.pending {
+            if self.sent.is_some_and(|t| now < t + MOVE_GAP) {
+                return None;
+            }
+            self.pending = None;
+            self.sent = Some(now);
+            self.last = Some(LastMove { sid, mv: m, at: now, repaired: false });
+            return Some(m);
+        }
+        let l = self.last.as_mut()?;
+        if l.due(now, tick) {
+            l.repaired = true;
+            self.sent = Some(now);
+            return Some(l.mv);
+        }
+        None
     }
 }
 
@@ -419,22 +715,35 @@ impl Session {
         }
         r
     }
-    fn send_msg(&self, m: &Msg) -> io::Result<()> {
-        self.send_plain(&proto::encode_msg(m))
-    }
     fn close(&self) {
         let _ = self.ctl.shutdown(Shutdown::Both);
     }
     fn send_udp(&self, sock: &UdpSocket, m: &UdpMsg) {
         let Some(addr) = lock(&self.udp_peer).addr else { return };
-        let pkt = lock(&self.udp_tx).seal(&m.encode());
+        let Some(pkt) = lock(&self.udp_tx).seal(&m.encode()) else { return };
         let _ = sock.send_to(&pkt, addr);
+    }
+    fn udp_live(&self) -> bool {
+        lock(&self.udp_peer).live(Instant::now())
     }
 }
 
 fn layout_msg(cfg: &Config) -> Msg {
     let l = cfg.layout.layout;
     Msg::Layout { side: l.side, offset: l.offset, scale: l.scale, rev: cfg.layout.rev }
+}
+
+/// reader 线程自己的状态。
+#[derive(Default)]
+struct RxState {
+    clip: ClipRx,
+    /// 已处理到的 Net::clip_gen。
+    clip_seen: u64,
+    /// 等着写盘的 peer.json / 排布，及上次写的时间（每秒至多一次）。
+    desk: Option<(String, Desk)>,
+    desk_at: Option<Instant>,
+    layout: Option<(Layout, u64)>,
+    layout_at: Option<Instant>,
 }
 
 impl Net {
@@ -482,6 +791,18 @@ impl Net {
         }
     }
 
+    /// 是 cfg.peer 的 IP 或上次连上的 IP（预留握手名额、可以改状态）。不做 DNS：用 dialer 解析好的。
+    fn known_ip(&self, ip: IpAddr, peer_cfg: &str) -> bool {
+        peer_literal_ip(peer_cfg) == Some(ip) || lock(&self.peer_ips).contains(&ip) || *lock(&self.last_ok) == Some(ip)
+    }
+
+    /// 认证前的错误：总记日志（限频），按 show_notice 决定是否显示在状态里。
+    fn peer_notice(&self, ip: IpAddr, kind: &'static str, msg: String) {
+        let peer_cfg = self.hub.cfg.read().unwrap_or_else(|e| e.into_inner()).peer.trim().to_string();
+        let show = show_notice(self.current().is_some(), peer_cfg.is_empty(), self.known_ip(ip, &peer_cfg));
+        self.log_ip(ip, kind, msg, show);
+    }
+
     /// 取密钥；无效时只记一次日志。
     fn psk(&self, cfg: &Config) -> Option<[u8; 32]> {
         match cfg.key_bytes() {
@@ -504,7 +825,48 @@ impl Net {
         Msg::Hello { ver: PROTO_VERSION, name: cfg.name.clone(), monitors: crate::sys::monitors().monitors, udp_port, id: self.opts.id }
     }
 
-    /// 握手、互发 Hello/Layout、读对方 Hello（= 认证）、登记为当前会话。
+    fn send_hello<W: Write>(&self, w: &mut W, tx: &mut Sealer, cfg: &Config) -> io::Result<()> {
+        write_frame(w, tx, &proto::encode_msg(&self.hello(cfg)))?;
+        write_frame(w, tx, &proto::encode_msg(&layout_msg(cfg)))
+    }
+
+    /// 发现连到了自己：报错，60 秒内不再拨这个地址。
+    fn self_detected(&self, peer: &str) {
+        *lock(&self.self_peer) = Some((peer.to_string(), Instant::now() + SELF_BACKOFF));
+        self.note_err(ERR_SELF.into());
+    }
+
+    /// 握手失败的报告。dialed：主动连接时的 cfg.peer；my_nc：本机作为客户端发出的 nonce_c。
+    fn handshake_failed(&self, e: &io::Error, peer: SocketAddr, dialed: Option<&str>, my_nc: &[u8; 32]) {
+        let ip = peer.ip();
+        match dialed {
+            Some(p) => {
+                if lock(&self.sent_nc).hit(my_nc) {
+                    self.self_detected(p);
+                } else if is_err(e, ERR_OLD) {
+                    self.note_err(ERR_OLD.into());
+                } else if is_closed(e) {
+                    self.note_err(format!("与 {peer} 握手失败：对方断开了连接（若对方是旧版本，请两台都更新）"));
+                } else {
+                    self.note_err(format!("与 {peer} 握手失败：{e}"));
+                }
+            }
+            None => {
+                if is_err(e, ERR_REFLECT) {
+                    #[cfg(test)]
+                    self.stats.reflect_rejects.fetch_add(1, Ordering::Relaxed);
+                    self.log_ip(ip, "self", format!("{ip} 发来的握手是本机刚发出的（连到了自己），拒绝"), false);
+                } else if is_err(e, ERR_OLD) {
+                    self.peer_notice(ip, "old", ERR_OLD.into());
+                } else {
+                    self.log_ip(ip, "hs", format!("{ip} 入站握手失败：{e}"), false);
+                }
+            }
+        }
+    }
+
+    /// 握手、读对方 Hello（= 认证）、互发 Hello/Layout、登记为当前会话。
+    /// 客户端先发 Hello；服务端验证了客户端的第一帧才发自己的（认证前不发可预测的内容）。
     /// dialed：主动连接时配置里的 peer 字符串（被动连接为 None）。
     fn establish(&self, mut stream: TcpStream, dialed: Option<&str>) -> Option<(SessionHandle, TcpStream, Opener, Msg)> {
         let client = dialed.is_some();
@@ -515,28 +877,37 @@ impl Net {
         let _ = stream.set_nodelay(true);
 
         let mut dl = Deadline { s: &mut stream, until: Instant::now() + HANDSHAKE_TIMEOUT };
-        let ch = match handshake(&mut dl, &psk, client) {
+        let my_nc = crypto::random32();
+        let seen = |nc: &[u8; 32]| lock(&self.sent_nc).reflected(nc, Instant::now());
+        let role = if client {
+            lock(&self.sent_nc).remember(my_nc, Instant::now());
+            Role::Client(my_nc)
+        } else {
+            Role::Server(&seen)
+        };
+        let ch = match handshake(&mut dl, &psk, role) {
             Ok(c) => c,
             Err(e) => {
-                if client {
-                    self.note_err(format!("与 {peer} 握手失败：{e}"));
-                } else {
-                    self.log_ip(ip, "hs", format!("{ip} 入站握手失败：{e}"), false);
-                }
+                self.handshake_failed(&e, peer, dialed, &my_nc);
                 return None;
             }
         };
         let Chans { nonce_c, mut tx, mut rx, utx, urx } = ch;
-        let sent = write_frame(&mut dl, &mut tx, &proto::encode_msg(&self.hello(&cfg)))
-            .and_then(|_| write_frame(&mut dl, &mut tx, &proto::encode_msg(&layout_msg(&cfg))));
-        if let Err(e) = sent {
-            self.log_ip(ip, "send", format!("向 {ip} 发送 Hello 失败：{e}"), false);
-            return None;
+        if client {
+            if let Err(e) = self.send_hello(&mut dl, &mut tx, &cfg) {
+                self.note_err(format!("向 {peer} 发送 Hello 失败：{e}"));
+                return None;
+            }
         }
         let first = match read_frame(&mut dl, &mut rx, MAX_FIRST_FRAME) {
             Ok(p) => p,
             Err(e) if is_auth_fail(&e) => {
-                self.log_ip(ip, "auth", format!("与 {ip} 认证失败：两边的配对密钥不一致"), true);
+                self.peer_notice(ip, "auth", format!("与 {ip} 认证失败：两边的配对密钥不一致"));
+                return None;
+            }
+            Err(e) if client && is_closed(&e) => {
+                // 服务端解不开我们的第一帧就会直接断开：多半是密钥不一致（客户端只连 cfg.peer，可以显示）
+                self.log_ip(ip, "auth", format!("与 {ip} 认证失败：对方断开了连接（多半是两边的配对密钥不一致）"), true);
                 return None;
             }
             Err(e) => {
@@ -557,11 +928,17 @@ impl Net {
             return None;
         }
         if *peer_id == self.opts.id {
-            if let Some(p) = dialed {
-                *lock(&self.self_peer) = Some(p.to_string());
+            match dialed {
+                Some(p) => self.self_detected(p),
+                None => self.note_err(ERR_SELF.into()),
             }
-            self.note_err(ERR_SELF.into());
             return None;
+        }
+        if !client {
+            if let Err(e) = self.send_hello(&mut dl, &mut tx, &cfg) {
+                self.log_ip(ip, "send", format!("向 {ip} 发送 Hello 失败：{e}"), false);
+                return None;
+            }
         }
         let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
         let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
@@ -574,13 +951,13 @@ impl Net {
             peer,
             peer_id: *peer_id,
             sig: CfgSig::of(&cfg),
-            last_rx: Mutex::new(Instant::now()),
+            last_rx: Mutex::new(RxClock { at: Instant::now(), staled: false }),
             udp_warned: AtomicBool::new(false),
             ctl,
             tx: Mutex::new(TcpTx { stream: wstream, sealer: tx }),
             udp_tx: Mutex::new(utx),
             udp_rx: Mutex::new(urx),
-            udp_peer: Mutex::new(UdpPeer { addr: Some(SocketAddr::new(ip, *udp_port)), learned: false }),
+            udp_peer: Mutex::new(UdpPeer { addr: Some(SocketAddr::new(ip, *udp_port)), ..Default::default() }),
         });
         if let Err(why) = self.install(&sess) {
             self.log_ip(ip, "yield", format!("与 {ip} 的新连接被拒：{why}"), false);
@@ -593,53 +970,52 @@ impl Net {
     }
 
     /// 登记新会话；按 tie-break / 身份规则可能拒绝。
+    /// injector.begin_session 和 PeerDown 在 holder 锁内发出：两条会话并发登记时，injector 的会话号与 holder 一致。
     fn install(&self, new: &SessionHandle) -> Result<(), String> {
-        let replaced = {
+        {
             let mut cur = lock(&self.holder);
             if let Some(old) = cur.as_ref() {
                 if keep_old(old.started.elapsed(), &old.nonce_c, &new.nonce_c) {
                     return Err("让位给已有连接".into());
                 }
-                if other_peer_busy(old.peer_id, new.peer_id, lock(&old.last_rx).elapsed()) {
+                if other_peer_busy(old.peer_id, new.peer_id, lock(&old.last_rx).at.elapsed()) {
                     return Err(format!("已连着另一台（{}）", old.peer.ip()));
                 }
                 old.close();
             }
-            cur.replace(new.clone()).is_some()
-        };
-        self.injector.begin_session(new.id);
-        if replaced {
-            crate::log!("新连接替换旧连接");
-            self.hub.to_input(ToInput::PeerDown);
+            let replaced = cur.replace(new.clone()).is_some();
+            self.injector.begin_session(new.id);
+            if replaced {
+                crate::log!("新连接替换旧连接");
+                self.hub.to_input(ToInput::PeerDown);
+            }
         }
+        *lock(&self.last_ok) = Some(new.peer.ip());
+        *lock(&self.self_peer) = None;
         Ok(())
     }
 
     fn end_session(&self, sess: &Session, why: &str) {
         sess.close();
-        let was_current = {
-            let mut cur = lock(&self.holder);
-            if cur.as_ref().is_some_and(|c| c.id == sess.id) {
-                *cur = None;
-                true
-            } else {
-                false
-            }
-        };
-        if was_current {
-            crate::log!("与 {} 的连接断开：{why}", sess.peer);
-            self.injector.end_session(sess.id);
-            self.hub.to_input(ToInput::PeerDown);
-            self.hub.set_status(|s| {
-                s.connected = false;
-                s.peer_addr.clear();
-            });
+        let mut cur = lock(&self.holder);
+        if !cur.as_ref().is_some_and(|c| c.id == sess.id) {
+            return;
         }
+        *cur = None;
+        // 同 install：在锁内通知，和并发登记的新会话顺序一致
+        crate::log!("与 {} 的连接断开：{why}", sess.peer);
+        self.injector.end_session(sess.id);
+        self.hub.to_input(ToInput::PeerDown);
+        self.hub.set_status(|s| {
+            s.connected = false;
+            s.peer_addr.clear();
+        });
     }
 
     fn run_reader(&self, sess: SessionHandle, mut stream: TcpStream, mut opener: Opener, first: Msg) {
-        let mut clip = ClipRx::default();
-        self.handle(&sess, first, &mut clip);
+        let mut st = RxState { clip_seen: self.clip_gen.load(Ordering::Relaxed), ..Default::default() };
+        self.handle(&sess, first, &mut st);
+        self.flush(&mut st, false);
         let why = loop {
             let plain = match read_frame(&mut stream, &mut opener, MAX_FRAME) {
                 Ok(p) => p,
@@ -651,30 +1027,50 @@ impl Net {
             if !self.is_current(&sess) {
                 break "已被新连接替换".to_string();
             }
-            *lock(&sess.last_rx) = Instant::now();
+            {
+                let mut c = lock(&sess.last_rx);
+                c.at = Instant::now();
+                c.staled = false;
+            }
+            // 本机剪贴板已被更新的内容取代：丢掉正在接收的对方图片（之后这个 id 的分片都忽略）
+            let g = self.clip_gen.load(Ordering::Relaxed);
+            if g != st.clip_seen {
+                st.clip_seen = g;
+                st.clip.reset();
+            }
             match proto::decode_frame(&plain) {
-                Some(Frame::Msg(m)) => self.handle(&sess, m, &mut clip),
+                Some(Frame::Msg(m)) => self.handle(&sess, m, &mut st),
                 Some(Frame::Chunk { id, offset, data }) => {
-                    if let Some((format, data)) = clip.chunk(id, offset, &data) {
+                    if let Some((format, data)) = st.clip.chunk(id, offset, data) {
                         self.hub.to_desktop(ToDesktop::ClipImage { format, data });
                     }
                 }
                 None => crate::log!("忽略无法解析的帧（{} 字节）", plain.len()),
             }
+            drop(plain);
+            st.clip.expire(Instant::now());
+            self.flush(&mut st, false);
         };
+        self.flush(&mut st, true);
         self.end_session(&sess, &why);
     }
 
-    /// 处理一条消息。只在 reader 线程调用：绝不直接写 socket（回复走 hub.to_net → writer）。
-    fn handle(&self, sess: &Session, m: Msg, clip: &mut ClipRx) {
+    /// 处理一条消息。只在 reader 线程调用：绝不直接写 socket（回复走可靠队列 → net-tcp）。
+    fn handle(&self, sess: &Session, m: Msg, st: &mut RxState) {
         match m {
             Msg::Hello { ver, name, monitors, udp_port, .. } => {
                 if ver != PROTO_VERSION {
                     crate::log!("对方协议版本 {ver} 与本机 {PROTO_VERSION} 不同");
                 }
+                let name = proto::sanitize_name(name);
+                let n_in = monitors.len();
+                let monitors = proto::sanitize_monitors(monitors);
+                if monitors.len() != n_in {
+                    crate::log!("对方报来 {n_in} 块显示器，有效的 {} 块", monitors.len());
+                }
                 let desk = Desk::new(monitors);
                 if self.opts.persist {
-                    config::save_peer_desk(&name, &desk);
+                    st.desk = Some((name.clone(), desk.clone()));
                 }
                 {
                     let mut u = lock(&sess.udp_peer);
@@ -697,7 +1093,7 @@ impl Net {
                 });
                 self.hub.to_input(ToInput::PeerUp { name, desk });
             }
-            Msg::Layout { side, offset, scale, rev } => self.apply_layout(sess, Layout { side, offset, scale }, rev),
+            Msg::Layout { side, offset, scale, rev } => self.apply_layout(sess, Layout { side, offset, scale }, rev, st),
             Msg::Enter { epoch, x, y } => self.injector.enter(sess.id, epoch, x, y),
             Msg::Leave { epoch } => self.injector.leave(sess.id, epoch),
             Msg::Button { epoch, x, y, button, down } => self.injector.button(sess.id, epoch, x, y, button, down),
@@ -717,19 +1113,23 @@ impl Net {
             }
             Msg::ClipImage { id, format, total, raw_len } => match clip_limit(&self.hub.cfg().clipboard, format) {
                 Some(max) => {
-                    if !clip.start(id, format, total, raw_len, max) {
+                    if !st.clip.start(id, format, total, raw_len, max) {
                         crate::log!("忽略对方的剪贴板数据（格式 {format}，{total} / {raw_len} 字节，超过上限）");
                     }
                 }
-                None => clip.reset(),
+                None => st.clip.reset(),
             },
-            Msg::Ping { t } => self.hub.to_net(Out::Msg(Msg::Pong { t })),
+            Msg::Ping { t } => self.enqueue(Out::Msg(Msg::Pong { t })),
             Msg::Pong { .. } => {}
         }
     }
 
-    /// 对方的排布（对方视角）：rev 更新则镜像后采用；只改排布字段。
-    fn apply_layout(&self, sess: &Session, theirs: Layout, rev: u64) {
+    /// 对方的排布（对方视角）：rev 更新则镜像后采用；只改排布字段。写盘由 flush 限频。
+    fn apply_layout(&self, sess: &Session, theirs: Layout, rev: u64, st: &mut RxState) {
+        if !layout_sane(&theirs, rev, config::now_ms()) {
+            crate::log!("忽略对方不合理的排布（rev {rev}，错开 {}，缩放 {}）", theirs.offset, theirs.scale);
+            return;
+        }
         let mine = theirs.mirrored();
         let new_cfg = {
             let mut c = self.hub.cfg.write().unwrap_or_else(|e| e.into_inner());
@@ -742,18 +1142,36 @@ impl Net {
         };
         crate::log!("采用对方的排布（rev {rev}）：对方在本机{}，错开 {}", mine.side.label_zh(), mine.offset);
         if self.opts.persist {
-            let r = config::update(&new_cfg, move |c| {
-                // 磁盘上已有更新的排布（设置窗口刚存的）就不覆盖
-                if c.layout.rev <= rev {
-                    c.layout.layout = mine;
-                    c.layout.rev = rev;
-                }
-            });
-            if let Err(e) = r {
-                crate::log!("保存配置失败：{e}");
-            }
+            st.layout = Some((mine, rev));
         }
         self.hub.to_input(ToInput::Config(Box::new(new_cfg)));
+    }
+
+    /// 把攒着的 peer.json / 排布写盘：每样每秒至多一次（force = 会话结束，写掉剩下的）。内容没变时 config 那边不写。
+    fn flush(&self, st: &mut RxState, force: bool) {
+        let now = Instant::now();
+        let due = |at: Option<Instant>| force || at.is_none_or(|t| now.saturating_duration_since(t) >= PERSIST_EVERY);
+        if st.desk.is_some() && due(st.desk_at) {
+            if let Some((name, desk)) = st.desk.take() {
+                config::save_peer_desk(&name, &desk);
+                st.desk_at = Some(now);
+            }
+        }
+        if st.layout.is_some() && due(st.layout_at) {
+            if let Some((mine, rev)) = st.layout.take() {
+                let r = config::update(&self.hub.cfg(), move |c| {
+                    // 磁盘上已有更新的排布（设置窗口刚存的）就不覆盖
+                    if c.layout.rev <= rev {
+                        c.layout.layout = mine;
+                        c.layout.rev = rev;
+                    }
+                });
+                if let Err(e) = r {
+                    crate::log!("保存配置失败：{e}");
+                }
+                st.layout_at = Some(now);
+            }
+        }
     }
 
     // ------------------------------------------------------------ 线程
@@ -779,18 +1197,24 @@ impl Net {
                     continue;
                 }
             };
-            if self.pending.load(Ordering::SeqCst) >= MAX_PENDING_HANDSHAKES {
+            let Ok(peer) = stream.peer_addr() else { continue };
+            let ip = peer.ip();
+            let peer_cfg = self.hub.cfg.read().unwrap_or_else(|e| e.into_inner()).peer.trim().to_string();
+            let reserved = self.known_ip(ip, &peer_cfg);
+            if !lock(&self.admit).admit(ip, reserved) {
                 continue; // 直接丢弃（关闭）
             }
-            self.pending.fetch_add(1, Ordering::SeqCst);
             let me = self.clone();
-            spawn_named("net-conn", move || {
+            let ok = spawn_named("net-conn", move || {
                 let est = me.establish(stream, None);
-                me.pending.fetch_sub(1, Ordering::SeqCst);
+                lock(&me.admit).release(ip);
                 if let Some((sess, s, opener, first)) = est {
                     me.run_reader(sess, s, opener, first);
                 }
             });
+            if !ok {
+                lock(&self.admit).release(ip);
+            }
         }
     }
 
@@ -803,7 +1227,7 @@ impl Net {
             }
             let cfg = self.hub.cfg();
             let peer = cfg.peer.trim().to_string();
-            if peer.is_empty() || self_blocked(&mut lock(&self.self_peer), &peer) {
+            if peer.is_empty() || self_blocked(&mut lock(&self.self_peer), &peer, Instant::now()) {
                 continue;
             }
             if self.psk(&cfg).is_none() {
@@ -818,6 +1242,7 @@ impl Net {
             };
             // 本机只监听 IPv4（对方也是），IPv6 地址连不上
             let v4: Vec<SocketAddr> = addrs.iter().copied().filter(|a| a.is_ipv4()).collect();
+            *lock(&self.peer_ips) = v4.iter().map(|a| a.ip()).collect();
             if v4.is_empty() {
                 self.note_err(format!("对方地址 {peer} 只有 IPv6，kmlink 只支持 IPv4，请填对方的 IPv4 地址"));
                 continue;
@@ -827,7 +1252,10 @@ impl Net {
                     Ok(s) => {
                         if let Some((sess, s, opener, first)) = self.establish(s, Some(&peer)) {
                             let me = self.clone();
-                            spawn_named("net-conn", move || me.run_reader(sess, s, opener, first));
+                            let sess2 = sess.clone();
+                            if !spawn_named("net-conn", move || me.run_reader(sess, s, opener, first)) {
+                                self.end_session(&sess2, "创建线程失败");
+                            }
                         }
                         break;
                     }
@@ -843,7 +1271,7 @@ impl Net {
                 break s;
             }
             std::thread::sleep(UDP_RETRY);
-            match UdpSocket::bind((self.opts.bind_ip, port)) {
+            match bind_udp(self.opts.bind_ip, port) {
                 Ok(s) => {
                     crate::log!("UDP 端口 {port} 绑定成功");
                     let _ = self.udp.set(s);
@@ -851,7 +1279,7 @@ impl Net {
                 Err(_) => continue,
             }
         };
-        let mut buf = vec![0u8; UDP_BUF];
+        let mut buf = [0u8; UDP_BUF];
         let mut fails = 0u32;
         loop {
             let (n, src) = match sock.recv_from(&mut buf) {
@@ -872,13 +1300,16 @@ impl Net {
                     continue;
                 }
             };
-            let Some(sess) = self.current() else { continue };
-            let Some(plain) = lock(&sess.udp_rx).open(&buf[..n]) else { continue };
-            {
-                let mut u = lock(&sess.udp_peer);
-                u.addr = Some(src);
-                u.learned = true;
+            // 先过滤再解密：长度不对的、不是会话对端 IP 发来的（端口可以变）直接丢
+            if !(UDP_MIN_PKT..=UDP_MAX_PKT).contains(&n) {
+                continue;
             }
+            let Some(sess) = self.current() else { continue };
+            if src.ip() != sess.peer.ip() {
+                continue;
+            }
+            let Some(plain) = lock(&sess.udp_rx).open(&buf[..n]) else { continue };
+            lock(&sess.udp_peer).heard(src, Instant::now());
             if let Some(UdpMsg::Move { epoch, seq, x, y }) = UdpMsg::decode(&plain) {
                 #[cfg(test)]
                 self.stats.udp_moves.fetch_add(1, Ordering::Relaxed);
@@ -893,32 +1324,50 @@ impl Net {
         }
     }
 
-    /// 发鼠标位置：UDP；UDP 不可用或还不通时也走 TCP（接收方按 seq 去重）。
+    /// 放进可靠队列，叫醒 net-tcp。
+    fn enqueue(&self, o: Out) {
+        lock(&self.tq).push(o);
+        self.tq_cv.notify_one();
+    }
+
+    /// 发鼠标位置：UDP；UDP 不可用或不通时也走 TCP（进可靠队列，接收方按 seq 去重）。
     fn send_move(&self, s: &Session, m: &UdpMsg) {
         let UdpMsg::Move { epoch, seq, x, y } = *m else { return };
-        let (udp, tcp) = move_route(self.udp.get().is_some(), lock(&s.udp_peer).learned);
+        let (udp, tcp) = move_route(self.udp.get().is_some(), s.udp_live());
         if udp {
             self.send_udp(s, m);
         }
         if tcp {
-            let _ = s.send_msg(&Msg::Move { epoch, seq, x, y });
+            self.enqueue(Out::Move { epoch, seq, x, y });
         }
     }
 
     /// UDP 不通时在状态里说明；通了就清掉。
     fn check_udp(&self, s: &Session) {
         let bound = self.udp.get().is_some();
-        let learned = lock(&s.udp_peer).learned;
+        let live = s.udp_live();
         let shown = self.hub.status().last_error == ERR_UDP_DOWN;
-        if !bound || (!learned && s.started.elapsed() >= UDP_GRACE) {
+        if !bound || (!live && s.started.elapsed() >= UDP_GRACE) {
             if !s.udp_warned.swap(true, Ordering::Relaxed) {
                 crate::log!("与 {} 的 UDP 不通（本机{}绑定），鼠标移动改走 TCP", s.peer, if bound { "已" } else { "未" });
             }
             if !shown {
                 self.hub.set_status(|st| st.last_error = ERR_UDP_DOWN.into());
             }
-        } else if learned && shown {
+        } else if live && shown {
             self.hub.set_status(|st| st.last_error.clear());
+        }
+    }
+
+    /// 对方 1.5 秒没有任何帧：抬起本机（被控端）按着的键和按钮，会话不断。有新帧来才重新计时。
+    /// 在 last_rx 锁内调用，和 reader 更新时间戳互斥：不会抬起刚收到的按键。
+    fn check_stale(&self, s: &Session, now: Instant) {
+        let mut c = lock(&s.last_rx);
+        if !c.staled && now.saturating_duration_since(c.at) >= STALE_AFTER {
+            c.staled = true;
+            #[cfg(test)]
+            self.stats.stales.fetch_add(1, Ordering::Relaxed);
+            self.injector.stale(s.id);
         }
     }
 
@@ -928,92 +1377,101 @@ impl Net {
             self.end_session(s, "密钥/对方地址/端口已修改，用新设置重连");
             return;
         }
-        let _ = s.send_msg(&Msg::Ping { t: config::now_ms() });
+        self.enqueue(Out::Msg(Msg::Ping { t: config::now_ms() }));
         self.send_udp(s, &UdpMsg::Hi);
         self.check_udp(s);
     }
 
-    /// 常驻 writer：独占 net 通道，整个进程生命周期。
-    fn run_writer(self: Arc<Self>, rx: Receiver<Out>) {
-        let mut q = OutQueue::default();
-        let mut img_id = u32::from_le_bytes([crypto::random32()[0], 0, 0, 0]);
-        let mut next_tick = Instant::now() + PING_EVERY;
-        let mut last_mv: Option<LastMove> = None;
-        loop {
-            let wake = match &last_mv {
-                Some(l) if !l.repaired => next_tick.min(l.at + REPAIR_AFTER),
-                _ => next_tick,
-            };
-            // 有图片在发：不等待，发完一片就回来看看有没有更急的消息
-            let first = if q.img.is_some() {
-                match rx.try_recv() {
-                    Ok(o) => Some(o),
-                    Err(TryRecvError::Empty) => None,
-                    Err(TryRecvError::Disconnected) => return,
-                }
-            } else {
-                match rx.recv_timeout(wake.saturating_duration_since(Instant::now())) {
-                    Ok(o) => Some(o),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => return,
-                }
-            };
-            if let Some(o) = first {
-                q.push(o);
+    /// 分拣一个要发的东西。
+    fn route(&self, o: Out, mover: &mut Mover) {
+        match o {
+            Out::Move { epoch, seq, x, y } => mover.push(UdpMsg::Move { epoch, seq, x, y }),
+            Out::CancelClip => {
+                self.clip_gen.fetch_add(1, Ordering::Relaxed);
+                self.enqueue(Out::CancelClip);
             }
-            while let Ok(o) = rx.try_recv() {
-                q.push(o);
-            }
+            o => self.enqueue(o),
+        }
+    }
 
-            let sess = self.current();
-            match &sess {
-                None => {
-                    q.clear();
-                    last_mv = None;
+    /// 常驻 net-out：独占 hub 的 net 通道，整个进程生命周期。不写 TCP（不会被慢网络卡住）。
+    fn run_out(self: Arc<Self>, rx: Receiver<Out>) {
+        let mut next_tick = Instant::now() + PING_EVERY;
+        let mut mover = Mover::default();
+        loop {
+            let mut wake = next_tick;
+            if let Some(t) = mover.wake() {
+                wake = wake.min(t);
+            }
+            if let Some(s) = self.current() {
+                let c = lock(&s.last_rx);
+                if !c.staled {
+                    wake = wake.min(c.at + STALE_AFTER);
                 }
-                Some(s) => {
-                    let (frames, mv) = q.take_batch(s.id, &mut img_id);
-                    // 先发 TCP（Enter 等），再发合并后的 Move
-                    let mut ok = true;
-                    for f in frames {
-                        if let Err(e) = s.send_plain(&f) {
-                            if e.kind() == io::ErrorKind::InvalidInput {
-                                crate::log!("丢弃过大的消息（{} 字节）", f.len());
-                                continue;
-                            }
-                            crate::log!("发送失败：{e}");
-                            q.clear();
-                            ok = false;
-                            break;
-                        }
+            }
+            match rx.recv_timeout(wake.saturating_duration_since(Instant::now())) {
+                Ok(o) => {
+                    self.route(o, &mut mover);
+                    while let Ok(o) = rx.try_recv() {
+                        self.route(o, &mut mover);
                     }
-                    if let Some(mv) = mv {
-                        if ok {
-                            self.send_move(s, &mv);
-                        }
-                        last_mv = Some(LastMove { sid: s.id, mv, at: Instant::now(), repaired: false });
-                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    lock(&self.tq).quit = true;
+                    self.tq_cv.notify_all();
+                    return;
                 }
             }
 
             let now = Instant::now();
             let tick = now >= next_tick;
-            if let Some(s) = &sess {
-                // 补发最后一个 Move（同 seq：丢了就补上，没丢接收方会忽略）
-                if let Some(l) = last_mv.as_mut().filter(|l| l.sid == s.id) {
-                    if l.due(now, tick) {
-                        self.send_move(s, &l.mv);
-                        l.repaired = true;
+            let sess = self.current();
+            match &sess {
+                None => mover = Mover::default(),
+                Some(s) => {
+                    if let Some(m) = mover.poll(now, tick, s.id) {
+                        self.send_move(s, &m);
                     }
-                }
-                if last_mv.as_ref().is_some_and(|l| l.sid != s.id || now.saturating_duration_since(l.at) >= REPAIR_FOR) {
-                    last_mv = None;
+                    self.check_stale(s, now);
                 }
             }
             if tick {
                 next_tick = now + PING_EVERY;
                 if let Some(s) = &sess {
                     self.on_tick(s);
+                }
+            }
+        }
+    }
+
+    /// 常驻 net-tcp：从可靠队列取，阻塞写 TCP。每轮先发全部消息，再发至多一个图片分片。
+    fn run_tcp(self: Arc<Self>) {
+        let mut img_id = u32::from_le_bytes([crypto::random32()[0], 0, 0, 0]);
+        loop {
+            {
+                let mut q = lock(&self.tq);
+                while !q.quit && !q.has_work() {
+                    q = self.tq_cv.wait(q).unwrap_or_else(|e| e.into_inner());
+                }
+                if q.quit {
+                    return;
+                }
+            }
+            let Some(s) = self.current() else {
+                lock(&self.tq).clear();
+                continue;
+            };
+            let frames = lock(&self.tq).take_batch(s.id, &mut img_id);
+            for f in frames {
+                if let Err(e) = s.send_plain(&f) {
+                    if e.kind() == io::ErrorKind::InvalidInput {
+                        crate::log!("丢弃过大的消息（{} 字节）", f.len());
+                        continue;
+                    }
+                    crate::log!("发送失败：{e}");
+                    lock(&self.tq).clear();
+                    break;
                 }
             }
         }
@@ -1036,8 +1494,9 @@ struct ImgTx {
 #[derive(Default)]
 struct OutQueue {
     msgs: VecDeque<Msg>,
-    mv: Option<UdpMsg>,
     img: Option<ImgTx>,
+    /// hub 通道已关闭（进程退出）：net-tcp 结束。
+    quit: bool,
 }
 
 impl OutQueue {
@@ -1050,7 +1509,11 @@ impl OutQueue {
                 }
                 self.msgs.push_back(m)
             }
-            Out::Move { epoch, seq, x, y } => self.mv = Some(UdpMsg::Move { epoch, seq, x, y }),
+            // 走 TCP 的鼠标位置（UDP 不可用/不通时）：只留最新的一个；排在已排队的消息之后（Enter 先到），图片分片之前
+            Out::Move { epoch, seq, x, y } => {
+                self.msgs.retain(|m| !matches!(m, Msg::Move { .. }));
+                self.msgs.push_back(Msg::Move { epoch, seq, x, y });
+            }
             Out::ClipImage { format, raw_len, deflated } => {
                 if deflated.is_empty() || u32::try_from(deflated.len()).is_err() {
                     return;
@@ -1058,22 +1521,28 @@ impl OutQueue {
                 // 新图片顶掉还没发完的旧图片（接收方见到新 id 会丢弃旧的）
                 self.img = Some(ImgTx { sess: None, id: 0, format, raw_len, data: deflated, header_sent: false, off: 0 });
             }
-            // TODO（net 负责人）：同时丢掉正在接收的对方图片
             Out::CancelClip => self.img = None,
         }
     }
 
-    fn clear(&mut self) {
-        self.msgs.clear();
-        self.mv = None;
-        self.img = None;
+    fn has_work(&self) -> bool {
+        !self.msgs.is_empty() || self.img.is_some()
     }
 
-    /// 取出这一轮要发的：TCP 明文帧（全部消息，然后至多一个图片帧）、最新的一个 Move。
-    /// 调用方先发帧、再发 Move（Enter 要先到）。
-    fn take_batch(&mut self, sess_id: u64, img_id: &mut u32) -> (Vec<Vec<u8>>, Option<UdpMsg>) {
+    fn clear(&mut self) {
+        self.msgs.clear();
+        self.img = None;
+        if self.msgs.capacity() > 256 {
+            self.msgs.shrink_to_fit();
+        }
+    }
+
+    /// 取出这一轮要发的 TCP 明文帧：全部消息，然后至多一个图片帧（头或一个分片）。
+    fn take_batch(&mut self, sess_id: u64, img_id: &mut u32) -> Vec<Vec<u8>> {
         let mut frames: Vec<Vec<u8>> = self.msgs.drain(..).map(|m| proto::encode_msg(&m)).collect();
-        let mv = self.mv.take();
+        if self.msgs.capacity() > 256 {
+            self.msgs.shrink_to_fit();
+        }
         if self.img.as_ref().is_some_and(|i| i.sess.is_some_and(|s| s != sess_id)) {
             self.img = None;
         }
@@ -1090,11 +1559,11 @@ impl OutQueue {
                 frames.push(proto::encode_chunk(img.id, img.off as u32, &img.data[img.off..end]));
                 img.off = end;
                 if end >= img.data.len() {
-                    self.img = None;
+                    self.img = None; // 发完即释放整块数据
                 }
             }
         }
-        (frames, mv)
+        frames
     }
 }
 
@@ -1106,6 +1575,8 @@ struct Incoming {
     total: usize,
     raw_len: usize,
     buf: Vec<u8>,
+    /// 最近一次有进展的时间（30 秒不动就释放）。
+    at: Instant,
 }
 
 #[derive(Default)]
@@ -1114,19 +1585,29 @@ struct ClipRx {
 }
 
 impl ClipRx {
+    /// 丢掉正在接收的（之后这个 id 的分片都不认）。
     fn reset(&mut self) {
         self.cur = None;
     }
 
     /// 新传输开始（丢弃未完成的旧传输）。超过上限返回 false。
+    /// 按 total 一次分配好（不倍增扩容；total 已受 max 限制，分配的页要写入时才真正占内存）。
     fn start(&mut self, id: u32, format: u32, total: u32, raw_len: u32, max: usize) -> bool {
         self.cur = None;
         let (total, raw_len) = (total as usize, raw_len as usize);
         if total == 0 || raw_len == 0 || total > max || raw_len > max {
             return false;
         }
-        self.cur = Some(Incoming { id, format, total, raw_len, buf: Vec::with_capacity(total.min(4 * CHUNK)) });
+        self.cur = Some(Incoming { id, format, total, raw_len, buf: Vec::with_capacity(total), at: Instant::now() });
         true
+    }
+
+    /// 半截的传输 30 秒没进展：释放。
+    fn expire(&mut self, now: Instant) {
+        if self.cur.as_ref().is_some_and(|c| now.saturating_duration_since(c.at) >= CLIP_STALL) {
+            crate::log!("对方的剪贴板数据 30 秒没有进展，丢弃");
+            self.cur = None;
+        }
     }
 
     /// 收到一片；拼齐并解压成功时返回 (format, 原始数据)。
@@ -1141,14 +1622,17 @@ impl ClipRx {
             return None;
         }
         inc.buf.extend_from_slice(data);
+        inc.at = Instant::now();
         if inc.buf.len() < inc.total {
             return None;
         }
         let inc = self.cur.take()?;
-        match miniz_oxide::inflate::decompress_to_vec_with_limit(&inc.buf, inc.raw_len) {
-            Ok(v) if v.len() == inc.raw_len => Some((inc.format, v)),
-            Ok(v) => {
-                crate::log!("剪贴板数据长度不符（{} ≠ {}），丢弃", v.len(), inc.raw_len);
+        // 按 raw_len 一次分配好解压缓冲；数据比声称的长会报 HasMoreOutput
+        let mut out = vec![0u8; inc.raw_len];
+        match miniz_oxide::inflate::decompress_slice_iter_to_slice(&mut out, std::iter::once(&inc.buf[..]), false, false) {
+            Ok(n) if n == inc.raw_len => Some((inc.format, out)),
+            Ok(n) => {
+                crate::log!("剪贴板数据长度不符（{n} ≠ {}），丢弃", inc.raw_len);
                 None
             }
             Err(e) => {
@@ -1171,6 +1655,10 @@ mod tests {
         [0x42; 32]
     }
 
+    fn no_reflect(_: &[u8; 32]) -> bool {
+        false
+    }
+
     fn tcp_pair() -> (TcpStream, TcpStream) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let a = TcpStream::connect(l.local_addr().unwrap()).unwrap();
@@ -1183,10 +1671,10 @@ mod tests {
     fn hs_pair(kc: [u8; 32], ks: [u8; 32]) -> (TcpStream, Chans, TcpStream, Chans) {
         let (mut c, mut s) = tcp_pair();
         let t = std::thread::spawn(move || {
-            let ch = handshake(&mut s, &ks, false).unwrap();
+            let ch = handshake(&mut s, &ks, Role::Server(&no_reflect)).unwrap();
             (s, ch)
         });
-        let cc = handshake(&mut c, &kc, true).unwrap();
+        let cc = handshake(&mut c, &kc, Role::Client(crypto::random32())).unwrap();
         let (s, sc) = t.join().unwrap();
         (c, cc, s, sc)
     }
@@ -1210,10 +1698,111 @@ mod tests {
         // s → c
         write_frame(&mut s, &mut sc.tx, &proto::encode_msg(&Msg::Yield { epoch: 0 })).unwrap();
         assert!(matches!(proto::decode_frame(&read_frame(&mut c, &mut cc.rx, MAX_FRAME).unwrap()), Some(Frame::Msg(Msg::Yield { .. }))));
-        // 篡改：直接写一个用错误计数器加密的帧（重放第 0 帧的密文）
-        let mut fresh = Sealer::new(&crypto::derive(&psk(), &cc.nonce_c, &[0; 32]).c2s);
+        // 篡改：直接写一个用错误密钥/计数器加密的帧
+        let mut fresh = Sealer::new(&crypto::derive(&psk(), &[0; 32], &cc.nonce_c, &[0; 32]).c2s);
         write_frame(&mut c, &mut fresh, b"\0{}").unwrap();
         assert_eq!(read_frame(&mut s, &mut sc.rx, MAX_FRAME).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// 记下经过的字节（模拟窃听者录下的握手）。
+    struct Tap<S> {
+        s: S,
+        wrote: Vec<u8>,
+        read: Vec<u8>,
+    }
+    impl<S: Read> Read for Tap<S> {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            let n = self.s.read(b)?;
+            self.read.extend_from_slice(&b[..n]);
+            Ok(n)
+        }
+    }
+    impl<S: Write> Write for Tap<S> {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            let n = self.s.write(b)?;
+            self.wrote.extend_from_slice(&b[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.s.flush()
+        }
+    }
+
+    #[test]
+    fn kml2_handshake_forward_secrecy() {
+        let (c, mut s) = tcp_pair();
+        let t = std::thread::spawn(move || handshake(&mut s, &psk(), Role::Server(&no_reflect)).unwrap());
+        let mut tap = Tap { s: c, wrote: Vec::new(), read: Vec::new() };
+        let mut cc = handshake(&mut tap, &psk(), Role::Client(crypto::random32())).unwrap();
+        let mut sc = t.join().unwrap();
+        // 线上：双方各 68 字节 = KML2 + nonce + X25519 临时公钥
+        assert_eq!((tap.wrote.len(), tap.read.len()), (68, 68));
+        assert_eq!(&tap.wrote[..4], b"KML2");
+        assert_eq!(&tap.read[..4], b"KML2");
+        let nc: [u8; 32] = tap.wrote[4..36].try_into().unwrap();
+        let ns: [u8; 32] = tap.read[4..36].try_into().unwrap();
+        let (pkc, pks): ([u8; 32], [u8; 32]) = (tap.wrote[36..].try_into().unwrap(), tap.read[36..].try_into().unwrap());
+        assert_eq!(nc, cc.nonce_c);
+        assert_ne!(pkc, pks);
+        let msg = proto::encode_msg(&Msg::Yield { epoch: 7 });
+        let mut ct = Vec::new();
+        write_frame(&mut ct, &mut cc.tx, &msg).unwrap();
+        // 日后拿到 psk + 录下的握手（没有临时私钥）：不带 DH（旧算法）或拿公钥当 DH 都解不开
+        for guess in [[0u8; 32], pkc, pks] {
+            let k = crypto::derive(&psk(), &guess, &nc, &ns);
+            assert!(read_frame(&mut &ct[..], &mut Opener::new(&k.c2s), MAX_FRAME).is_err());
+        }
+        // 真正的对端能解开
+        assert_eq!(read_frame(&mut &ct[..], &mut sc.rx, MAX_FRAME).unwrap(), msg);
+        // 同一个 psk 再握手一次：会话密钥不同
+        let (_, mut cc2, _, _) = hs_pair(psk(), psk());
+        let mut ct2 = Vec::new();
+        write_frame(&mut ct2, &mut cc2.tx, &msg).unwrap();
+        assert_ne!(ct, ct2);
+    }
+
+    #[test]
+    fn old_version_magic_reported() {
+        let (mut c, mut s) = tcp_pair();
+        c.write_all(b"KML1").unwrap();
+        c.write_all(&[0u8; 32]).unwrap();
+        let e = handshake(&mut s, &psk(), Role::Server(&no_reflect)).err().unwrap();
+        assert!(is_err(&e, ERR_OLD), "{e:?}");
+    }
+
+    #[test]
+    fn reflected_nonce_rejected_before_auth() {
+        let t0 = Instant::now();
+        let mut sent = SentNonces::default();
+        let nc = crypto::random32();
+        sent.remember(nc, t0);
+        assert!(!sent.hit(&nc));
+        assert!(!sent.reflected(&[1u8; 32], t0));
+        assert!(sent.reflected(&nc, t0 + Duration::from_secs(5)));
+        assert!(sent.hit(&nc));
+        // 10 秒后忘掉
+        assert!(!sent.reflected(&nc, t0 + SENT_NC_KEEP));
+        // 至多 16 个
+        for i in 0..40u8 {
+            sent.remember([i; 32], t0);
+        }
+        assert_eq!(sent.0.len(), SENT_NC_MAX);
+
+        // 握手：服务端收到本机刚发出的 nonce_c → 不回握手，直接拒绝；客户端看到连接断开，并能查到“被本机收到过”
+        let shared = Arc::new(Mutex::new(SentNonces::default()));
+        let nc = crypto::random32();
+        lock(&shared).remember(nc, Instant::now());
+        let (mut c, mut s) = tcp_pair();
+        let sh = shared.clone();
+        let t = std::thread::spawn(move || {
+            let seen = |n: &[u8; 32]| lock(&sh).reflected(n, Instant::now());
+            handshake(&mut s, &psk(), Role::Server(&seen)).err().unwrap()
+        });
+        let ce = handshake(&mut c, &psk(), Role::Client(nc)).err().unwrap();
+        let se = t.join().unwrap();
+        assert!(is_err(&se, ERR_REFLECT), "{se:?}");
+        assert!(is_closed(&ce), "{ce:?}");
+        assert!(lock(&shared).hit(&nc));
     }
 
     #[test]
@@ -1234,8 +1823,14 @@ mod tests {
 
         let (mut c, mut s) = tcp_pair();
         c.write_all(b"XXXX").unwrap();
-        c.write_all(&[0u8; 32]).unwrap();
-        assert!(handshake(&mut s, &psk(), false).is_err());
+        c.write_all(&[0u8; 64]).unwrap();
+        assert!(handshake(&mut s, &psk(), Role::Server(&no_reflect)).is_err());
+        // 小阶点（全 0 公钥）：拒绝
+        let (mut c, mut s) = tcp_pair();
+        c.write_all(MAGIC).unwrap();
+        c.write_all(&[0u8; 64]).unwrap();
+        let e = handshake(&mut s, &psk(), Role::Server(&no_reflect)).err().unwrap();
+        assert!(is_err(&e, ERR_PEER_KEY), "{e:?}");
     }
 
     #[test]
@@ -1246,8 +1841,11 @@ mod tests {
         let b = UdpSocket::bind("127.0.0.1:0").unwrap();
         b.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mv = UdpMsg::Move { epoch: 1, seq: 5, x: 100, y: -20 };
-        let p1 = utx.seal(&mv.encode());
-        let p2 = utx.seal(&UdpMsg::Hi.encode());
+        let p1 = utx.seal(&mv.encode()).unwrap();
+        let p2 = utx.seal(&UdpMsg::Hi.encode()).unwrap();
+        // 合法包的长度都在过滤范围内
+        assert!((UDP_MIN_PKT..=UDP_MAX_PKT).contains(&p1.len()));
+        assert!((UDP_MIN_PKT..=UDP_MAX_PKT).contains(&p2.len()));
         a.send_to(&p2, b.local_addr().unwrap()).unwrap();
         a.send_to(&p1, b.local_addr().unwrap()).unwrap(); // 迟到的旧包
         let mut buf = [0u8; 2048];
@@ -1280,6 +1878,7 @@ mod tests {
             .map(|f| match proto::decode_frame(f) {
                 Some(Frame::Msg(Msg::ClipImage { .. })) => "hdr".into(),
                 Some(Frame::Msg(Msg::Ping { t })) => format!("p{t}"),
+                Some(Frame::Msg(Msg::Move { seq, .. })) => format!("m{seq}"),
                 Some(Frame::Msg(_)) => "msg".into(),
                 Some(Frame::Chunk { offset, .. }) => format!("c{offset}"),
                 None => "?".into(),
@@ -1297,21 +1896,21 @@ mod tests {
         q.push(Out::Msg(Msg::Ping { t: 1 }));
         q.push(mv(2));
         q.push(Out::Msg(Msg::Ping { t: 2 }));
-        let (f, m) = q.take_batch(7, &mut id);
-        assert_eq!(kinds(&f), ["p1", "p2", "hdr"]);
-        assert_eq!(m, Some(UdpMsg::Move { epoch: 1, seq: 2, x: 2, y: 0 }));
-        let (f, m) = q.take_batch(7, &mut id);
-        assert_eq!(kinds(&f), ["c0"]);
-        assert_eq!(m, None);
+        // 走 TCP 的 Move 只留最新的，排在已排队消息之后、图片之前
+        assert_eq!(kinds(&q.take_batch(7, &mut id)), ["p1", "m2", "p2", "hdr"]);
+        assert_eq!(kinds(&q.take_batch(7, &mut id)), ["c0"]);
         // 分片之间插入的消息先发
         q.push(Out::Msg(Msg::Ping { t: 3 }));
-        let (f, _) = q.take_batch(7, &mut id);
-        assert_eq!(kinds(&f), ["p3", &format!("c{CHUNK}")]);
-        let (f, _) = q.take_batch(7, &mut id);
-        assert_eq!(kinds(&f), [format!("c{}", CHUNK * 2)]);
+        q.push(mv(3));
+        assert_eq!(kinds(&q.take_batch(7, &mut id)), ["p3".to_string(), "m3".into(), format!("c{CHUNK}")]);
+        assert_eq!(kinds(&q.take_batch(7, &mut id)), [format!("c{}", CHUNK * 2)]);
         assert!(q.img.is_none());
-        let (f, _) = q.take_batch(7, &mut id);
-        assert!(f.is_empty());
+        assert!(!q.has_work());
+        assert!(q.take_batch(7, &mut id).is_empty());
+        // 取消：丢掉待发的图片
+        q.push(Out::ClipImage { format: 8, raw_len: 1, deflated: vec![1; 10] });
+        q.push(Out::CancelClip);
+        assert!(!q.has_work());
     }
 
     #[test]
@@ -1319,19 +1918,92 @@ mod tests {
         let mut q = OutQueue::default();
         let mut id = 0u32;
         q.push(Out::ClipImage { format: 8, raw_len: 1, deflated: vec![1; CHUNK * 3] });
-        let (f, _) = q.take_batch(1, &mut id);
-        assert_eq!(kinds(&f), ["hdr"]);
-        let (f, _) = q.take_batch(2, &mut id);
-        assert!(f.is_empty());
+        assert_eq!(kinds(&q.take_batch(1, &mut id)), ["hdr"]);
+        assert!(q.take_batch(2, &mut id).is_empty());
         assert!(q.img.is_none());
         // 新图片替换旧图片，id 递增
         q.push(Out::ClipImage { format: 8, raw_len: 1, deflated: vec![1; 10] });
         q.push(Out::ClipImage { format: 17, raw_len: 1, deflated: vec![2; 10] });
-        let (f, _) = q.take_batch(2, &mut id);
+        let f = q.take_batch(2, &mut id);
         match proto::decode_frame(&f[0]) {
             Some(Frame::Msg(Msg::ClipImage { id, format, total, .. })) => assert_eq!((id, format, total), (2, 17, 10)),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn mover_throttles_but_keeps_latest() {
+        let ms = Duration::from_millis;
+        let m_ = |s: u32| UdpMsg::Move { epoch: 1, seq: s, x: s as i32, y: 0 };
+        let t = Instant::now();
+        let mut m = Mover::default();
+        assert!(m.wake().is_none());
+        m.push(m_(1));
+        assert_eq!(m.poll(t, false, 1), Some(m_(1))); // 第一个立刻发
+        m.push(m_(2));
+        m.push(m_(3));
+        assert_eq!(m.poll(t + ms(1), false, 1), None); // 不到 2ms
+        assert_eq!(m.wake(), Some(t + MOVE_GAP));
+        assert_eq!(m.poll(t + MOVE_GAP, false, 1), Some(m_(3))); // 间隔一到发最新的
+        let t2 = t + MOVE_GAP;
+        assert_eq!(m.poll(t2 + ms(1), false, 1), None);
+        // 100ms 没有新的：补发最后一个，然后每秒的 tick 再补
+        assert_eq!(m.wake(), Some(t2 + REPAIR_AFTER));
+        assert_eq!(m.poll(t2 + REPAIR_AFTER, false, 1), Some(m_(3)));
+        assert_eq!(m.poll(t2 + REPAIR_AFTER + ms(1), false, 1), None);
+        assert!(m.wake().is_none());
+        assert_eq!(m.poll(t2 + ms(1000), true, 1), Some(m_(3)));
+        // 会话变了：不补发旧会话的
+        assert_eq!(m.poll(t2 + ms(1500), true, 2), None);
+        // 安静够久了：新位置立刻发
+        m.push(m_(4));
+        assert_eq!(m.poll(t2 + ms(2000), false, 2), Some(m_(4)));
+    }
+
+    #[test]
+    fn udp_falls_back_to_tcp_and_back() {
+        let t0 = Instant::now();
+        let src: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let mut u = UdpPeer::default();
+        assert!(!u.live(t0));
+        u.heard(src, t0);
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        assert!(u.live(at(2000)));
+        assert_eq!(move_route(true, u.live(at(2000))), (true, false));
+        // 2.5 秒没收到对方的 UDP（对方每秒发 Hi）：鼠标位置回落到 TCP（UDP 照发，探路）
+        assert!(!u.live(at(2600)));
+        assert!(!u.learned);
+        assert_eq!(move_route(true, u.live(at(2600))), (true, true));
+        assert_eq!(u.addr, Some(src));
+        // 又收到了：切回只走 UDP
+        u.heard(src, at(3000));
+        assert_eq!(move_route(true, u.live(at(3000))), (true, false));
+    }
+
+    #[test]
+    fn per_ip_handshake_quota() {
+        let ip = |i: u8| IpAddr::V4(Ipv4Addr::new(10, 0, 0, i));
+        let mut a = Admission::default();
+        assert!(a.admit(ip(1), false));
+        assert!(a.admit(ip(1), false));
+        assert!(!a.admit(ip(1), false)); // 同一 IP 至多 2 个未认证连接
+        assert!(!a.admit(ip(1), true)); // 预留的 IP 也一样
+        for i in 2..8 {
+            assert!(a.admit(ip(i), false));
+        }
+        assert_eq!(a.total, MAX_PENDING_HANDSHAKES);
+        assert!(!a.admit(ip(20), false)); // 总数满
+        assert!(a.admit(ip(30), true)); // cfg.peer / 上次连上的 IP 照样进
+        a.release(ip(1));
+        assert!(!a.admit(ip(21), false));
+        a.release(ip(30));
+        assert!(a.admit(ip(21), false));
+        a.release(ip(99)); // 没登记过的：无事
+        for i in [1, 2, 3, 4, 5, 6, 7, 21] {
+            a.release(ip(i));
+        }
+        assert_eq!(a.total, 0);
+        assert!(a.per_ip.is_empty());
     }
 
     fn deflate(raw: &[u8]) -> Vec<u8> {
@@ -1344,6 +2016,7 @@ mod tests {
         let z = deflate(&raw);
         let mut rx = ClipRx::default();
         assert!(rx.start(5, 8, z.len() as u32, raw.len() as u32, 1 << 20));
+        assert_eq!(rx.cur.as_ref().unwrap().buf.capacity(), z.len()); // 一次按 total 分配
         let mut out = None;
         for (i, part) in z.chunks(1000).enumerate() {
             assert!(out.is_none());
@@ -1367,9 +2040,49 @@ mod tests {
         // raw_len 声称比实际小：解压超限 → 丢弃
         assert!(rx.start(10, 8, z.len() as u32, 100, 1 << 20));
         assert!(rx.chunk(10, 0, &z).is_none());
+        // raw_len 声称比实际大：长度不符 → 丢弃
+        assert!(rx.start(12, 8, z.len() as u32, raw.len() as u32 + 1, 1 << 20));
+        assert!(rx.chunk(12, 0, &z).is_none());
         // 垃圾数据
         assert!(rx.start(11, 8, 4, 100, 1 << 20));
         assert!(rx.chunk(11, 0, &[0xff; 4]).is_none());
+    }
+
+    #[test]
+    fn clip_cancel_and_stall() {
+        let raw: Vec<u8> = (0..50_000u32).map(|i| (i % 7) as u8).collect();
+        let z = deflate(&raw);
+        let mut rx = ClipRx::default();
+        // 取消：之后这个 id 的分片都忽略
+        assert!(rx.start(3, 8, z.len() as u32, raw.len() as u32, 1 << 20));
+        assert!(rx.chunk(3, 0, &z[..10]).is_none());
+        rx.reset();
+        assert!(rx.chunk(3, 10, &z[10..]).is_none());
+        assert!(rx.cur.is_none());
+        // 30 秒没进展：释放
+        assert!(rx.start(4, 8, z.len() as u32, raw.len() as u32, 1 << 20));
+        rx.expire(Instant::now() + Duration::from_secs(20));
+        assert!(rx.cur.is_some());
+        rx.expire(Instant::now() + CLIP_STALL + Duration::from_secs(1));
+        assert!(rx.cur.is_none());
+    }
+
+    #[test]
+    fn clip_limits() {
+        let mut c = ClipCfg { enabled: true, images: false, max_text_kb: 1, max_image_mb: 1 };
+        assert_eq!(clip_limit(&c, 13), Some(2050));
+        assert_eq!(clip_limit(&c, 8), None);
+        c.images = true;
+        assert_eq!(clip_limit(&c, 17), Some(1 << 20));
+        c.enabled = false;
+        assert_eq!(clip_limit(&c, 13), None);
+        assert_eq!(clip_limit(&c, 8), None);
+        // 文字分片拼装
+        let raw: Vec<u8> = "大段文字".repeat(100).encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let z = deflate(&raw);
+        let mut rx = ClipRx::default();
+        assert!(rx.start(1, 13, z.len() as u32, raw.len() as u32, 1 << 20));
+        assert_eq!(rx.chunk(1, 0, &z), Some((13, raw)));
     }
 
     // ------------------------------------------------ 两个进程内的“对等端”
@@ -1410,6 +2123,16 @@ mod tests {
         Node { net, hub, input, desktop }
     }
 
+    /// 两个连好的节点（B 主动连 A）。
+    fn pair() -> (Node, Node) {
+        let key = config::new_key_hex();
+        let (pa, pb) = (free_port(), free_port());
+        let a = node("A", pa, String::new(), &key, Layout::default(), 0);
+        let b = node("B", pb, format!("127.0.0.1:{pa}"), &key, Layout::default(), 0);
+        wait("双方连上", 10, || a.hub.status().connected && b.hub.status().connected);
+        (a, b)
+    }
+
     fn wait(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
         let end = Instant::now() + Duration::from_secs(secs);
         while Instant::now() < end {
@@ -1422,15 +2145,7 @@ mod tests {
     }
 
     fn next_desktop(rx: &Receiver<ToDesktop>, secs: u64) -> ToDesktop {
-        let end = Instant::now() + Duration::from_secs(secs);
-        loop {
-            let left = end.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(left) {
-                Ok(ToDesktop::Status) => continue,
-                Ok(m) => return m,
-                Err(_) => panic!("desktop 消息超时"),
-            }
-        }
+        next_desktop_opt(rx, secs).expect("desktop 消息超时")
     }
 
     fn next_desktop_opt(rx: &Receiver<ToDesktop>, secs: u64) -> Option<ToDesktop> {
@@ -1539,6 +2254,100 @@ mod tests {
     }
 
     #[test]
+    fn mouse_moves_not_blocked_by_image() {
+        // 传大图时（TCP 写路径被占着），UDP 鼠标位置照样立刻到
+        let (a, b) = pair();
+        let learned = |n: &Node| n.net.current().is_some_and(|s| lock(&s.udp_peer).learned);
+        wait("UDP 打通", 5, || learned(&a) && learned(&b));
+        let sb = b.net.current().unwrap();
+        let mut raw = vec![0u8; 4_000_000];
+        getrandom::fill(&mut raw).unwrap();
+        let z = deflate(&raw);
+        let u0 = a.net.stats.udp_moves.load(Ordering::Relaxed);
+        {
+            // 卡住 B 的 TCP 发送（模拟 WiFi 上分片排不出去）
+            let _g = lock(&sb.tx);
+            b.hub.to_net(Out::ClipImage { format: 8, raw_len: raw.len() as u32, deflated: z });
+            std::thread::sleep(Duration::from_millis(50));
+            b.hub.to_net(Out::Move { epoch: 1, seq: 1, x: 1, y: 1 });
+            wait("TCP 卡着时 UDP Move 照样到", 2, || a.net.stats.udp_moves.load(Ordering::Relaxed) > u0);
+        }
+    }
+
+    #[test]
+    fn udp_stall_falls_back_to_tcp() {
+        let (a, b) = pair();
+        let learned = |n: &Node| n.net.current().is_some_and(|s| lock(&s.udp_peer).learned);
+        wait("UDP 打通", 5, || learned(&a) && learned(&b));
+        let sa = a.net.current().unwrap();
+        let tcp0 = b.net.stats.tcp_moves.load(Ordering::Relaxed);
+        {
+            // A 的 UDP 接收卡住：A 收不到 B 的 UDP 包
+            let _g = lock(&sa.udp_rx);
+            wait("A 发现 UDP 不通", 5, || !sa.udp_live());
+            a.hub.to_net(Out::Move { epoch: 1, seq: 1, x: 5, y: 5 });
+            wait("Move 改走 TCP", 5, || b.net.stats.tcp_moves.load(Ordering::Relaxed) > tcp0);
+        }
+        // UDP 恢复：切回只走 UDP
+        wait("A 的 UDP 恢复", 5, || sa.udp_live());
+        std::thread::sleep(Duration::from_millis(300));
+        let (tcp1, udp1) = (b.net.stats.tcp_moves.load(Ordering::Relaxed), b.net.stats.udp_moves.load(Ordering::Relaxed));
+        a.hub.to_net(Out::Move { epoch: 1, seq: 2, x: 6, y: 6 });
+        wait("UDP Move 到达", 5, || b.net.stats.udp_moves.load(Ordering::Relaxed) > udp1);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(b.net.stats.tcp_moves.load(Ordering::Relaxed), tcp1);
+    }
+
+    #[test]
+    fn quiet_peer_releases_keys_but_keeps_session() {
+        let (a, b) = pair();
+        let sb = b.net.current().unwrap();
+        let id = a.net.current().unwrap().id;
+        let s0 = a.net.stats.stales.load(Ordering::Relaxed);
+        let t0 = Instant::now();
+        {
+            // B 发不出任何 TCP 帧（Ping 也发不出）
+            let _g = lock(&sb.tx);
+            wait("A 抬起按键", 4, || a.net.stats.stales.load(Ordering::Relaxed) > s0);
+        }
+        assert!(t0.elapsed() >= Duration::from_millis(1000));
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(a.net.current().unwrap().id, id, "会话不应断开");
+        // 每段安静只抬一次
+        assert_eq!(a.net.stats.stales.load(Ordering::Relaxed), s0 + 1);
+    }
+
+    #[test]
+    fn cancel_clip_drops_incoming_image() {
+        let (a, b) = pair();
+        let sb = b.net.current().unwrap();
+        let mut raw = vec![0u8; 100_000];
+        getrandom::fill(&mut raw).unwrap();
+        let z = deflate(&raw);
+        assert!(z.len() > CHUNK);
+        let hdr = |id: u32| proto::encode_msg(&Msg::ClipImage { id, format: 8, total: z.len() as u32, raw_len: raw.len() as u32 });
+        // B 发了图片头和第一片
+        sb.send_plain(&hdr(777)).unwrap();
+        sb.send_plain(&proto::encode_chunk(777, 0, &z[..CHUNK])).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        // A 本机剪贴板被更新的内容取代
+        a.hub.to_net(Out::CancelClip);
+        wait("A 处理取消", 5, || a.net.clip_gen.load(Ordering::Relaxed) == 1);
+        sb.send_plain(&proto::encode_chunk(777, CHUNK as u32, &z[CHUNK..])).unwrap();
+        assert!(next_desktop_opt(&a.desktop, 1).is_none(), "取消后不应再拼出这张图");
+        // 之后新的传输照常
+        sb.send_plain(&hdr(778)).unwrap();
+        sb.send_plain(&proto::encode_chunk(778, 0, &z)).unwrap();
+        match next_desktop(&a.desktop, 5) {
+            ToDesktop::ClipImage { format, data } => {
+                assert_eq!(format, 8);
+                assert!(data == raw);
+            }
+            m => panic!("{m:?}"),
+        }
+    }
+
+    #[test]
     fn wrong_key_does_not_connect() {
         let (pa, pb) = (free_port(), free_port());
         let a = node("A", pa, String::new(), &config::new_key_hex(), Layout::default(), 0);
@@ -1562,10 +2371,10 @@ mod tests {
     #[test]
     fn handshake_deadline_is_absolute() {
         let (mut c, mut s) = tcp_pair();
-        // 慢速连接：每 50ms 一个字节，单次读永远不会超时
+        // 慢速连接：每 50ms 一个字节（魔数对，后面是 0），单次读永远不会超时
         let t = std::thread::spawn(move || {
-            for _ in 0..40 {
-                if c.write_all(b"K").is_err() {
+            for i in 0..40 {
+                if c.write_all(&[MAGIC.get(i).copied().unwrap_or(0)]).is_err() {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -1573,7 +2382,7 @@ mod tests {
         });
         let t0 = Instant::now();
         let mut dl = Deadline { s: &mut s, until: Instant::now() + Duration::from_millis(300) };
-        let e = handshake(&mut dl, &psk(), false).err().expect("应超时");
+        let e = handshake(&mut dl, &psk(), Role::Server(&no_reflect)).err().expect("应超时");
         assert!(matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock), "{e:?}");
         assert!(t0.elapsed() < Duration::from_millis(1000));
         drop(s);
@@ -1618,11 +2427,32 @@ mod tests {
         assert!(!adopt_layout(2, &x, &x, 2, 5, 9));
         assert!(!adopt_layout(2, &x, &y, 2, 5, 0));
         assert!(!adopt_layout(3, &x, &y, 2, 5, 9));
-        // 自连后不再拨同一个 peer；peer 变了就解除
-        let mut slot = Some("1.2.3.4".to_string());
-        assert!(self_blocked(&mut slot, "1.2.3.4"));
-        assert!(!self_blocked(&mut slot, "1.2.3.5"));
+        // 排布合理性：rev 超前 1 天以上、数值离谱的不要
+        let now = 1_700_000_000_000u64;
+        assert!(layout_sane(&y, now + 1000, now));
+        assert!(layout_sane(&y, now + MAX_REV_AHEAD, now));
+        assert!(!layout_sane(&y, now + MAX_REV_AHEAD + 1, now));
+        assert!(!layout_sane(&y, u64::MAX, now));
+        assert!(!layout_sane(&Layout { offset: i32::MIN, ..y }, now, now));
+        assert!(!layout_sane(&Layout { scale: f64::NAN, ..y }, now, now));
+        assert!(!layout_sane(&Layout { scale: 0.0, ..y }, now, now));
+        // 自连后 60 秒内不再拨同一个 peer；peer 变了或到期就解除
+        let mut slot = Some(("1.2.3.4".to_string(), t + SELF_BACKOFF));
+        assert!(self_blocked(&mut slot, "1.2.3.4", t));
+        assert!(!self_blocked(&mut slot, "1.2.3.4", t + SELF_BACKOFF));
         assert!(slot.is_none());
+        let mut slot = Some(("1.2.3.4".to_string(), t + SELF_BACKOFF));
+        assert!(!self_blocked(&mut slot, "1.2.3.5", t));
+        assert!(slot.is_none());
+        // 认证前的错误何时显示在状态里
+        assert!(show_notice(false, true, false));
+        assert!(show_notice(false, false, true));
+        assert!(!show_notice(false, false, false)); // 填了对方地址，陌生 IP 不能改状态
+        assert!(!show_notice(true, true, true)); // 已有会话时不改
+        assert_eq!(peer_literal_ip(" 10.0.0.2:5 "), Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
+        assert_eq!(peer_literal_ip("10.0.0.2"), Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
+        assert!(peer_literal_ip("[::1]").is_some());
+        assert_eq!(peer_literal_ip("my-pc"), None);
         // 另一台同密钥的电脑：旧会话活跃时拒绝
         assert!(other_peer_busy(1, 2, Duration::from_millis(500)));
         assert!(!other_peer_busy(1, 2, Duration::from_secs(3)));
@@ -1640,24 +2470,6 @@ mod tests {
         assert_eq!(CfgSig::of(&c), sig);
         c.port += 1;
         assert_ne!(CfgSig::of(&c), sig);
-    }
-
-    #[test]
-    fn clip_limits() {
-        let mut c = ClipCfg { enabled: true, images: false, max_text_kb: 1, max_image_mb: 1 };
-        assert_eq!(clip_limit(&c, 13), Some(2050));
-        assert_eq!(clip_limit(&c, 8), None);
-        c.images = true;
-        assert_eq!(clip_limit(&c, 17), Some(1 << 20));
-        c.enabled = false;
-        assert_eq!(clip_limit(&c, 13), None);
-        assert_eq!(clip_limit(&c, 8), None);
-        // 文字分片拼装
-        let raw: Vec<u8> = "大段文字".repeat(100).encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-        let z = deflate(&raw);
-        let mut rx = ClipRx::default();
-        assert!(rx.start(1, 13, z.len() as u32, raw.len() as u32, 1 << 20));
-        assert_eq!(rx.chunk(1, 0, &z), Some((13, raw)));
     }
 
     #[test]
@@ -1679,8 +2491,13 @@ mod tests {
         let peer = format!("127.0.0.1:{p}");
         let a = node("A", p, peer.clone(), &key, Layout::default(), 0);
         wait("报告连到自己", 10, || a.hub.status().last_error == ERR_SELF);
-        assert_eq!(lock(&a.net.self_peer).as_deref(), Some(peer.as_str()));
+        assert!(lock(&a.net.self_peer).as_ref().is_some_and(|(p, until)| *p == peer && *until > Instant::now()));
+        // 认证前（握手阶段）就识别出来了
+        let n = a.net.stats.reflect_rejects.load(Ordering::Relaxed);
+        assert!(n >= 1);
+        // 退避期间不再拨（测试里拨号间隔 100ms）
         std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(a.net.stats.reflect_rejects.load(Ordering::Relaxed), n);
         assert!(a.net.current().is_none());
         assert!(!a.hub.status().connected);
         assert!(!a.input.try_iter().any(|m| matches!(m, ToInput::PeerUp { .. })));

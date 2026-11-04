@@ -115,8 +115,10 @@ impl Config {
                     (c, false)
                 }
                 Err(e) => {
-                    let bak = dir().join(format!("config.bad-{}.toml", now_ms()));
+                    let name = format!("config.bad-{}.toml", now_ms());
+                    let bak = dir().join(&name);
                     let _ = std::fs::copy(&p, &bak);
+                    prune_bad(&name);
                     crate::log!("config.toml 解析失败（{e}），已备份到 {}", bak.display());
                     let mut c = Config::default();
                     c.key = salvage(&s, "key").filter(|k| parse_key(k).is_some()).unwrap_or_else(new_key_hex);
@@ -148,9 +150,13 @@ impl Config {
         self.save_locked()
     }
 
+    /// 内容没变就不写（避免无谓的磁盘写入和设置窗口/主程序互相触发重新加载）。
     fn save_locked(&self) -> std::io::Result<()> {
-        std::fs::create_dir_all(dir())?;
         let s = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
+        if std::fs::read_to_string(path()).is_ok_and(|old| old == s) {
+            return Ok(());
+        }
+        std::fs::create_dir_all(dir())?;
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let tmp = dir().join(format!("config.toml.{}.{}.tmp", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         std::fs::write(&tmp, s)?;
@@ -250,10 +256,31 @@ pub fn new_key_hex() -> String {
     k.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// 内容没变就不写（net 那边另有每秒至多一次的限频）。
 pub fn save_peer_desk(name: &str, desk: &Desk) {
-    let v = serde_json::json!({ "name": name, "monitors": desk.monitors });
+    let s = serde_json::json!({ "name": name, "monitors": desk.monitors }).to_string();
+    let p = peer_desk_path();
+    if std::fs::read_to_string(&p).is_ok_and(|old| old == s) {
+        return;
+    }
     let _ = std::fs::create_dir_all(dir());
-    let _ = std::fs::write(peer_desk_path(), v.to_string());
+    let _ = std::fs::write(p, s);
+}
+
+/// 解析失败的备份里有密钥：只留最新的一个（keep），其余 config.bad-*.toml 删掉。
+fn prune_bad(keep: &str) {
+    let Ok(rd) = std::fs::read_dir(dir()) else { return };
+    for e in rd.flatten() {
+        let n = e.file_name();
+        let Some(n) = n.to_str() else { continue };
+        if is_bad_backup(n) && n != keep {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+fn is_bad_backup(n: &str) -> bool {
+    n.starts_with("config.bad-") && n.ends_with(".toml")
 }
 
 pub fn load_peer_desk() -> Option<(String, Desk)> {
@@ -307,5 +334,8 @@ peer = \"10.0.0.1\"
         let far_future = now_ms() + 10_000_000;
         assert_eq!(next_rev(far_future), far_future + 1);
         assert!(next_rev(0) >= now_ms() - 1000);
+        assert!(is_bad_backup("config.bad-123.toml"));
+        assert!(!is_bad_backup("config.toml"));
+        assert!(!is_bad_backup("config.bad-1.toml.tmp"));
     }
 }
