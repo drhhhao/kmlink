@@ -75,6 +75,7 @@ fn daemon(with_console: bool) {
     }
     unsafe {
         let _ = timeBeginPeriod(1);
+        no_power_throttling();
     }
 
     let (cfg, first_run) = config::Config::load_or_create();
@@ -96,4 +97,30 @@ fn daemon(with_console: bool) {
     log!("退出");
     log::flush(500);
     std::process::exit(0);
+}
+
+/// Windows 11 对没有可见窗口的后台进程：会忽略 timeBeginPeriod（计时退回 15.6ms），还可能放进“效率模式”
+/// （EcoQoS，排到小核、降频）。这两样都会让鼠标转发变钝，明确声明本进程不要这两种节能限制。
+fn no_power_throttling() {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling,
+        SetProcessInformation,
+    };
+    let st = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: 0, // 0 = 这两项都“不节流”
+    };
+    let r = unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            &st as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    };
+    if let Err(e) = r {
+        log!("关闭电源节流失败：{e}");
+    }
 }

@@ -157,6 +157,7 @@ fn tick() -> u32 {
     unsafe { GetTickCount() }
 }
 
+#[cfg_attr(test, allow(dead_code))]
 const REAL: Sys = Sys { send, last_input: crate::input::last_physical_input, now: tick };
 
 pub struct Injector {
@@ -167,7 +168,12 @@ pub struct Injector {
 
 impl Injector {
     pub fn new(hub: Arc<Hub>) -> Self {
-        Self { hub, inner: Mutex::new(Inner::default()), sys: REAL }
+        // 测试里（net 的端到端测试也会建 Injector）绝不能真的注入：否则跑 cargo test 会挪动本机光标、往前台窗口打字
+        #[cfg(test)]
+        let sys = Sys { send: |i| i.len() as u32, last_input: || None, now: tick };
+        #[cfg(not(test))]
+        let sys = REAL;
+        Self { hub, inner: Mutex::new(Inner::default()), sys }
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -371,6 +377,7 @@ fn unsent<'a>(keys: &'a [KeyId], btns: &'a [Button], n: usize) -> (&'a [KeyId], 
 }
 
 /// 注入，返回实际注入个数；失败（安全桌面等）不重试。少于请求数时记一次日志（恢复正常后再失败会再记）。
+#[cfg_attr(test, allow(dead_code))]
 fn send(inputs: &[INPUT]) -> u32 {
     static WARNED: AtomicBool = AtomicBool::new(false);
     let n = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };

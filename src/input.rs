@@ -225,6 +225,11 @@ impl Drive {
 }
 
 pub struct Kvm {
+    /// 诊断（KMLINK_TRACE=1）：跨屏后前 32 个移动事件 (time, pt.x, pt.y, cur.x, cur.y, parked, vc.x)。
+    pub trace: [(u32, i32, i32, i32, i32, i32, i32); 32],
+    pub trace_n: usize,
+    /// 最近一次回到本机是哪行代码触发的、当时对方光标在哪（定时器里写日志，钩子里不写）。
+    pub home_note: Option<(&'static std::panic::Location<'static>, Point)>,
     mine: Desk,
     peer: Option<Desk>,
     layout: Layout,
@@ -281,6 +286,9 @@ impl Kvm {
             yield_acc: 0,
             yield_acc_at: None,
             yielded_at: None,
+            home_note: None,
+            trace: [(0, 0, 0, 0, 0, 0, 0); 32],
+            trace_n: 0,
             probe,
             armed: true,
             fg_blocked: false,
@@ -442,6 +450,7 @@ impl Kvm {
         out.push(Action::Send(Msg::Enter { epoch: self.epoch, x: entry.x, y: entry.y }));
         // 先隐藏、隐藏完再停放（见 hidden）
         out.push(Action::HideCursor(self.epoch));
+        self.trace_n = 0;
         out.push(Action::Driving(true));
         true
     }
@@ -489,6 +498,10 @@ impl Kvm {
                 }
                 let dx = ev.pt.x.saturating_sub(cur.x);
                 let dy = ev.pt.y.saturating_sub(cur.y);
+                if TRACE.load(Ordering::Relaxed) && self.trace_n < self.trace.len() {
+                    self.trace[self.trace_n] = (ev.time, ev.pt.x, ev.pt.y, cur.x, cur.y, d.parked as i32, d.vc.pos.x);
+                    self.trace_n += 1;
+                }
                 if dx == 0 && dy == 0 {
                     return Verdict::Swallow;
                 }
@@ -610,8 +623,10 @@ impl Kvm {
     // ── 回到本机 ──
 
     /// 回到本机，返回实际落点（不在驱动时 None）。
+    #[track_caller]
     fn go_home(&mut self, land: Point, out: &mut Vec<Action>) -> Option<Point> {
         let d = self.drive.take()?;
+        self.home_note = Some((std::panic::Location::caller(), d.vc.pos));
         for (s, r) in self.swallow_keys.iter_mut().zip(d.remote_keys.iter()) {
             *s |= *r;
         }
@@ -649,6 +664,7 @@ impl Kvm {
         self.drive.as_ref().map(|d| d.exit)
     }
 
+    #[track_caller]
     fn go_home_exit(&mut self, out: &mut Vec<Action>) -> Option<Point> {
         let e = self.exit_point()?;
         self.go_home(e, out)
@@ -820,6 +836,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 static LAST_PHYSICAL: AtomicU32 = AtomicU32::new(0);
 
 /// 本机最后一次物理键鼠输入的时间（GetTickCount 时基）。任意线程可读。
+#[cfg_attr(test, allow(dead_code))]
 pub fn last_physical_input() -> Option<u32> {
     match LAST_PHYSICAL.load(Ordering::Relaxed) {
         0 => None,
@@ -1078,7 +1095,11 @@ impl Hooks {
 }
 
 /// 在当前（主）线程运行，直到收到 ToInput::Quit。
+/// 诊断开关：环境变量 KMLINK_TRACE=1。
+pub static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn run(hub: Arc<Hub>, rx: Receiver<ToInput>) {
+    TRACE.store(std::env::var_os("KMLINK_TRACE").is_some_and(|v| v == "1"), Ordering::Relaxed);
     let mut msg = MSG::default();
     unsafe {
         // 先建好线程消息队列，PostThreadMessage 才能送达
@@ -1141,6 +1162,15 @@ pub fn run(hub: Arc<Hub>, rx: Receiver<ToInput>) {
                 let blocked = desk_ok && crate::elev::foreground_blocked();
                 dispatch(|k, out| {
                     k.poll(blocked, desk_ok, out);
+                    if let Some((loc, p)) = k.home_note.take() {
+                        crate::log!("回到本机（input.rs:{}，对方光标 {},{}）", loc.line(), p.x, p.y);
+                        if TRACE.load(Ordering::Relaxed) {
+                            for t in &k.trace[..k.trace_n] {
+                                crate::log!("  trace t={} pt={},{} cur={},{} parked={} vc.x={}", t.0, t.1, t.2, t.3, t.4, t.5, t.6);
+                            }
+                            k.trace_n = 0;
+                        }
+                    }
                     Verdict::Pass
                 });
                 if !desk_ok || blocked {
