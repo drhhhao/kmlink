@@ -25,6 +25,7 @@ mod net;
 mod proto;
 mod settings;
 mod sys;
+mod ui;
 
 use std::sync::Arc;
 use windows::Win32::Media::timeBeginPeriod;

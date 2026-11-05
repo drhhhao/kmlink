@@ -1,53 +1,63 @@
-//! 设置窗口（单独进程：`kmlink.exe settings`，关掉就退出，不占主程序内存）。纯 Win32 + GDI，中文用系统字体（微软雅黑）。
+//! 设置窗口（单独进程：`kmlink.exe settings`，关掉就退出，不占主程序内存）。全部自绘（src/ui.rs），设计稿：设计\设置窗口\proof.html（方向 B「舞台」）。
 //!
-//! 窗口约 760 x 560（按 DPI 缩放），标题“kmlink 设置”。内容：
-//! 1. 排布画布（上半部分，约 720 x 340）：
-//!    - 本机显示器（sys::monitors()）画成浅蓝色矩形，标“本机”；对方显示器（config::load_peer_desk()，
-//!      没有时用 1920x1080 的占位，并在画布上写“对方未连接，先用默认尺寸”）画成浅灰色矩形，标对方名字。
-//!    - 整体按比例缩放到画布内居中。对方的矩形组可以用鼠标拖动；松手时吸附到本机外接矩形最近的一侧（贴边、不重叠），
-//!      沿边方向保留位置 → 得到 Layout{side, offset（本机像素，取整）, scale}。拖动时实时显示，吸附后重画。
-//!    - 画布下方一行文字：“对方在本机右侧，往下错开 120 像素”（offset 为 0 时“对齐”）。
-//!    - 缩放：一个下拉框或 -/+ 按钮调 layout.scale（0.25 ~ 4，步进 0.05；显示为“对方尺寸比例 1.00”），用于两边 DPI 相差大时。
-//! 2. 连接：
-//!    - “对方 IP”编辑框（cfg.peer），提示文字：“两台里填一台即可，建议 WiFi 那台填有线那台的 IP”。
-//!    - “配对密钥”编辑框（cfg.key，64 位十六进制）+ “复制”按钮（复制到剪贴板）+ “新密钥”按钮。
-//!      提示：“两台必须相同：在一台复制，粘贴到另一台。”
-//!    - “本机地址”只读文字：列出本机 IPv4（GetAdaptersAddresses 或 std 解析主机名均可；没有就省略）。
-//! 3. 底部按钮：“保存”（校验密钥和对方地址（同 net：IP 或 IP:端口）；config::update 只改 peer/key，排布真被改过才写 layout 并 rev = next_rev；关闭窗口）
-//!    和“取消”。主程序会在约 2 秒内发现配置变化并重新加载、把排布同步给对方。
+//! 窗口 820 x 600（含 32 高的系统标题栏，按 DPI 缩放），不可调大小，标题“kmlink”。跟随系统浅色 / 深色
+//! （注册表 AppsUseLightTheme；收到 WM_SETTINGCHANGE "ImmersiveColorSet" 重画），标题栏用 DWMWA_CAPTION_COLOR 涂成舞台顶色。
+//! 改了就生效，没有“保存 / 取消”。
+//!
+//! 1. 舞台（上方 820 x 316，柔和渐变）：两台的显示器缩放到 740 x 212 的区域里居中。每块屏幕是圆角矩形 + “壁纸”渐变
+//!    （本机偏蓝、对方偏绿）+ 柔和投影；主显示器底部一颗玻璃胶囊：名字（本机带“本机”标签）+ “3840×2160 · 150%”，
+//!    其它显示器只写尺寸。两台相接的区段画一条绿色细条（鼠标从这里过去）。左上“已连接 / 未连接”，右上“拖动摆放”，
+//!    左下“WiFi电脑 在本机左侧 · 下移 416 像素”，右下“尺寸比例 − 1.00 +”（0.25 ~ 4，步进 0.05，点了立即生效）。
+//!    - 拖对方的屏幕：放大 2.5%、投影加深、94% 不透明，绿色虚线框标出松手后吸附的位置，左下文字实时变；拖动中画布比例不变。
+//!      松手后 240ms 滑进虚线框（cubic-bezier(.2,.8,.2,1)），然后写配置（rev = next_rev，排布真变了才写）。
+//!    - 改名：悬停名字出现浅底 + 铅笔、手形光标；点一下原地变输入框（绿圈），第二行变“回车保存”，Esc 取消，最多 16 字；
+//!      改好后名字旁绿勾 1.2 秒后淡出。本机名写 config.toml 的 name（主程序重新加载后会重发 Hello，对方就知道了）；
+//!      对方名写 rename_peer.json（主程序约每秒取走，连着时发给对方，对方改它自己的 name）。未连接时对方名字灰色、不能改，悬停提示“连上后可改”。
+//!    - 对方屏幕来自 peer.json（主程序写，含每块屏的 DPI，没有就只写分辨率）；从没连上过：名字“对方”、尺寸“—”、1920×1080 灰色虚线占位。
+//! 2. 卡片（下方）：左“连接”——对方 IP（填一台即可）、配对密钥（两台须相同；只显示首尾，旁边复制 / 换新密钥，换之前弹小确认框）、
+//!    本机 IP（只列真实局域网 IPv4：去掉回环、169.254、Clash 的 198.18/15；有网关的优先）+ 复制。
+//!    右“通用”——剪贴板同步 / 复制提示 / 开机自启三个开关，点了立即写配置。
+//!    输入框（对方 IP、密钥、名字）按回车或失焦时校验：对就写入；不对则该行提示变红、输入框红圈。输入框用真的 EDIT 控件
+//!    （光标、选择、中文输入法、粘贴都靠它），平时隐藏，点到哪个框才盖上去。
+//! 3. 状态：每 500ms 读 status.json（主程序写；connected 为真且 pid 还活着才算已连接）、peer.json、config.toml（改了就重新读入）。
+//!
 //! 只允许一个设置窗口（命名互斥量 Local\kmlink-settings），再打开就把已有的窗口提到前面。
-//! 文字要简洁。所有坐标是物理像素（进程已 PerMonitorV2），字体大小按 GetDpiForWindow 缩放。
+//! 所有窗口坐标是物理像素（进程已 PerMonitorV2）；布局常量是 96 DPI 下的逻辑像素，乘 s = dpi/96。
+//! 调试截图用：KMLINK_THEME=dark|light 强制主题；KMLINK_UI=hover|edit|drag|offhover|popover 直接呈现某个状态。
 
 use crate::config::{self, Config};
 use crate::geom::{Desk, Layout, Rect, Side};
 use crate::sys;
+use crate::ui::{self, Font, Painter, Rgba, Seg, Surface, hex, hexa};
 use std::cell::RefCell;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::{Duration, Instant, SystemTime};
 use windows::Win32::Foundation::{
-    COLORREF, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    CloseHandle, E_ACCESSDENIED, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, COLOR_WINDOWTEXT, CreateCompatibleBitmap, CreateCompatibleDC,
-    CreateFontW, CreatePen, DC_BRUSH, DC_PEN, DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC,
-    DeleteObject, DrawTextW, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetMonitorInfoW, GetStockObject, GetSysColor, GetSysColorBrush, HBRUSH,
-    HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_DOT,
-    Rectangle, SRCCOPY, SelectObject, SetBkColor, SetBkMode, SetDCBrushColor, SetDCPenColor, SetTextColor, TRANSPARENT,
+    BeginPaint, CreateCompatibleDC, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, EnumDisplayMonitors, GetMonitorInfoW, HBRUSH,
+    HDC, HMONITOR, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT, SetBkColor, SetTextColor,
 };
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
-use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
-use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClientRect, GetDlgCtrlID,
-    GetDlgItem, GetMessageW, GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, IDC_SIZEALL, IsDialogMessageW, IsIconic, LoadCursorW,
-    MB_ICONWARNING, MB_OK, MSG, MessageBoxW, MoveWindow, PostQuitMessage, RegisterClassExW, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
-    SWP_NOZORDER, SendMessageW, SetCursor, SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR,
-    WM_SETFONT, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
-    WS_TABSTOP, WS_VISIBLE,
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_ESCAPE, VK_RETURN,
+    VK_TAB,
 };
-use windows::core::{PCWSTR, w};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CW_USEDEFAULT, CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, FindWindowW,
+    GetClientRect, GetMessageW, GetWindowTextLengthW, GetWindowTextW, HICON, HMENU, ICONINFO, IDC_ARROW, IDC_HAND, IDC_IBEAM,
+    IDC_SIZEALL, IsIconic, KillTimer, LoadCursorW, MSG, MoveWindow, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow,
+    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
+    WM_SETCURSOR, WM_SETFONT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
+    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+};
+use windows::core::{BOOL, PCWSTR, s, w};
 
 // ---------------------------------------------------------------------------
 // 纯逻辑（可单测）
@@ -56,6 +66,8 @@ use windows::core::{PCWSTR, w};
 const SCALE_MIN: f64 = 0.25;
 const SCALE_MAX: f64 = 4.0;
 const SCALE_STEP: f64 = 0.05;
+/// 名字最多几个字。
+const NAME_MAX: usize = 16;
 
 /// 把沿边错开量夹到“两块矩形沿边至少共享 1 像素”的范围内（否则没有可跨越的区段）。
 /// me：本机外接矩形；pw/ph：对方外接矩形缩放到本机像素后的宽高。
@@ -96,16 +108,14 @@ fn step_scale(s: f64, steps: i32) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
-/// 用户在窗口里改过排布没有（和打开时比）。没改就不动文件里的排布和 rev。
-fn layout_changed(opened: &Layout, now: &Layout) -> bool {
-    opened.side != now.side || opened.offset != now.offset || (opened.scale - now.scale).abs() > 1e-9
+/// 两个排布是否不同。
+fn layout_changed(old: &Layout, now: &Layout) -> bool {
+    old.side != now.side || old.offset != now.offset || (old.scale - now.scale).abs() > 1e-9
 }
 
-/// 保存时对磁盘上最新配置的修改：只改 peer/key；排布真改了才写排布并递增 rev。
-fn apply_save(c: &mut Config, peer: &str, key: String, opened: &Layout, now: &Layout) {
-    c.peer = peer.trim().to_string();
-    c.key = key;
-    if layout_changed(opened, now) {
+/// 写排布（对磁盘上最新的配置）：真变了才写，并递增 rev；没变就不动排布和 rev（不跟对方同步来的打架）。
+fn apply_layout(c: &mut Config, now: &Layout) {
+    if layout_changed(&c.layout.layout, now) {
         c.layout.layout = *now;
         c.layout.rev = config::next_rev(c.layout.rev);
     }
@@ -157,7 +167,7 @@ fn is_own_addr(peer: &str, ips: &[String]) -> bool {
     ip.is_loopback() || ip.is_unspecified() || ips.iter().any(|s| *s == ip.to_string())
 }
 
-/// 画布下方的说明：“对方在右侧，下移 120 像素” / “对方在左侧，对齐”。
+/// 舞台左下的说明（名字另画）：“在本机右侧 · 下移 120 像素” / “在本机左侧 · 对齐”。
 fn status_text(l: &Layout) -> String {
     let o = l.offset;
     let mv = if o == 0 {
@@ -171,123 +181,386 @@ fn status_text(l: &Layout) -> String {
         };
         format!("{dir} {} 像素", o.unsigned_abs())
     };
-    format!("对方在{}，{mv}", l.side.label_zh())
+    format!("在本机{} · {mv}", l.side.label_zh())
+}
+
+/// 名字校验：去掉首尾空白，非空，最多 16 个字。
+fn clean_name(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() || t.chars().count() > NAME_MAX || t.chars().any(char::is_control) { None } else { Some(t.to_string()) }
+}
+
+/// 密钥只显示首尾：“982e0241…2895a8b”。
+fn short_key(k: &str) -> String {
+    let c: Vec<char> = k.chars().collect();
+    if c.len() <= 17 { k.to_string() } else { format!("{}…{}", c[..8].iter().collect::<String>(), c[c.len() - 7..].iter().collect::<String>()) }
+}
+
+/// 真实局域网地址：去掉回环、未指定、广播、169.254/16（自动地址）、198.18.0.0/15（Clash fake-ip 的 TUN 网卡）。
+fn usable_lan_ip(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    !(ip.is_loopback() || ip.is_unspecified() || ip.is_broadcast() || ip.is_link_local() || ip.is_multicast() || (o[0] == 198 && (o[1] & 0xFE) == 18))
+}
+
+/// 一块显示器的说明：“3840×2160 · 150%”（不知道 DPI 就只写分辨率）。
+fn res_text(r: &Rect, dpi: Option<u32>) -> String {
+    match dpi {
+        Some(d) if d > 0 => format!("{}×{} · {}%", r.w(), r.h(), (d * 100 + 48) / 96),
+        _ => format!("{}×{}", r.w(), r.h()),
+    }
+}
+
+/// 一块显示器：位置（物理像素）、DPI（不知道为 None）、是否主显示器。
+#[derive(Clone, Debug, PartialEq)]
+struct Mon {
+    r: Rect,
+    dpi: Option<u32>,
+    primary: bool,
+}
+
+/// 保证恰好一块主显示器：没标的话，取左上角在 (0,0) 的，再不行取第一块。
+fn fix_primary(ms: &mut [Mon]) {
+    if ms.iter().filter(|m| m.primary).count() == 1 {
+        return;
+    }
+    let i = ms.iter().position(|m| m.r.l == 0 && m.r.t == 0).unwrap_or(0);
+    for (j, m) in ms.iter_mut().enumerate() {
+        m.primary = i == j;
+    }
+}
+
+/// peer.json：{"name", "monitors": [Rect...], "dpis": [u32...]}（dpis 可缺、可短）。
+fn parse_peer(s: &str) -> Option<(String, Vec<Mon>)> {
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    let name = v.get("name")?.as_str()?.to_string();
+    let rects: Vec<Rect> = serde_json::from_value(v.get("monitors")?.clone()).ok()?;
+    let dpis: Vec<u32> = v.get("dpis").and_then(|d| serde_json::from_value(d.clone()).ok()).unwrap_or_default();
+    let mut ms: Vec<Mon> = rects
+        .into_iter()
+        .enumerate()
+        .filter(|(_, r)| r.w() > 0 && r.h() > 0)
+        .map(|(i, r)| Mon { r, dpi: dpis.get(i).copied().filter(|d| *d > 0), primary: false })
+        .collect();
+    if ms.is_empty() {
+        return None;
+    }
+    fix_primary(&mut ms);
+    Some((name, ms))
+}
+
+/// status.json：{"pid", "connected", "peer_name", ...} → (pid, connected, peer_name)。
+fn parse_status(s: &str) -> Option<(u32, bool, String)> {
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    let pid = v.get("pid")?.as_u64()? as u32;
+    let connected = v.get("connected").and_then(|c| c.as_bool()).unwrap_or(false);
+    let name = v.get("peer_name").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
+    Some((pid, connected, name))
+}
+
+/// 两台相接的区段（本机像素）：返回 (边所在的坐标, [(沿边起, 止)...])。
+/// mine：本机各显示器；peer：对方各显示器已放到本机坐标系里的 (l, t, r, b)；pb：对方外接矩形（同坐标系）。
+fn contact_segments(mine: &[Rect], peer: &[(f64, f64, f64, f64)], pb: (f64, f64, f64, f64), side: Side) -> (f64, Vec<(f64, f64)>) {
+    let me = Desk::new(mine.to_vec()).bounds();
+    let near = |a: f64, b: f64| (a - b).abs() < 0.5;
+    let (line, mi, pi): (f64, Vec<(f64, f64)>, Vec<(f64, f64)>) = match side {
+        Side::Left => (
+            me.l as f64,
+            mine.iter().filter(|m| m.l == me.l).map(|m| (m.t as f64, m.b as f64)).collect(),
+            peer.iter().filter(|p| near(p.2, pb.2)).map(|p| (p.1, p.3)).collect(),
+        ),
+        Side::Right => (
+            me.r as f64,
+            mine.iter().filter(|m| m.r == me.r).map(|m| (m.t as f64, m.b as f64)).collect(),
+            peer.iter().filter(|p| near(p.0, pb.0)).map(|p| (p.1, p.3)).collect(),
+        ),
+        Side::Top => (
+            me.t as f64,
+            mine.iter().filter(|m| m.t == me.t).map(|m| (m.l as f64, m.r as f64)).collect(),
+            peer.iter().filter(|p| near(p.3, pb.3)).map(|p| (p.0, p.2)).collect(),
+        ),
+        Side::Bottom => (
+            me.b as f64,
+            mine.iter().filter(|m| m.b == me.b).map(|m| (m.l as f64, m.r as f64)).collect(),
+            peer.iter().filter(|p| near(p.1, pb.1)).map(|p| (p.0, p.2)).collect(),
+        ),
+    };
+    let mut out = Vec::new();
+    for a in &mi {
+        for b in &pi {
+            let (lo, hi) = (a.0.max(b.0), a.1.min(b.1));
+            if hi > lo {
+                out.push((lo, hi));
+            }
+        }
+    }
+    (line, out)
 }
 
 // ---------------------------------------------------------------------------
-// 窗口
+// 外观
 // ---------------------------------------------------------------------------
 
-const TITLE: &str = "kmlink 设置";
-const CANVAS_CLASS: PCWSTR = w!("kmlink_settings_canvas");
-const MAIN_CLASS: PCWSTR = w!("kmlink_settings");
-
-// 控件 id；保存/取消用 IDOK/IDCANCEL，这样回车、Esc 也能用
-const ID_SAVE: i32 = 1;
-const ID_CANCEL: i32 = 2;
-const ID_SEC_LAYOUT: i32 = 101;
-const ID_CANVAS: i32 = 102;
-const ID_STATUS: i32 = 103;
-const ID_SCALE_LBL: i32 = 104;
-const ID_MINUS: i32 = 105;
-const ID_SCALE_VAL: i32 = 106;
-const ID_PLUS: i32 = 107;
-const ID_SEC_CONN: i32 = 110;
-const ID_PEER_LBL: i32 = 111;
-const ID_PEER: i32 = 112;
-const ID_PEER_HINT: i32 = 113;
-const ID_KEY_LBL: i32 = 114;
-const ID_KEY: i32 = 115;
-const ID_COPY: i32 = 116;
-const ID_NEWKEY: i32 = 117;
-const ID_KEY_HINT: i32 = 118;
-const ID_ADDR_LBL: i32 = 119;
-const ID_ADDR: i32 = 120;
-
-// 样式位（部分常量在未启用的 feature 里，直接写数值）
-const SS_CENTER: u32 = 0x1;
-const SS_NOPREFIX: u32 = 0x80;
-const SS_CENTERIMAGE: u32 = 0x200;
-const SS_ENDELLIPSIS: u32 = 0x4000;
-const ES_AUTOHSCROLL: u32 = 0x80;
-const ES_READONLY: u32 = 0x800;
-const BS_PUSHBUTTON: u32 = 0x0;
-const BS_DEFPUSHBUTTON: u32 = 0x1;
-const EM_SETLIMITTEXT: u32 = 0xC5;
-const HTCLIENT: usize = 1;
-const CF_UNICODETEXT: u32 = 13;
-
-/// 客户区大小（96 DPI 下的逻辑像素）。
-const CLIENT_W: i32 = 760;
-const CLIENT_H: i32 = 600;
-
-#[derive(Clone, Copy, PartialEq)]
-enum Kind {
-    Section,
-    Label,
-    Hint,
-    Value,
-    Edit,
-    RoEdit,
-    Button,
-    DefButton,
-    Canvas,
+/// 一块“壁纸”：径向柔光（at gx 15%，半径 120% x 90%，0 → 60% 渐隐）叠在 135° 三段线性渐变上。
+#[derive(Clone, Copy)]
+struct Wall {
+    glow: Rgba,
+    gx: f32,
+    stops: [Rgba; 3],
+    mid: f32,
 }
 
-struct Ctl {
-    id: i32,
-    kind: Kind,
-    text: &'static str,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
+impl Wall {
+    /// (u, v)：在屏幕矩形内的位置（逻辑像素），w/h：矩形大小。
+    fn at(&self, u: f32, v: f32, w: f32, h: f32) -> Rgba {
+        let t = (((u - w / 2.0) + (v - h / 2.0)) / (w + h) + 0.5).clamp(0.0, 1.0);
+        let lin = if t < self.mid { self.stops[0].lerp(self.stops[1], t / self.mid) } else { self.stops[1].lerp(self.stops[2], (t - self.mid) / (1.0 - self.mid)) };
+        let dx = (u - self.gx * w) / (1.2 * w);
+        let dy = (v - 0.15 * h) / (0.9 * h);
+        let a = (1.0 - (dx * dx + dy * dy).sqrt() / 0.6).clamp(0.0, 1.0);
+        lin.lerp(self.glow, a)
+    }
 }
 
-const fn c(id: i32, kind: Kind, text: &'static str, x: i32, y: i32, w: i32, h: i32) -> Ctl {
-    Ctl { id, kind, text, x, y, w, h }
+/// 配色（照抄 proof.html 的 .light / .dark）。
+#[derive(Clone, Copy)]
+struct Theme {
+    dark: bool,
+    bg: Rgba,
+    card: Rgba,
+    cardline: Rgba,
+    card_shadow: f32,
+    hair: Rgba,
+    fg: Rgba,
+    fg2: Rgba,
+    mutd: Rgba,
+    mut2: Rgba,
+    fill: Rgba,
+    fillh: Rgba,
+    green: Rgba,
+    greenring: Rgba,
+    swoff: Rgba,
+    knob: Rgba,
+    stage_top: Rgba,
+    glass: Rgba,
+    glassline: Rgba,
+    glassedge: Rgba,
+    scrline: Rgba,
+    off: Rgba,
+    offline: Rgba,
+    tip: Rgba,
+    tipfg: Rgba,
+    tipline: Rgba,
+    tag: Rgba,
+    hov: Rgba,
+    red: Rgba,
+    redring: Rgba,
+    wa: Wall,
+    wb: Wall,
 }
 
-/// 所有控件：位置是 96 DPI 下的逻辑像素，左右边距 20，内容宽 720（20..740）。创建顺序即 Tab 顺序。
-const CTLS: &[Ctl] = &[
-    c(ID_SEC_LAYOUT, Kind::Section, "屏幕排布", 20, 12, 200, 24),
-    c(ID_CANVAS, Kind::Canvas, "", 20, 40, 720, 300), // 40..340
-    c(ID_STATUS, Kind::Label, "", 20, 348, 500, 26),
-    c(ID_SCALE_LBL, Kind::Label, "尺寸比例", 540, 348, 72, 26), // 540..612
-    c(ID_MINUS, Kind::Button, "−", 616, 348, 30, 26),          // 616..646
-    c(ID_SCALE_VAL, Kind::Value, "1.00", 650, 348, 56, 26),     // 650..706
-    c(ID_PLUS, Kind::Button, "+", 710, 348, 30, 26),            // 710..740
-    c(ID_SEC_CONN, Kind::Section, "连接", 20, 390, 200, 24),
-    c(ID_PEER_LBL, Kind::Label, "对方 IP", 20, 420, 60, 26),
-    c(ID_PEER, Kind::Edit, "", 84, 420, 260, 26), // 84..344
-    c(ID_PEER_HINT, Kind::Hint, "填一台即可", 356, 420, 200, 26),
-    c(ID_KEY_LBL, Kind::Label, "配对密钥", 20, 456, 60, 26),
-    c(ID_KEY, Kind::Edit, "", 84, 456, 540, 26), // 84..624，64 位十六进制放得下
-    c(ID_COPY, Kind::Button, "复制", 630, 456, 52, 26), // 630..682
-    c(ID_NEWKEY, Kind::Button, "新密钥", 688, 456, 52, 26), // 688..740
-    c(ID_KEY_HINT, Kind::Hint, "两台须相同", 84, 484, 300, 22),
-    c(ID_ADDR_LBL, Kind::Label, "本机地址", 20, 514, 60, 26),
-    c(ID_ADDR, Kind::RoEdit, "", 84, 518, 656, 20), // 无边框只读，下移 4 与左侧标签文字对齐
-    c(ID_SAVE, Kind::DefButton, "保存", 560, 556, 86, 30), // 560..646
-    c(ID_CANCEL, Kind::Button, "取消", 654, 556, 86, 30), // 654..740，底边 586，客户区高 600
-];
+const LIGHT: Theme = Theme {
+    dark: false,
+    bg: hex(0xF3F3F3),
+    card: hex(0xFFFFFF),
+    cardline: hexa(0x000000, 0.06),
+    card_shadow: 0.05,
+    hair: hexa(0x000000, 0.07),
+    fg: hex(0x1C1C1E),
+    fg2: hex(0x3A3A3C),
+    mutd: hex(0x8E8E93),
+    mut2: hex(0xAEAEB2),
+    fill: hex(0xF2F2F4),
+    fillh: hex(0xE9E9EC),
+    green: hex(0x34C759),
+    greenring: hexa(0x34C759, 0.28),
+    swoff: hex(0xE3E3E7),
+    knob: hex(0xFFFFFF),
+    stage_top: hex(0xEEF1F6),
+    glass: hexa(0xFFFFFF, 0.66),
+    glassline: hexa(0xFFFFFF, 0.9),
+    glassedge: hexa(0x000000, 0.08),
+    scrline: hexa(0x000000, 0.10),
+    off: hexa(0xFFFFFF, 0.45),
+    offline: hexa(0x3C3C43, 0.32),
+    tip: hex(0xFFFFFF),
+    tipfg: hex(0x1C1C1E),
+    tipline: hexa(0x000000, 0.10),
+    tag: hexa(0x000000, 0.07),
+    hov: hexa(0x7F7F87, 0.16),
+    red: hex(0xFF3B30),
+    redring: hexa(0xFF3B30, 0.22),
+    wa: Wall { glow: hex(0xE3EEFF), gx: 0.2, stops: [hex(0xC7DBFF), hex(0xA6C4FB), hex(0xD3CBFB)], mid: 0.48 },
+    wb: Wall { glow: hex(0xE9FBEF), gx: 0.8, stops: [hex(0xCDF2DB), hex(0x9FDFBB), hex(0xC9E9F7)], mid: 0.5 },
+};
 
-// 颜色
-const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
-    COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
+const DARK: Theme = Theme {
+    dark: true,
+    bg: hex(0x202020),
+    card: hex(0x2B2B2B),
+    cardline: hexa(0xFFFFFF, 0.06),
+    card_shadow: 0.3,
+    hair: hexa(0xFFFFFF, 0.07),
+    fg: hex(0xF2F2F7),
+    fg2: hex(0xD1D1D6),
+    mutd: hex(0x98989F),
+    mut2: hex(0x636366),
+    fill: hex(0x383838),
+    fillh: hex(0x424242),
+    green: hex(0x30D158),
+    greenring: hexa(0x30D158, 0.30),
+    swoff: hex(0x48484A),
+    knob: hex(0xFFFFFF),
+    stage_top: hex(0x1B1E24),
+    glass: hexa(0x2C2C30, 0.62),
+    glassline: hexa(0xFFFFFF, 0.14),
+    glassedge: hexa(0x000000, 0.35),
+    scrline: hexa(0xFFFFFF, 0.10),
+    off: hexa(0xFFFFFF, 0.04),
+    offline: hexa(0xEBEBF5, 0.28),
+    tip: hex(0x2C2C2E),
+    tipfg: hex(0xF2F2F7),
+    tipline: hexa(0xFFFFFF, 0.12),
+    tag: hexa(0xFFFFFF, 0.12),
+    hov: hexa(0x7F7F87, 0.22),
+    red: hex(0xFF453A),
+    redring: hexa(0xFF453A, 0.28),
+    wa: Wall { glow: hex(0x3A4F7A), gx: 0.2, stops: [hex(0x25365A), hex(0x1D2B4A), hex(0x2E2850)], mid: 0.5 },
+    wb: Wall { glow: hex(0x2C5A41), gx: 0.8, stops: [hex(0x1F3D2E), hex(0x183528), hex(0x1B3040)], mid: 0.5 },
+};
+
+/// 系统是不是深色（KMLINK_THEME=dark|light 可强制，调试截图用）。
+fn system_dark() -> bool {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+    if let Ok(v) = std::env::var("KMLINK_THEME") {
+        if v.eq_ignore_ascii_case("dark") {
+            return true;
+        }
+        if v.eq_ignore_ascii_case("light") {
+            return false;
+        }
+    }
+    let mut v: u32 = 1;
+    let mut sz = 4u32;
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut v as *mut u32 as *mut core::ffi::c_void),
+            Some(&mut sz),
+        )
+    };
+    r.is_ok() && v == 0
 }
-const C_BG: COLORREF = rgb(0xF6, 0xF7, 0xF9);
-const C_FRAME: COLORREF = rgb(0xD8, 0xDC, 0xE0);
-const C_MINE_FILL: COLORREF = rgb(0xD6, 0xE8, 0xFF);
-const C_MINE_EDGE: COLORREF = rgb(0x4A, 0x8F, 0xE2);
-const C_PEER_FILL: COLORREF = rgb(0xE4, 0xE6, 0xEA);
-const C_PEER_EDGE: COLORREF = rgb(0x8E, 0x95, 0x9E);
-const C_PEER_DRAG: COLORREF = rgb(0x50, 0x57, 0x60);
-const C_GHOST: COLORREF = rgb(0x2F, 0x7B, 0xE0);
-const C_TEXT: COLORREF = rgb(0x1F, 0x23, 0x28);
-const C_HINT: COLORREF = rgb(0x80, 0x86, 0x8C);
 
-/// 画布坐标 = o + 本机像素 * k
+// ---------------------------------------------------------------------------
+// 布局常量（逻辑像素，客户区坐标；客户区 820 x 568）
+// ---------------------------------------------------------------------------
+
+const CLIENT_W: f32 = 820.0;
+const CLIENT_H: f32 = 568.0;
+const STAGE_H: f32 = 316.0;
+/// 舞台里画屏幕的区域
+const AREA: R = R::new(40.0, 50.0, 740.0, 212.0);
+/// 两组屏幕之间各让开 3（中间放接缝绿条）
+const GAP: f32 = 3.0;
+const CARD: R = R::new(16.0, 332.0, 788.0, 220.0);
+/// 卡片第一行顶
+const ROW0: f32 = 366.0;
+const ROW_H: f32 = 56.0;
+const IP_BOX: R = R::new(204.0, 378.0, 186.0, 32.0);
+const KEY_BOX: R = R::new(166.0, 434.0, 148.0, 32.0);
+const COPY_KEY: R = R::new(320.0, 434.0, 32.0, 32.0);
+const NEW_KEY: R = R::new(358.0, 434.0, 32.0, 32.0);
+const COPY_IP: R = R::new(362.0, 492.0, 28.0, 28.0);
+const STEPPER: R = R::new(706.0, 274.0, 94.0, 28.0);
+const MINUS: R = R::new(710.0, 277.0, 24.0, 22.0);
+const PLUS: R = R::new(772.0, 277.0, 24.0, 22.0);
+const POP: R = R::new(150.0, 346.0, 240.0, 80.0);
+const POP_OK: R = R::new(318.0, 386.0, 60.0, 28.0);
+const POP_CANCEL: R = R::new(250.0, 386.0, 60.0, 28.0);
+const SWITCH_LABELS: [&str; 3] = ["剪贴板同步", "复制提示", "开机自启"];
+
+/// 逻辑像素矩形。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct R {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl R {
+    const fn new(x: f32, y: f32, w: f32, h: f32) -> R {
+        R { x, y, w, h }
+    }
+    fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+    fn cx(&self) -> f32 {
+        self.x + self.w / 2.0
+    }
+    fn cy(&self) -> f32 {
+        self.y + self.h / 2.0
+    }
+}
+
+fn switch_rect(i: usize) -> R {
+    R::new(744.0, ROW0 + ROW_H * i as f32 + 16.0, 40.0, 24.0)
+}
+
+fn switch_row(i: usize) -> R {
+    R::new(430.0, ROW0 + ROW_H * i as f32, 354.0, ROW_H)
+}
+
+// ---------------------------------------------------------------------------
+// 状态
+// ---------------------------------------------------------------------------
+
+/// 鼠标下面是什么。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hot {
+    None,
+    Peer,
+    NameLocal,
+    NamePeer,
+    NamePeerOff,
+    Minus,
+    Plus,
+    Ip,
+    Key,
+    CopyKey,
+    NewKey,
+    CopyIp,
+    Switch(usize),
+    PopCancel,
+    PopOk,
+    Pop,
+}
+
+/// 可编辑的字段。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Field {
+    Ip,
+    Key,
+    LocalName,
+    PeerName,
+}
+
+impl Field {
+    /// 用哪个 EDIT（两个名字共用一个）。
+    fn slot(self) -> usize {
+        match self {
+            Field::Ip => 0,
+            Field::Key => 1,
+            Field::LocalName | Field::PeerName => 2,
+        }
+    }
+}
+
+/// 舞台坐标 = o + 本机像素 * k（逻辑像素）。
 #[derive(Clone, Copy, Debug)]
 struct View {
     k: f64,
@@ -295,32 +568,128 @@ struct View {
     oy: f64,
 }
 
+impl View {
+    fn lerp(&self, o: &View, t: f64) -> View {
+        View { k: self.k + (o.k - self.k) * t, ox: self.ox + (o.ox - self.ox) * t, oy: self.oy + (o.oy - self.oy) * t }
+    }
+}
+
 struct Drag {
-    m0: (i32, i32),
+    /// 按下时鼠标（逻辑像素）
+    m0: (f32, f32),
+    /// 按下时对方外接矩形左上角（本机像素）
     p0: (f64, f64),
     pos: (f64, f64),
     view: View,
+    /// 移动超过 3 像素才算开始拖
+    active: bool,
+}
+
+/// 松手后滑进吸附位置的动画。
+struct DropAnim {
+    from: (f64, f64),
+    view0: View,
+    t0: Instant,
+}
+
+const DROP_MS: f32 = 240.0;
+const SWITCH_MS: f32 = 180.0;
+const FLASH_MS: f32 = 1200.0;
+const FADE_MS: f32 = 300.0;
+
+const TIMER_POLL: usize = 1;
+const TIMER_ANIM: usize = 2;
+
+struct Fonts {
+    name: Font,
+    res: Font,
+    tag: Font,
+    chip: Font,
+    small: Font,
+    stat: Font,
+    stat_b: Font,
+    step: Font,
+    group: Font,
+    label: Font,
+    hint: Font,
+    input: Font,
+    mono: Font,
+    btn: Font,
+}
+
+const YAHEI: &[&str] = &["Microsoft YaHei UI"];
+const SEGOE: &[&str] = &["Segoe UI"];
+
+impl Fonts {
+    fn new(s: f32) -> Fonts {
+        Fonts {
+            name: Font::new(YAHEI, 13.5, 700, s),
+            res: Font::new(SEGOE, 11.5, 400, s),
+            tag: Font::new(YAHEI, 10.5, 700, s),
+            chip: Font::new(YAHEI, 12.0, 700, s),
+            small: Font::new(YAHEI, 12.0, 400, s),
+            stat: Font::new(YAHEI, 12.5, 400, s),
+            stat_b: Font::new(YAHEI, 12.5, 700, s),
+            step: Font::new(&["Segoe UI Semibold", "Segoe UI"], 12.5, 600, s),
+            group: Font::new(YAHEI, 12.0, 700, s),
+            label: Font::new(YAHEI, 13.0, 400, s),
+            hint: Font::new(YAHEI, 11.5, 400, s),
+            input: Font::new(SEGOE, 13.0, 400, s),
+            mono: Font::new(&["Cascadia Mono", "Consolas"], 12.0, 400, s),
+            btn: Font::new(YAHEI, 12.5, 400, s),
+        }
+    }
 }
 
 struct App {
-    main: HWND,
-    canvas: HWND,
-    dpi: u32,
-    font: HFONT,
-    bold: HFONT,
-    mine: Desk,
-    peer: Desk,
-    peer_name: String,
-    peer_known: bool,
-    layout: Layout,
-    /// 打开时的排布（判断用户改没改）
-    layout0: Layout,
-    /// 打开时的配置（保存时若重新读取失败就用它）
+    hwnd: HWND,
+    s: f32,
+    th: Theme,
+    fonts: Fonts,
+    surf: Option<Surface>,
+    /// 量字用的 DC
+    mdc: HDC,
+    /// 三个 EDIT：对方 IP、密钥、名字
+    edits: [HWND; 3],
+    /// EDIT 当前摆放（物理像素），None = 隐藏
+    edit_pos: [Option<(i32, i32, i32, i32)>; 3],
+    brush_fill: HBRUSH,
+    brush_card: HBRUSH,
     cfg: Config,
-    /// 本机 IPv4（保存时检查对方 IP 不是本机）
-    ips: Vec<String>,
+    cfg_mtime: Option<SystemTime>,
+    mine: Vec<Mon>,
+    peer: Vec<Mon>,
+    /// peer.json 里的名字（没有为空）
+    peer_file_name: String,
+    peer_known: bool,
+    connected: bool,
+    /// status.json 里的对方名字
+    status_name: String,
+    /// 刚改的对方名字（等对方确认，最多 10 秒）
+    rename_pending: Option<(String, Instant)>,
+    layout: Layout,
     drag: Option<Drag>,
-    hover: bool,
+    drop: Option<DropAnim>,
+    hover: Hot,
+    press: Hot,
+    tracking: bool,
+    edit: Option<Field>,
+    /// 名字输入框里当前的字（量宽度用）
+    edit_text: String,
+    draft_ip: Option<String>,
+    draft_key: Option<String>,
+    err_ip: Option<&'static str>,
+    err_key: Option<&'static str>,
+    err_name: bool,
+    sw: [bool; 3],
+    sw_t: [Option<Instant>; 3],
+    flash: Option<(Field, Instant)>,
+    copied: Option<(Hot, Instant)>,
+    popover: bool,
+    /// 本机局域网 IPv4（有网关的在前）
+    ips: Vec<String>,
+    /// 调试截图：悬停状态不随鼠标变
+    frozen: bool,
 }
 
 thread_local! {
@@ -335,98 +704,939 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     })
 }
 
+fn ms_since(t: Instant) -> f32 {
+    t.elapsed().as_secs_f32() * 1000.0
+}
+
 impl App {
+    fn mine_desk(&self) -> Desk {
+        Desk::new(self.mine.iter().map(|m| m.r).collect())
+    }
+
+    fn peer_desk(&self) -> Desk {
+        Desk::new(self.peer.iter().map(|m| m.r).collect())
+    }
+
+    fn local_name(&self) -> String {
+        let n = self.cfg.name.trim();
+        if n.is_empty() { std::env::var("COMPUTERNAME").unwrap_or_else(|_| "本机".into()) } else { n.to_string() }
+    }
+
+    fn peer_name(&self) -> String {
+        if let Some((n, _)) = &self.rename_pending {
+            return n.clone();
+        }
+        if self.connected && !self.status_name.is_empty() {
+            return self.status_name.clone();
+        }
+        if self.peer_known && !self.peer_file_name.trim().is_empty() {
+            return self.peer_file_name.trim().to_string();
+        }
+        "对方".to_string()
+    }
+
     /// 对方外接矩形缩放后的宽高（本机像素）。
     fn peer_wh(&self) -> (f64, f64) {
-        let pb = self.peer.bounds();
+        let pb = self.peer_desk().bounds();
         let s = sanitize_scale(self.layout.scale);
         (pb.w() as f64 * s, pb.h() as f64 * s)
     }
 
-    /// 对方外接矩形左上角（本机像素）：拖动中用拖动位置。
-    fn peer_pos(&self) -> (f64, f64) {
-        match &self.drag {
-            Some(d) => d.pos,
-            None => {
-                let (l, t, _, _) = self.layout.peer_rect_in_mine(&self.mine, &self.peer);
-                (l, t)
-            }
-        }
+    fn layout_pos(&self, l: &Layout) -> (f64, f64) {
+        let (x, y, _, _) = l.peer_rect_in_mine(&self.mine_desk(), &self.peer_desk());
+        (x, y)
     }
 
     /// 拖动中：松手后将得到的排布；否则当前排布。
     fn projected(&self) -> Layout {
         match &self.drag {
-            Some(d) => {
+            Some(d) if d.active => {
                 let (pw, ph) = self.peer_wh();
-                let (side, offset) = snap(self.mine.bounds(), pw, ph, d.pos.0, d.pos.1);
+                let (side, offset) = snap(self.mine_desk().bounds(), pw, ph, d.pos.0, d.pos.1);
                 Layout { side, offset, scale: self.layout.scale }
             }
-            None => self.layout,
+            _ => self.layout,
         }
     }
 
-    fn px(&self, v: i32) -> i32 {
-        scale_px(v, self.dpi)
-    }
-
-    /// 把本机和对方整体缩放到画布内居中。
-    fn fit_view(&self, cw: i32, ch: i32) -> View {
-        let me = self.mine.bounds();
-        let (pl, pt) = self.peer_pos();
+    /// 把本机和对方（左上角在 pos）整体缩放到舞台区域里居中。
+    fn fit_view(&self, pos: (f64, f64)) -> View {
+        let me = self.mine_desk().bounds();
         let (pw, ph) = self.peer_wh();
-        let ul = (me.l as f64).min(pl);
-        let ut = (me.t as f64).min(pt);
-        let ur = (me.r as f64).max(pl + pw);
-        let ub = (me.b as f64).max(pt + ph);
-        let m = self.px(16) as f64;
-        let top = if self.peer_known { m } else { self.px(32) as f64 }; // 留出提示文字
-        let aw = (cw as f64 - 2.0 * m).max(1.0);
-        let ah = (ch as f64 - top - m).max(1.0);
+        let ul = (me.l as f64).min(pos.0);
+        let ut = (me.t as f64).min(pos.1);
+        let ur = (me.r as f64).max(pos.0 + pw);
+        let ub = (me.b as f64).max(pos.1 + ph);
+        let (aw, ah) = (AREA.w as f64, AREA.h as f64);
         let (uw, uh) = ((ur - ul).max(1.0), (ub - ut).max(1.0));
         let k = (aw / uw).min(ah / uh);
-        View { k, ox: m + (aw - uw * k) / 2.0 - ul * k, oy: top + (ah - uh * k) / 2.0 - ut * k }
+        View { k, ox: AREA.x as f64 + (aw - uw * k) / 2.0 - ul * k, oy: AREA.y as f64 + (ah - uh * k) / 2.0 - ut * k }
     }
 
-    /// 画布坐标 (mx, my) 是否落在对方矩形组上。
-    fn hit_peer(&self, v: &View, mx: i32, my: i32) -> bool {
-        let x = (mx as f64 - v.ox) / v.k;
-        let y = (my as f64 - v.oy) / v.k;
-        let (pl, pt) = self.peer_pos();
-        let (pw, ph) = self.peer_wh();
-        x >= pl && x < pl + pw && y >= pt && y < pt + ph
+    fn drop_t(&self) -> Option<f32> {
+        self.drop.as_ref().map(|d| ui::cubic_bezier(0.2, 0.8, 0.2, 1.0, ms_since(d.t0) / DROP_MS))
+    }
+
+    fn switch_t(&self, i: usize) -> f32 {
+        let target = if self.sw[i] { 1.0 } else { 0.0 };
+        match self.sw_t[i] {
+            Some(t0) => {
+                let p = (ms_since(t0) / SWITCH_MS).min(1.0);
+                let e = ui::cubic_bezier(0.25, 0.1, 0.25, 1.0, p);
+                if self.sw[i] { e } else { 1.0 - e }
+            }
+            None => target,
+        }
+    }
+
+    /// 名字旁绿勾的不透明度。
+    fn flash_alpha(&self, f: Field) -> f32 {
+        match self.flash {
+            Some((g, t0)) if g == f => {
+                let ms = ms_since(t0);
+                if ms < FLASH_MS { 1.0 } else { (1.0 - (ms - FLASH_MS) / FADE_MS).max(0.0) }
+            }
+            _ => 0.0,
+        }
+    }
+
+    fn copied_now(&self, h: Hot) -> bool {
+        matches!(self.copied, Some((g, t0)) if g == h && ms_since(t0) < FLASH_MS)
+    }
+
+    fn animating(&self) -> bool {
+        self.drop.is_some()
+            || self.sw_t.iter().flatten().any(|t| ms_since(*t) < SWITCH_MS + 20.0)
+            || self.flash.is_some_and(|(_, t)| ms_since(t) < FLASH_MS + FADE_MS + 20.0)
+            || self.copied.is_some_and(|(_, t)| ms_since(t) < FLASH_MS + 20.0)
+    }
+
+    fn measure(&self, f: &Font, t: &str) -> f32 {
+        ui::text_w(self.mdc, f, self.s, t)
     }
 }
 
-fn scale_px(v: i32, dpi: u32) -> i32 {
-    ((v as i64 * dpi as i64 + 48) / 96) as i32
+// ---------------------------------------------------------------------------
+// 场景：每次绘制 / 命中测试都现算（便宜）
+// ---------------------------------------------------------------------------
+
+struct Pill {
+    r: R,
+    primary: bool,
+    glass: bool,
+    name: String,
+    /// 名字文字（悬停时含铅笔）的位置
+    name_r: R,
+    /// 名字的点击区（总含铅笔位置，悬停时不抖）
+    name_hit: R,
+    hovered: bool,
+    editing: bool,
+    tag_r: Option<R>,
+    check: Option<(R, f32)>,
+    line1_cy: f32,
+    line2: String,
+    line2_cy: f32,
+    dim: bool,
 }
 
-fn make_font(dpi: u32, bold: bool) -> HFONT {
-    let h = -scale_px(if bold { 14 } else { 13 }, dpi);
-    let weight = if bold { FW_BOLD.0 } else { FW_NORMAL.0 } as i32;
+struct Scr {
+    r: R,
+    peer: bool,
+    offline: bool,
+    lift: f32,
+    pill: Pill,
+}
+
+struct Scene {
+    scr: Vec<Scr>,
+    /// 接缝绿条（舞台坐标）
+    edges: Vec<R>,
+    edge_vertical: bool,
+    ghost: Option<R>,
+    name_local: Option<R>,
+    name_peer: Option<R>,
+    /// 名字输入框（编辑中）
+    namebox: Option<R>,
+    tip: Option<R>,
+    layout_now: Layout,
+}
+
+/// 显示器矩形上与同组其它显示器相邻的边：(左, 上, 右, 下)。
+fn adjacent(m: &Rect, all: &[Rect]) -> [bool; 4] {
+    let mut e = [false; 4];
+    for o in all {
+        if o == m {
+            continue;
+        }
+        let oy = o.t < m.b && o.b > m.t;
+        let ox = o.l < m.r && o.r > m.l;
+        e[0] |= o.r == m.l && oy;
+        e[2] |= o.l == m.r && oy;
+        e[1] |= o.b == m.t && ox;
+        e[3] |= o.t == m.b && ox;
+    }
+    e
+}
+
+fn pill(a: &App, sr: R, mon: &Mon, peer: bool, offline: bool) -> Pill {
+    let f = &a.fonts;
+    let field = if peer { Field::PeerName } else { Field::LocalName };
+    let editing = a.edit == Some(field);
+    let hovered = !editing && ((peer && matches!(a.hover, Hot::NamePeer)) || (!peer && a.hover == Hot::NameLocal));
+    let name = if peer { a.peer_name() } else { a.local_name() };
+    let line2 = if editing {
+        "回车保存".to_string()
+    } else if peer && !a.peer_known {
+        "—".to_string()
+    } else {
+        res_text(&mon.r, mon.dpi)
+    };
+    let glass = !offline;
+    if !mon.primary {
+        let w2 = a.measure(&f.res, &line2);
+        let r = R::new(sr.cx() - (w2 + 22.0) / 2.0, sr.y + sr.h - 10.0 - 25.0, w2 + 22.0, 25.0);
+        return Pill {
+            r,
+            primary: false,
+            glass,
+            name,
+            name_r: R::default(),
+            name_hit: R::default(),
+            hovered: false,
+            editing: false,
+            tag_r: None,
+            check: None,
+            line1_cy: 0.0,
+            line2,
+            line2_cy: r.cy(),
+            dim: offline,
+        };
+    }
+    let line1_h = if editing { 24.0 } else { 19.0 };
+    let name_w = if editing { a.measure(&f.name, &a.edit_text).max(24.0) + 3.0 + 16.0 } else { a.measure(&f.name, &name) };
+    let pencil = 4.0 + 12.0;
+    let mut l1w = name_w + if hovered { pencil } else { 0.0 };
+    let tag_w = a.measure(&f.tag, "本机") + 10.0;
+    if !peer {
+        l1w += 5.0 + tag_w;
+    }
+    let fa = a.flash_alpha(field);
+    if fa > 0.0 {
+        l1w += 5.0 + 16.0;
+    }
+    let l2w = if editing { a.measure(&f.hint, &line2) } else { a.measure(&f.res, &line2) };
+    let w = l1w.max(l2w) + 26.0;
+    let h = 6.0 + line1_h + 15.0 + 6.0 + 2.0;
+    let r = R::new(sr.cx() - w / 2.0, sr.y + sr.h - 10.0 - h, w, h);
+    let line1_cy = r.y + 7.0 + line1_h / 2.0;
+    let line2_cy = r.y + 7.0 + line1_h + 7.5;
+    let mut x = r.cx() - l1w / 2.0;
+    let name_r = R::new(x, line1_cy - if editing { 12.0 } else { 9.5 }, name_w + if hovered { pencil } else { 0.0 }, line1_h);
+    let name_hit = R::new(x - 5.0, line1_cy - 10.0, name_w + pencil + 10.0, 20.0);
+    x += name_r.w;
+    let mut tag_r = None;
+    if !peer {
+        x += 5.0;
+        tag_r = Some(R::new(x, line1_cy - 8.0, tag_w, 16.0));
+        x += tag_w;
+    }
+    let check = if fa > 0.0 { Some((R::new(x + 5.0, line1_cy - 8.0, 16.0, 16.0), fa)) } else { None };
+    Pill { r, primary: true, glass, name, name_r, name_hit, hovered, editing, tag_r, check, line1_cy, line2, line2_cy, dim: offline }
+}
+
+fn scene(a: &App) -> Scene {
+    let peer_desk = a.peer_desk();
+    let pb = peer_desk.bounds();
+    let sc = sanitize_scale(a.layout.scale);
+    let lay_pos = a.layout_pos(&a.layout);
+    let (view, pos, lift) = match (&a.drag, &a.drop) {
+        (Some(d), _) if d.active => (d.view, d.pos, 1.0f32),
+        (_, Some(dr)) => {
+            let t = a.drop_t().unwrap_or(1.0) as f64;
+            let v1 = a.fit_view(lay_pos);
+            let pos = (dr.from.0 + (lay_pos.0 - dr.from.0) * t, dr.from.1 + (lay_pos.1 - dr.from.1) * t);
+            (dr.view0.lerp(&v1, t), pos, 1.0 - t as f32)
+        }
+        _ => (a.fit_view(lay_pos), lay_pos, 0.0),
+    };
+    let dragging = a.drag.as_ref().is_some_and(|d| d.active);
+    let lay_now = a.projected();
+    let tx = |x: f64| (view.ox + x * view.k) as f32;
+    let ty = |y: f64| (view.oy + y * view.k) as f32;
+    let (gx, gy) = match lay_now.side {
+        Side::Left => (GAP, 0.0),
+        Side::Right => (-GAP, 0.0),
+        Side::Top => (0.0, GAP),
+        Side::Bottom => (0.0, -GAP),
+    };
+    let mut out = Scene {
+        scr: Vec::new(),
+        edges: Vec::new(),
+        edge_vertical: lay_now.side.horizontal(),
+        ghost: None,
+        name_local: None,
+        name_peer: None,
+        namebox: None,
+        tip: None,
+        layout_now: lay_now,
+    };
+
+    // 本机
+    let mine_rects: Vec<Rect> = a.mine.iter().map(|m| m.r).collect();
+    for m in &a.mine {
+        let adj = adjacent(&m.r, &mine_rects);
+        let i = |b: bool| if b { 2.0 } else { 0.0 };
+        let (x0, y0) = (tx(m.r.l as f64) + gx + i(adj[0]), ty(m.r.t as f64) + gy + i(adj[1]));
+        let (x1, y1) = (tx(m.r.r as f64) + gx - i(adj[2]), ty(m.r.b as f64) + gy - i(adj[3]));
+        let r = R::new(x0, y0, x1 - x0, y1 - y0);
+        let p = pill(a, r, m, false, false);
+        if p.primary {
+            out.name_local = Some(p.name_hit);
+            if p.editing {
+                out.namebox = Some(p.name_r);
+            }
+        }
+        out.scr.push(Scr { r, peer: false, offline: false, lift: 0.0, pill: p });
+    }
+
+    // 对方
+    let offline = !a.connected;
+    let peer_rects: Vec<Rect> = a.peer.iter().map(|m| m.r).collect();
+    let place = |m: &Rect, p: (f64, f64)| {
+        let l = p.0 + (m.l - pb.l) as f64 * sc;
+        let t = p.1 + (m.t - pb.t) as f64 * sc;
+        (l, t, l + m.w() as f64 * sc, t + m.h() as f64 * sc)
+    };
+    let (pgx, pgy) = if lift > 0.0 { (0.0, 0.0) } else { (-gx, -gy) };
+    for m in &a.peer {
+        let adj = adjacent(&m.r, &peer_rects);
+        let i = |b: bool| if b { 2.0 } else { 0.0 };
+        let (l, t, rr, b) = place(&m.r, pos);
+        let (x0, y0) = (tx(l) + pgx + i(adj[0]), ty(t) + pgy + i(adj[1]));
+        let (x1, y1) = (tx(rr) + pgx - i(adj[2]), ty(b) + pgy - i(adj[3]));
+        let mut r = R::new(x0, y0, x1 - x0, y1 - y0);
+        if lift > 0.0 {
+            let k = 1.0 + 0.025 * lift;
+            r = R::new(r.cx() - r.w * k / 2.0, r.cy() - r.h * k / 2.0, r.w * k, r.h * k);
+        }
+        let p = pill(a, r, m, true, offline);
+        if p.primary {
+            out.name_peer = Some(p.name_hit);
+            if p.editing {
+                out.namebox = Some(p.name_r);
+            }
+            if a.hover == Hot::NamePeerOff && offline && !dragging {
+                let tw = a.measure(&a.fonts.small, "连上后可改") + 20.0;
+                out.tip = Some(R::new(p.name_r.cx() - tw / 2.0, p.name_r.y - 8.0 - 28.0, tw, 28.0));
+            }
+        }
+        out.scr.push(Scr { r, peer: true, offline, lift, pill: p });
+    }
+
+    // 拖动中：吸附位置的虚线框
+    if dragging {
+        let g = a.layout_pos(&lay_now);
+        let (l, t) = (tx(g.0) - gx, ty(g.1) - gy);
+        let (pw, ph) = a.peer_wh();
+        out.ghost = Some(R::new(l, t, (pw * view.k) as f32, (ph * view.k) as f32));
+    }
+
+    // 接缝：按吸附后的位置算
+    let at = a.layout_pos(&lay_now);
+    let placed: Vec<(f64, f64, f64, f64)> = a.peer.iter().map(|m| place(&m.r, at)).collect();
+    let pbx = (at.0, at.1, at.0 + pb.w() as f64 * sc, at.1 + pb.h() as f64 * sc);
+    let (line, segs) = contact_segments(&mine_rects, &placed, pbx, lay_now.side);
+    for (lo, hi) in segs {
+        let (a0, a1) = if lay_now.side.horizontal() { (ty(lo), ty(hi)) } else { (tx(lo), tx(hi)) };
+        let inset = ((a1 - a0) * 0.25).min(6.0);
+        let (a0, a1) = (a0 + inset, a1 - inset);
+        if a1 - a0 < 2.0 {
+            continue;
+        }
+        out.edges.push(if lay_now.side.horizontal() {
+            R::new(tx(line) - 1.5, a0, 3.0, a1 - a0)
+        } else {
+            R::new(a0, ty(line) - 1.5, a1 - a0, 3.0)
+        });
+    }
+    out
+}
+
+fn hit(a: &App, sc: &Scene, x: f32, y: f32) -> Hot {
+    if a.popover {
+        if POP_OK.contains(x, y) {
+            return Hot::PopOk;
+        }
+        if POP_CANCEL.contains(x, y) {
+            return Hot::PopCancel;
+        }
+        if POP.contains(x, y) {
+            return Hot::Pop;
+        }
+    }
+    if a.drag.is_some() || a.drop.is_some() {
+        return Hot::None;
+    }
+    if IP_BOX.contains(x, y) {
+        return Hot::Ip;
+    }
+    if KEY_BOX.contains(x, y) {
+        return Hot::Key;
+    }
+    if COPY_KEY.contains(x, y) {
+        return Hot::CopyKey;
+    }
+    if NEW_KEY.contains(x, y) {
+        return Hot::NewKey;
+    }
+    if !a.ips.is_empty() && COPY_IP.contains(x, y) {
+        return Hot::CopyIp;
+    }
+    for i in 0..3 {
+        if switch_row(i).contains(x, y) {
+            return Hot::Switch(i);
+        }
+    }
+    if MINUS.contains(x, y) {
+        return Hot::Minus;
+    }
+    if PLUS.contains(x, y) {
+        return Hot::Plus;
+    }
+    if y >= STAGE_H {
+        return Hot::None;
+    }
+    if a.edit != Some(Field::LocalName)
+        && let Some(r) = sc.name_local
+        && r.contains(x, y)
+    {
+        return Hot::NameLocal;
+    }
+    if a.edit != Some(Field::PeerName)
+        && let Some(r) = sc.name_peer
+        && r.contains(x, y)
+    {
+        return if a.connected { Hot::NamePeer } else { Hot::NamePeerOff };
+    }
+    if sc.scr.iter().any(|s| s.peer && s.r.contains(x, y)) {
+        return Hot::Peer;
+    }
+    Hot::None
+}
+
+// ---------------------------------------------------------------------------
+// 绘制
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Copy,
+    Refresh,
+    Pencil,
+    Check,
+    Minus,
+    Plus,
+}
+
+/// 图标（24 格的 viewBox，照设计稿的 SVG），中心 (cx, cy)，边长 size，线宽 sw（viewBox 单位）。
+fn icon(p: &mut Painter, which: Icon, cx: f32, cy: f32, size: f32, sw: f32, c: Rgba) {
+    use std::f32::consts::PI;
+    let k = size / 24.0;
+    let (x0, y0) = (cx - size / 2.0, cy - size / 2.0);
+    let m = |x: f32, y: f32| (x0 + x * k, y0 + y * k);
+    let ln = |a: (f32, f32), b: (f32, f32)| Seg::Line(a.0, a.1, b.0, b.1);
+    let w = sw * k;
+    match which {
+        Icon::Copy => {
+            let (rx, ry) = m(9.0, 9.0);
+            p.ring(rx, ry, 12.0 * k, 12.0 * k, 2.5 * k, -w / 2.0, w / 2.0, c);
+            let pts = [m(5.0, 15.0), m(4.0, 15.0), m(3.0, 14.0), m(3.0, 4.0), m(4.0, 3.0), m(14.0, 3.0), m(15.0, 4.0), m(15.0, 5.0)];
+            p.polyline(&pts, w, c);
+        }
+        Icon::Refresh => {
+            let (ccx, ccy) = m(12.0, 12.0);
+            let d = |deg: f32| deg * PI / 180.0;
+            let segs = [
+                Seg::Arc(ccx, ccy, 9.0 * k, d(0.0), d(136.36)),
+                ln(m(5.5, 18.2), m(3.0, 16.0)),
+                Seg::Arc(ccx, ccy, 9.0 * k, d(180.0), d(316.36)),
+                ln(m(18.5, 5.8), m(21.0, 8.0)),
+                ln(m(21.0, 3.0), m(21.0, 8.0)),
+                ln(m(21.0, 8.0), m(16.0, 8.0)),
+                ln(m(3.0, 21.0), m(3.0, 16.0)),
+                ln(m(3.0, 16.0), m(8.0, 16.0)),
+            ];
+            p.stroke(&segs, w, c);
+        }
+        Icon::Pencil => {
+            let (acx, acy) = m(19.0, 5.0);
+            let segs = [
+                Seg::Arc(acx, acy, 2.83 * k, 225.0 * PI / 180.0, 405.0 * PI / 180.0),
+                ln(m(21.0, 7.0), m(7.5, 20.5)),
+                ln(m(7.5, 20.5), m(2.0, 22.0)),
+                ln(m(2.0, 22.0), m(3.5, 16.5)),
+                ln(m(3.5, 16.5), m(17.0, 3.0)),
+            ];
+            p.stroke(&segs, w, c);
+        }
+        Icon::Check => p.polyline(&[m(5.0, 12.5), m(9.5, 17.0), m(19.0, 7.5)], w, c),
+        Icon::Minus => p.polyline(&[m(5.0, 12.0), m(19.0, 12.0)], w, c),
+        Icon::Plus => p.stroke(&[ln(m(5.0, 12.0), m(19.0, 12.0)), ln(m(12.0, 5.0), m(12.0, 19.0))], w, c),
+    }
+}
+
+/// 玻璃胶囊底：投影 + 半透明白 + 白描边 + 外细边 + 顶部内高光。
+fn glass(p: &mut Painter, th: &Theme, r: R, rad: f32) {
+    p.shadow(r.x, r.y, r.w, r.h, rad, 0.0, 6.0, 16.0, -6.0, hexa(0, 0.22));
+    p.rrect(r.x, r.y, r.w, r.h, rad, th.glass);
+    p.ring(r.x, r.y, r.w, r.h, rad, -1.0, 0.0, th.glassline);
+    p.ring(r.x, r.y, r.w, r.h, rad, 0.0, 0.5, th.glassedge);
+    if !th.dark {
+        p.ring(r.x + 1.0, r.y + 1.0, r.w - 2.0, r.h - 2.0, rad - 1.0, -1.0, 0.0, hexa(0xFFFFFF, 0.2));
+    }
+}
+
+/// 文字水平居中在 cx、竖直居中在 cy。
+fn text_c(p: &mut Painter, cx: f32, cy: f32, t: &str, f: &Font, c: Rgba) {
+    let w = p.measure(f, t);
+    p.text_mid(cx - w / 2.0, cy, t, f, c);
+}
+
+/// 文字右对齐到 rx。
+fn text_r(p: &mut Painter, rx: f32, cy: f32, t: &str, f: &Font, c: Rgba) {
+    let w = p.measure(f, t);
+    p.text_mid(rx - w, cy, t, f, c);
+}
+
+fn draw_pill(p: &mut Painter, a: &App, pl: &Pill) {
+    let th = &a.th;
+    let f = &a.fonts;
+    let r = pl.r;
+    if pl.glass {
+        glass(p, th, r, 12.0);
+    }
+    let dimc = th.mutd;
+    if !pl.primary {
+        let c = if pl.dim { dimc } else { th.fg2 };
+        text_c(p, r.cx(), pl.line2_cy, &pl.line2, &f.res, c);
+        return;
+    }
+    let nr = pl.name_r;
+    if pl.editing {
+        let red = a.err_name;
+        let (ring, halo) = if red { (th.red, th.redring) } else { (th.green, th.greenring) };
+        p.ring(nr.x, nr.y, nr.w, nr.h, 7.0, 1.5, 4.5, halo);
+        p.ring(nr.x, nr.y, nr.w, nr.h, 7.0, 0.0, 1.5, ring);
+        p.rrect(nr.x, nr.y, nr.w, nr.h, 7.0, th.card);
+    } else {
+        if pl.hovered {
+            p.rrect(nr.x - 5.0, nr.y, nr.w + 10.0, nr.h, 6.0, th.hov);
+        }
+        let c = if pl.dim { dimc } else { th.fg };
+        let w = p.text_mid(nr.x, pl.line1_cy, &pl.name, &f.name, c);
+        if pl.hovered {
+            icon(p, Icon::Pencil, nr.x + w + 4.0 + 6.0, pl.line1_cy, 12.0, 2.1, th.mutd);
+        }
+    }
+    if let Some(t) = pl.tag_r {
+        p.rrect(t.x, t.y, t.w, t.h, 5.0, th.tag);
+        text_c(p, t.cx(), t.cy(), "本机", &f.tag, th.fg2);
+    }
+    if let Some((c, al)) = pl.check {
+        p.circle(c.cx(), c.cy(), 8.0, th.green.alpha(al));
+        icon(p, Icon::Check, c.cx(), c.cy(), 10.0, 3.4, hexa(0xFFFFFF, al));
+    }
+    if pl.editing {
+        text_c(p, r.cx(), pl.line2_cy, &pl.line2, &f.hint, th.mutd);
+    } else {
+        let c = if pl.dim { dimc } else { th.fg2.alpha(0.85) };
+        text_c(p, r.cx(), pl.line2_cy, &pl.line2, &f.res, c);
+    }
+}
+
+fn draw_screen(p: &mut Painter, a: &App, s: &Scr) {
+    let th = &a.th;
+    let r = s.r;
+    if s.offline {
+        p.rrect(r.x, r.y, r.w, r.h, 10.0, th.off);
+        p.dashed(r.x, r.y, r.w, r.h, 10.0, 1.5, 5.0, 4.0, th.offline);
+    } else {
+        let l = s.lift;
+        if l < 1.0 {
+            p.shadow(r.x, r.y, r.w, r.h, 10.0, 0.0, 1.0, 2.0, 0.0, hexa(0, 0.08 * (1.0 - l)));
+            p.shadow(r.x, r.y, r.w, r.h, 10.0, 0.0, 10.0, 24.0, -10.0, hexa(0, 0.30 * (1.0 - l)));
+        }
+        if l > 0.0 {
+            p.shadow(r.x, r.y, r.w, r.h, 10.0, 0.0, 2.0, 4.0, 0.0, hexa(0, 0.10 * l));
+            p.shadow(r.x, r.y, r.w, r.h, 10.0, 0.0, 22.0, 40.0, -12.0, hexa(0, 0.42 * l));
+        }
+        let wall = if s.peer { th.wb } else { th.wa };
+        p.rrect_with(r.x, r.y, r.w, r.h, 10.0, |x, y| wall.at(x - r.x, y - r.y, r.w, r.h));
+        p.ring(r.x, r.y, r.w, r.h, 10.0, -1.0, 0.0, th.scrline);
+    }
+    draw_pill(p, a, &s.pill);
+}
+
+/// 卡片里一个输入框的底和描边（focus：绿圈；err：红圈；hover：深一点）。
+fn field_box(p: &mut Painter, th: &Theme, r: R, focus: bool, err: bool, hover: bool) {
+    if err {
+        p.ring(r.x, r.y, r.w, r.h, 8.0, 1.5, 4.0, th.redring);
+        p.ring(r.x, r.y, r.w, r.h, 8.0, 0.0, 1.5, th.red);
+    } else if focus {
+        p.ring(r.x, r.y, r.w, r.h, 8.0, 1.5, 4.0, th.greenring);
+        p.ring(r.x, r.y, r.w, r.h, 8.0, 0.0, 1.5, th.green);
+    }
+    p.rrect(r.x, r.y, r.w, r.h, 8.0, if hover && !focus { th.fillh } else { th.fill });
+}
+
+fn render(p: &mut Painter, a: &App, sc: &Scene) {
+    let th = &a.th;
+    let f = &a.fonts;
+    p.clear(th.bg);
+    p.vgrad(0.0, 0.0, CLIENT_W, STAGE_H, th.stage_top, th.bg);
+
+    // 接缝
+    for e in &sc.edges {
+        if a.connected {
+            p.glow(e.x, e.y, e.w, e.h, 1.5, 8.0, th.green.alpha(0.55));
+            p.rrect(e.x, e.y, e.w, e.h, 1.5, th.green);
+        } else {
+            let (len, along) = if sc.edge_vertical { (e.h, e.y) } else { (e.w, e.x) };
+            let n = (len / 6.0).floor().max(1.0) as i32;
+            let step = len / n as f32;
+            for i in 0..=n {
+                let t = along + step * i as f32;
+                let (cx, cy) = if sc.edge_vertical { (e.cx(), t) } else { (t, e.cy()) };
+                p.circle(cx, cy, 1.3, th.offline);
+            }
+        }
+    }
+    for s in sc.scr.iter().filter(|s| !s.peer) {
+        draw_screen(p, a, s);
+    }
+    if let Some(g) = sc.ghost {
+        p.rrect(g.x, g.y, g.w, g.h, 10.0, th.green.alpha(0.10));
+        p.dashed(g.x, g.y, g.w, g.h, 10.0, 1.5, 5.0, 4.0, th.green);
+    }
+    for s in sc.scr.iter().filter(|s| s.peer) {
+        p.alpha = 1.0 - 0.06 * s.lift;
+        draw_screen(p, a, s);
+        p.alpha = 1.0;
+    }
+
+    // 左上状态、右上提示
+    let (chip_t, dot) = if a.connected { ("已连接", th.green) } else { ("未连接", th.mut2) };
+    let cw = 1.0 + 9.0 + 7.0 + 6.0 + p.measure(&f.chip, chip_t) + 11.0 + 1.0;
+    let chip = R::new(20.0, 12.0, cw, 26.0);
+    glass(p, th, chip, 13.0);
+    if a.connected {
+        p.circle(chip.x + 13.5, chip.cy(), 6.5, th.greenring);
+    }
+    p.circle(chip.x + 13.5, chip.cy(), 3.5, dot);
+    p.text_mid(chip.x + 23.0, chip.cy(), chip_t, &f.chip, th.fg);
+    text_r(p, CLIENT_W - 22.0, 25.0, "拖动摆放", &f.small, th.mutd);
+
+    // 左下说明、右下比例
+    let cy = STEPPER.cy();
+    let nw = p.text_mid(24.0, cy, &a.peer_name(), &f.stat_b, th.fg);
+    p.text_mid(24.0 + nw + 7.0, cy, &status_text(&sc.layout_now), &f.stat, th.fg2);
+    text_r(p, STEPPER.x - 8.0, cy, "尺寸比例", &f.small, th.mutd);
+    glass(p, th, STEPPER, 14.0);
+    for (r, h, ic) in [(MINUS, Hot::Minus, Icon::Minus), (PLUS, Hot::Plus, Icon::Plus)] {
+        if a.hover == h {
+            p.circle(r.cx(), r.cy(), 11.0, th.hov);
+        }
+        icon(p, ic, r.cx(), r.cy(), 12.0, 2.4, th.fg2);
+    }
+    text_c(p, (MINUS.x + MINUS.w + PLUS.x) / 2.0, cy, &format!("{:.2}", sanitize_scale(a.layout.scale)), &f.step, th.fg);
+
+    // 卡片
+    let c = CARD;
+    p.shadow(c.x, c.y, c.w, c.h, 14.0, 0.0, 1.0, 3.0, 0.0, hexa(0, th.card_shadow));
+    p.rrect(c.x, c.y, c.w, c.h, 14.0, th.card);
+    p.ring(c.x, c.y, c.w, c.h, 14.0, 0.0, 1.0, th.cardline);
+    p.rrect(410.0, c.y + 16.0, 1.0, c.h - 32.0, 0.0, th.hair);
+    p.text_mid(36.0, c.y + 22.0, "连接", &f.group, th.mutd);
+    p.text_mid(430.0, c.y + 22.0, "通用", &f.group, th.mutd);
+    for x in [36.0, 430.0] {
+        for i in 1..3 {
+            p.rrect(x, ROW0 + ROW_H * i as f32, 354.0, 1.0, 0.0, th.hair);
+        }
+    }
+    let two_line = |p: &mut Painter, top: f32, a1: &str, b1: &str, bc: Rgba| {
+        p.text_mid(36.0, top + 19.5, a1, &f.label, th.fg);
+        p.text_mid(36.0, top + 37.5, b1, &f.hint, bc);
+    };
+
+    // 对方 IP
+    two_line(p, ROW0, "对方 IP", a.err_ip.unwrap_or("填一台即可"), if a.err_ip.is_some() { th.red } else { th.mutd });
+    let editing_ip = a.edit == Some(Field::Ip);
+    field_box(p, th, IP_BOX, editing_ip, a.err_ip.is_some(), a.hover == Hot::Ip);
+    if !editing_ip {
+        let v = a.draft_ip.clone().unwrap_or_else(|| a.cfg.peer.trim().to_string());
+        if v.is_empty() {
+            p.text_mid(IP_BOX.x + 10.0, IP_BOX.cy(), "未填", &f.label, th.mut2);
+        } else {
+            p.text_mid(IP_BOX.x + 10.0, IP_BOX.cy(), &v, &f.input, th.fg);
+        }
+    }
+
+    // 配对密钥
+    let r1 = ROW0 + ROW_H;
+    two_line(p, r1, "配对密钥", a.err_key.unwrap_or("两台须相同"), if a.err_key.is_some() { th.red } else { th.mutd });
+    let editing_key = a.edit == Some(Field::Key);
+    field_box(p, th, KEY_BOX, editing_key, a.err_key.is_some(), a.hover == Hot::Key);
+    if !editing_key {
+        let v = a.draft_key.clone().unwrap_or_else(|| a.cfg.key.clone());
+        p.text_mid(KEY_BOX.x + 10.0, KEY_BOX.cy(), &short_key(&v), &f.mono, th.fg);
+    }
+    for (r, h, ic) in [(COPY_KEY, Hot::CopyKey, Icon::Copy), (NEW_KEY, Hot::NewKey, Icon::Refresh)] {
+        let on = a.hover == h || (h == Hot::NewKey && a.popover);
+        p.rrect(r.x, r.y, r.w, r.h, 8.0, if on { th.fillh } else { th.fill });
+        if a.copied_now(h) {
+            icon(p, Icon::Check, r.cx(), r.cy(), 15.0, 2.4, th.green);
+        } else {
+            icon(p, ic, r.cx(), r.cy(), 15.0, 1.9, th.fg2);
+        }
+    }
+
+    // 本机 IP
+    let r2 = ROW0 + ROW_H * 2.0;
+    p.text_mid(36.0, r2 + 28.0, "本机 IP", &f.label, th.fg);
+    match a.ips.first() {
+        Some(ip) => {
+            text_r(p, COPY_IP.x - 6.0, r2 + 28.0, ip, &f.input, th.fg2);
+            if a.hover == Hot::CopyIp {
+                p.rrect(COPY_IP.x, COPY_IP.y, COPY_IP.w, COPY_IP.h, 8.0, th.fill);
+            }
+            if a.copied_now(Hot::CopyIp) {
+                icon(p, Icon::Check, COPY_IP.cx(), COPY_IP.cy(), 15.0, 2.4, th.green);
+            } else {
+                icon(p, Icon::Copy, COPY_IP.cx(), COPY_IP.cy(), 15.0, 1.9, th.mutd);
+            }
+        }
+        None => text_r(p, 390.0, r2 + 28.0, "无", &f.label, th.mutd),
+    }
+
+    // 开关
+    for (i, label) in SWITCH_LABELS.iter().enumerate() {
+        let row = switch_row(i);
+        p.text_mid(430.0, row.cy(), label, &f.label, th.fg);
+        let r = switch_rect(i);
+        let t = a.switch_t(i);
+        p.rrect(r.x, r.y, r.w, r.h, 12.0, th.swoff.lerp(th.green, t));
+        let kx = r.x + 12.0 + 16.0 * t;
+        p.shadow(kx - 10.0, r.y + 2.0, 20.0, 20.0, 10.0, 0.0, 1.0, 3.0, 0.0, hexa(0, 0.22));
+        p.ring(kx - 10.0, r.y + 2.0, 20.0, 20.0, 10.0, 0.0, 0.5, hexa(0, 0.04));
+        p.circle(kx, r.cy(), 10.0, th.knob);
+    }
+
+    // 提示 / 确认框
+    if let Some(t) = sc.tip {
+        p.shadow(t.x, t.y, t.w, t.h, 7.0, 0.0, 6.0, 16.0, -6.0, hexa(0, 0.25));
+        p.rrect(t.x, t.y, t.w, t.h, 7.0, th.tip);
+        p.ring(t.x, t.y, t.w, t.h, 7.0, -1.0, 0.0, th.tipline);
+        text_c(p, t.cx(), t.cy(), "连上后可改", &f.small, th.tipfg);
+    }
+    if a.popover {
+        let r = POP;
+        p.shadow(r.x, r.y, r.w, r.h, 10.0, 0.0, 10.0, 28.0, -6.0, hexa(0, 0.30));
+        p.rrect(r.x, r.y, r.w, r.h, 10.0, th.tip);
+        p.ring(r.x, r.y, r.w, r.h, 10.0, -1.0, 0.0, th.tipline);
+        p.text_mid(r.x + 14.0, r.y + 22.0, "换新密钥后两台都要重新粘贴", &f.btn, th.tipfg);
+        let cb = POP_CANCEL;
+        p.rrect(cb.x, cb.y, cb.w, cb.h, 7.0, if a.hover == Hot::PopCancel { th.fillh } else { th.fill });
+        text_c(p, cb.cx(), cb.cy(), "取消", &f.btn, th.fg);
+        let ok = POP_OK;
+        let g = if a.hover == Hot::PopOk { th.green.lerp(hex(0), 0.08) } else { th.green };
+        p.rrect(ok.x, ok.y, ok.w, ok.h, 7.0, g);
+        text_c(p, ok.cx(), ok.cy(), "更换", &f.btn, hex(0xFFFFFF));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 数据来源
+// ---------------------------------------------------------------------------
+
+/// 本机显示器 + 每块的 DPI（EnumDisplayMonitors + GetDpiForMonitor）。
+fn local_monitors() -> Vec<Mon> {
+    unsafe extern "system" fn cb(h: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
+        unsafe {
+            let v = &mut *(data.0 as *mut Vec<Mon>);
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if GetMonitorInfoW(h, &mut mi).as_bool() {
+                let r = mi.rcMonitor;
+                let (mut dx, mut dy) = (0u32, 0u32);
+                let dpi = GetDpiForMonitor(h, MDT_EFFECTIVE_DPI, &mut dx, &mut dy).ok().map(|_| dx).filter(|d| *d > 0);
+                v.push(Mon { r: Rect::new(r.left, r.top, r.right, r.bottom), dpi, primary: mi.dwFlags & 1 != 0 });
+            }
+        }
+        BOOL(1)
+    }
+    let mut v: Vec<Mon> = Vec::new();
     unsafe {
-        CreateFontW(
-            h,
-            0,
-            0,
-            0,
-            weight,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
-            0,
-            w!("Microsoft YaHei UI"),
-        )
+        let _ = EnumDisplayMonitors(None, None, Some(cb), LPARAM(&mut v as *mut _ as isize));
+    }
+    v.retain(|m| m.r.w() > 0 && m.r.h() > 0);
+    v.sort_by_key(|m| (m.r.l, m.r.t));
+    if v.is_empty() {
+        v.push(Mon { r: Rect::new(0, 0, 1920, 1080), dpi: None, primary: true });
+    }
+    fix_primary(&mut v);
+    v
+}
+
+fn placeholder_peer() -> Vec<Mon> {
+    vec![Mon { r: Rect::new(0, 0, 1920, 1080), dpi: None, primary: true }]
+}
+
+/// 进程还在不在（主程序以管理员身份运行时打不开也算在）。
+fn pid_alive(pid: u32) -> bool {
+    use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(h) => {
+                let mut code = 0u32;
+                let ok = GetExitCodeProcess(h, &mut code).is_ok();
+                let _ = CloseHandle(h);
+                !ok || code == 259 // STILL_ACTIVE
+            }
+            Err(e) => e.code() == E_ACCESSDENIED,
+        }
     }
 }
 
-fn dlg(main: HWND, id: i32) -> Option<HWND> {
-    unsafe { GetDlgItem(Some(main), id).ok() }
+/// 读 status.json：(已连接, 对方名字)。
+fn read_status() -> (bool, String) {
+    let Ok(s) = std::fs::read_to_string(config::dir().join("status.json")) else { return (false, String::new()) };
+    match parse_status(&s) {
+        Some((pid, c, name)) => (c && pid_alive(pid), name),
+        None => (false, String::new()),
+    }
+}
+
+/// 原子写一个小文件（先写临时文件再改名）。
+fn write_atomic(name: &str, body: &str) -> std::io::Result<()> {
+    let dir = config::dir();
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, body)?;
+    let r = std::fs::rename(&tmp, dir.join(name));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
+}
+
+/// 改对方的名字：写 rename_peer.json，主程序取走后发给对方。
+fn write_rename_peer(name: &str) -> bool {
+    let body = serde_json::json!({ "name": name, "t": config::now_ms() }).to_string();
+    match write_atomic("rename_peer.json", &body) {
+        Ok(()) => true,
+        Err(e) => {
+            crate::log!("设置窗口：写 rename_peer.json 失败 {e}");
+            false
+        }
+    }
+}
+
+/// 读 peer.json；带 DPI 的新格式解析不了时退回老的读法（只有名字和显示器）。
+fn read_peer() -> Option<(String, Vec<Mon>)> {
+    if let Some(p) = std::fs::read_to_string(config::peer_desk_path()).ok().and_then(|s| parse_peer(&s)) {
+        return Some(p);
+    }
+    let (name, desk) = config::load_peer_desk()?;
+    let mut ms: Vec<Mon> = desk.monitors.into_iter().filter(|r| r.w() > 0 && r.h() > 0).map(|r| Mon { r, dpi: None, primary: false }).collect();
+    if ms.is_empty() {
+        return None;
+    }
+    fix_primary(&mut ms);
+    Some((name, ms))
+}
+
+fn cfg_mtime() -> Option<SystemTime> {
+    std::fs::metadata(config::path()).and_then(|m| m.modified()).ok()
+}
+
+/// 本机局域网 IPv4：已连接的非回环网卡上的单播地址，过滤见 usable_lan_ip；有默认网关的网卡排前面。
+fn lan_ips() -> Vec<String> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, GET_ADAPTERS_ADDRESSES_FLAGS,
+        GetAdaptersAddresses, IF_TYPE_SOFTWARE_LOOPBACK, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
+    };
+    use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
+
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+    let flags = GET_ADAPTERS_ADDRESSES_FLAGS(
+        GAA_FLAG_SKIP_ANYCAST.0 | GAA_FLAG_SKIP_MULTICAST.0 | GAA_FLAG_SKIP_DNS_SERVER.0 | GAA_FLAG_INCLUDE_GATEWAYS.0,
+    );
+    let mut found: Vec<(Ipv4Addr, bool)> = Vec::new();
+    let mut size: u32 = 16 * 1024;
+    for _ in 0..4 {
+        // u64 保证 8 字节对齐
+        let mut buf = vec![0u64; (size as usize).div_ceil(8).max(1)];
+        let p = buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+        let r = unsafe { GetAdaptersAddresses(AF_INET.0 as u32, flags, None, Some(p), &mut size) };
+        if r == ERROR_BUFFER_OVERFLOW {
+            continue;
+        }
+        if r != 0 {
+            crate::log!("GetAdaptersAddresses 失败：{r}");
+            break;
+        }
+        let mut a = p as *const IP_ADAPTER_ADDRESSES_LH;
+        while !a.is_null() {
+            let ad = unsafe { &*a };
+            if ad.OperStatus == IfOperStatusUp && ad.IfType != IF_TYPE_SOFTWARE_LOOPBACK {
+                let gw = !ad.FirstGatewayAddress.is_null();
+                let mut u = ad.FirstUnicastAddress as *const IP_ADAPTER_UNICAST_ADDRESS_LH;
+                while !u.is_null() {
+                    let ua = unsafe { &*u };
+                    let sa = ua.Address.lpSockaddr;
+                    if !sa.is_null() && unsafe { (*sa).sa_family } == AF_INET {
+                        let sin = unsafe { &*(sa as *const SOCKADDR_IN) };
+                        let ip = Ipv4Addr::from(unsafe { sin.sin_addr.S_un.S_addr }.to_ne_bytes());
+                        if usable_lan_ip(ip) && !found.iter().any(|(x, _)| *x == ip) {
+                            found.push((ip, gw));
+                        }
+                    }
+                    u = ua.Next;
+                }
+            }
+            a = ad.Next;
+        }
+        break;
+    }
+    found.sort_by_key(|(_, gw)| !*gw); // 稳定排序：有网关的在前
+    found.into_iter().map(|(ip, _)| ip.to_string()).collect()
+}
+
+// ---------------------------------------------------------------------------
+// 窗口
+// ---------------------------------------------------------------------------
+
+const MAIN_CLASS: PCWSTR = w!("kmlink_settings");
+const EDIT_IDS: [i32; 3] = [201, 202, 203];
+
+// 样式位 / 消息（部分常量在未启用的 feature 里，直接写数值）
+const ES_AUTOHSCROLL: u32 = 0x80;
+const EM_GETSEL: u32 = 0xB0;
+const EM_SETSEL: u32 = 0xB1;
+const EM_SETLIMITTEXT: u32 = 0xC5;
+const EM_SETMARGINS: u32 = 0xD3;
+const EN_CHANGE: u32 = 0x300;
+const EN_KILLFOCUS: u32 = 0x200;
+const HTCLIENT: usize = 1;
+const CF_UNICODETEXT: u32 = 13;
+const SIZE_MINIMIZED: usize = 1;
+const WM_MOUSELEAVE: u32 = 0x02A3;
+
+fn scale_px(v: f32, s: f32) -> i32 {
+    (v * s).round() as i32
 }
 
 fn set_text(h: HWND, s: &str) {
@@ -445,52 +1655,86 @@ fn get_text(h: HWND) -> String {
     }
 }
 
-fn wide_nz(s: &str) -> Vec<u16> {
-    s.encode_utf16().collect()
-}
-
-/// 按 DPI 摆放所有控件。
-fn layout_controls(main: HWND, dpi: u32) {
-    for c in CTLS {
-        if let Some(h) = dlg(main, c.id) {
-            let (x, y) = (scale_px(c.x, dpi), scale_px(c.y, dpi));
-            let (w, h2) = (scale_px(c.x + c.w, dpi) - x, scale_px(c.y + c.h, dpi) - y);
-            unsafe {
-                let _ = MoveWindow(h, x, y, w, h2, true);
-            }
-        }
+fn invalidate(hwnd: HWND) {
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
     }
 }
 
-fn apply_fonts(main: HWND, font: HFONT, bold: HFONT) {
-    for c in CTLS {
-        if c.kind == Kind::Canvas {
-            continue;
-        }
-        if let Some(h) = dlg(main, c.id) {
-            let f = if c.kind == Kind::Section { bold } else { font };
-            unsafe {
-                SendMessageW(h, WM_SETFONT, Some(WPARAM(f.0 as usize)), Some(LPARAM(1)));
-            }
-        }
-    }
-}
-
-/// 把状态同步到文字控件并重画画布。不能在借用 APP 时调用。
+/// 状态变了：摆好输入框、重画。不能在借用 APP 时调用。
 fn refresh() {
-    let Some((main, canvas, status, scale)) =
-        with_app(|a| (a.main, a.canvas, status_text(&a.projected()), format!("{:.2}", sanitize_scale(a.layout.scale))))
-    else {
+    sync_edits();
+    if let Some(h) = with_app(|a| a.hwnd) {
+        invalidate(h);
+    }
+    ensure_anim();
+}
+
+/// 有动画就开 16ms 的计时器。
+fn ensure_anim() {
+    if let Some((h, true)) = with_app(|a| (a.hwnd, a.animating())) {
+        unsafe {
+            SetTimer(Some(h), TIMER_ANIM, 16, None);
+        }
+    }
+}
+
+/// 输入框该放哪（物理像素），None = 隐藏。
+fn edit_rect(a: &App, sc: &Scene, slot: usize) -> Option<(i32, i32, i32, i32)> {
+    let f = a.edit?;
+    if f.slot() != slot {
+        return None;
+    }
+    let (r, font) = match f {
+        Field::Ip => (R::new(IP_BOX.x + 10.0, IP_BOX.cy(), IP_BOX.w - 20.0, 0.0), &a.fonts.input),
+        Field::Key => (R::new(KEY_BOX.x + 10.0, KEY_BOX.cy(), KEY_BOX.w - 20.0, 0.0), &a.fonts.mono),
+        Field::LocalName | Field::PeerName => {
+            let b = sc.namebox?;
+            (R::new(b.x + 8.0, b.cy(), b.w - 16.0, 0.0), &a.fonts.name)
+        }
+    };
+    let s = a.s;
+    let hh = (font.cell * s).ceil() as i32 + 1;
+    let x = scale_px(r.x, s);
+    let y = (r.y * s - hh as f32 / 2.0).round() as i32;
+    Some((x, y, scale_px(r.x + r.w, s) - x, hh))
+}
+
+fn sync_edits() {
+    let Some(plan) = with_app(|a| {
+        let sc = scene(a);
+        let mut out = Vec::new();
+        for slot in 0..3 {
+            let want = edit_rect(a, &sc, slot);
+            if want != a.edit_pos[slot] {
+                let resized = matches!((a.edit_pos[slot], want), (Some(o), Some(n)) if o.2 != n.2);
+                a.edit_pos[slot] = want;
+                out.push((a.edits[slot], want, resized));
+            }
+        }
+        out
+    }) else {
         return;
     };
-    if let Some(h) = dlg(main, ID_STATUS) {
-        set_text(h, &status);
-    }
-    if let Some(h) = dlg(main, ID_SCALE_VAL) {
-        set_text(h, &scale);
-    }
-    unsafe {
-        let _ = InvalidateRect(Some(canvas), None, false);
+    for (h, want, resized) in plan {
+        unsafe {
+            match want {
+                Some((x, y, w, hh)) => {
+                    let _ = MoveWindow(h, x, y, w, hh, true);
+                    let _ = ShowWindow(h, SW_SHOW);
+                    if resized {
+                        // 变宽后把横向滚动复位（先选到开头再还原选区），不然字会被卷走一截
+                        let r = SendMessageW(h, EM_GETSEL, None, None).0 as u32;
+                        let (s0, s1) = (r & 0xFFFF, r >> 16);
+                        SendMessageW(h, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+                        SendMessageW(h, EM_SETSEL, Some(WPARAM(s0 as usize)), Some(LPARAM(s1 as isize)));
+                    }
+                }
+                None => {
+                    let _ = ShowWindow(h, SW_HIDE);
+                }
+            }
+        }
     }
 }
 
@@ -508,23 +1752,86 @@ fn already_running() -> bool {
     }
 }
 
+/// DwmSetWindowAttribute（运行时取函数，不额外链接 dwmapi）。
+fn dwm_set(hwnd: HWND, attr: u32, val: u32) {
+    type F = unsafe extern "system" fn(HWND, u32, *const core::ffi::c_void, u32) -> i32;
+    unsafe {
+        let Ok(m) = LoadLibraryW(w!("dwmapi.dll")) else { return };
+        if let Some(f) = GetProcAddress(m, s!("DwmSetWindowAttribute")) {
+            let f: F = std::mem::transmute(f);
+            f(hwnd, attr, &val as *const u32 as *const _, 4);
+        }
+    }
+}
+
+/// 标题栏跟主题：深色模式开关 + 标题栏底色 = 舞台顶色 + 标题文字色。
+fn apply_caption(hwnd: HWND, th: &Theme) {
+    const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+    const DWMWA_CAPTION_COLOR: u32 = 35;
+    const DWMWA_TEXT_COLOR: u32 = 36;
+    dwm_set(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, th.dark as u32);
+    dwm_set(hwnd, DWMWA_CAPTION_COLOR, th.stage_top.colorref().0);
+    dwm_set(hwnd, DWMWA_TEXT_COLOR, th.fg.colorref().0);
+}
+
+/// 窗口图标（设计稿里的绿色小方块），边长 px。
+fn app_icon(px: i32) -> Option<HICON> {
+    use windows::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS};
+    let n = px.max(8) as usize;
+    let k = n as f32 / 16.0;
+    let cov = |d: f32| (0.5 - d * k).clamp(0.0, 1.0);
+    let mut argb = vec![0u32; n * n];
+    for y in 0..n {
+        for x in 0..n {
+            let (fx, fy) = ((x as f32 + 0.5) / k, (y as f32 + 0.5) / k);
+            let bg = cov(ui::sd_rrect(fx, fy, 8.0, 8.0, 7.5, 7.5, 4.0));
+            let ring = cov(ui::sd_rrect(fx, fy, 5.5, 7.0, 2.5, 2.5, 1.0).abs() - 0.65);
+            let fill = cov(ui::sd_rrect(fx, fy, 10.75, 8.75, 2.25, 2.25, 1.0));
+            let wht = ring.max(fill);
+            let c = hex(0x34C759).lerp(hex(0xFFFFFF), wht);
+            let q = |v: f32| (v * 255.0 + 0.5) as u32;
+            argb[y * n + x] = q(bg) << 24 | q(c.r) << 16 | q(c.g) << 8 | q(c.b);
+        }
+    }
+    unsafe {
+        let bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: n as i32,
+                biHeight: -(n as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let color = CreateDIBSection(None, &bi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        if bits.is_null() {
+            let _ = DeleteObject(color.into());
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(argb.as_ptr(), bits as *mut u32, n * n);
+        let mask_bits = vec![0u8; n.div_ceil(16) * 2 * n];
+        let mask = CreateBitmap(n as i32, n as i32, 1, 1, Some(mask_bits.as_ptr() as *const _));
+        let ii = ICONINFO { fIcon: true.into(), xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
+        let icon = CreateIconIndirect(&ii).ok();
+        let _ = DeleteObject(color.into());
+        let _ = DeleteObject(mask.into());
+        icon
+    }
+}
+
 pub fn run() {
     if already_running() {
         return;
     }
     // 配置：缺失就新建；解析失败由 load_or_create 备份并保留密钥，不会悄悄换钥
     let (cfg, _) = Config::load_or_create();
-    let mut mine = sys::monitors();
-    if mine.is_empty() {
-        mine = Desk::new(vec![Rect::new(0, 0, 1920, 1080)]);
-    }
-    let (peer_name, peer, peer_known) = match config::load_peer_desk() {
-        Some((n, d)) if !d.is_empty() => (n, d, true),
-        _ => (String::new(), Desk::new(vec![Rect::new(0, 0, 1920, 1080)]), false),
-    };
     let mut layout = cfg.layout.layout;
     layout.scale = sanitize_scale(layout.scale);
-    let ips = local_ipv4();
+    let th = if system_dark() { DARK } else { LIGHT };
 
     unsafe {
         let hinst: HINSTANCE = match GetModuleHandleW(None) {
@@ -534,40 +1841,29 @@ pub fn run() {
                 return;
             }
         };
-        let arrow = LoadCursorW(None, IDC_ARROW).ok();
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(main_proc),
             hInstance: hinst,
-            hCursor: arrow.unwrap_or_default(),
-            hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as usize as *mut _),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             lpszClassName: MAIN_CLASS,
             ..Default::default()
         };
-        let wc2 = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(canvas_proc),
-            hInstance: hinst,
-            hCursor: arrow.unwrap_or_default(),
-            lpszClassName: CANVAS_CLASS,
-            ..Default::default()
-        };
-        if RegisterClassExW(&wc) == 0 || RegisterClassExW(&wc2) == 0 {
+        if RegisterClassExW(&wc) == 0 {
             crate::log!("设置窗口：注册窗口类失败");
             return;
         }
-
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-        let title = sys::wide(TITLE);
-        let main = match CreateWindowExW(
+        let title = sys::wide("kmlink");
+        let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE(0),
             MAIN_CLASS,
             PCWSTR(title.as_ptr()),
             style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            CLIENT_W,
-            CLIENT_H,
+            820,
+            600,
             None,
             None,
             Some(hinst),
@@ -579,103 +1875,114 @@ pub fn run() {
                 return;
             }
         };
-        let dpi = match GetDpiForWindow(main) {
+        let dpi = match GetDpiForWindow(hwnd) {
             0 => 96,
             d => d,
         };
+        let s = dpi as f32 / 96.0;
+        apply_caption(hwnd, &th);
+        let icons = [app_icon((16.0 * s).round() as i32), app_icon((32.0 * s).round() as i32)];
+        for (i, ic) in icons.iter().enumerate() {
+            if let Some(ic) = ic {
+                SendMessageW(hwnd, WM_SETICON, Some(WPARAM(i)), Some(LPARAM(ic.0 as isize)));
+            }
+        }
 
-        // 子控件
-        let mut canvas = HWND::default();
-        for c in CTLS {
-            let (class, st, ex): (PCWSTR, u32, u32) = match c.kind {
-                Kind::Section | Kind::Label => (w!("STATIC"), SS_CENTERIMAGE | SS_NOPREFIX | SS_ENDELLIPSIS, 0),
-                Kind::Hint => (w!("STATIC"), SS_CENTERIMAGE | SS_NOPREFIX | SS_ENDELLIPSIS, 0),
-                Kind::Value => (w!("STATIC"), SS_CENTER | SS_CENTERIMAGE | SS_NOPREFIX, 0),
-                Kind::Edit => (w!("EDIT"), WS_TABSTOP.0 | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE.0),
-                Kind::RoEdit => (w!("EDIT"), ES_AUTOHSCROLL | ES_READONLY, 0),
-                Kind::Button => (w!("BUTTON"), WS_TABSTOP.0 | BS_PUSHBUTTON, 0),
-                Kind::DefButton => (w!("BUTTON"), WS_TABSTOP.0 | BS_DEFPUSHBUTTON, 0),
-                Kind::Canvas => (CANVAS_CLASS, 0, 0),
-            };
-            let text = sys::wide(c.text);
+        // 输入框：borderless EDIT，平时隐藏
+        let mut edits = [HWND::default(); 3];
+        for (i, id) in EDIT_IDS.iter().enumerate() {
             match CreateWindowExW(
-                WINDOW_EX_STYLE(ex),
-                class,
-                PCWSTR(text.as_ptr()),
-                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(st),
+                WINDOW_EX_STYLE(0),
+                w!("EDIT"),
+                w!(""),
+                WS_CHILD | WINDOW_STYLE(ES_AUTOHSCROLL),
                 0,
                 0,
-                0,
-                0,
-                Some(main),
-                Some(HMENU(c.id as isize as *mut _)),
+                10,
+                10,
+                Some(hwnd),
+                Some(HMENU(*id as isize as *mut _)),
                 Some(hinst),
                 None,
             ) {
                 Ok(h) => {
-                    if c.kind == Kind::Canvas {
-                        canvas = h;
-                    }
+                    edits[i] = h;
+                    let limit = [200usize, 128, NAME_MAX][i];
+                    SendMessageW(h, EM_SETLIMITTEXT, Some(WPARAM(limit)), None);
+                    SendMessageW(h, EM_SETMARGINS, Some(WPARAM(3)), Some(LPARAM(0)));
                 }
-                Err(e) => crate::log!("设置窗口：控件 {} 创建失败 {e}", c.id),
+                Err(e) => crate::log!("设置窗口：输入框创建失败 {e}"),
             }
         }
 
-        let font = make_font(dpi, false);
-        let bold = make_font(dpi, true);
+        let fonts = Fonts::new(s);
+        for (i, h) in edits.iter().enumerate() {
+            let f = [&fonts.input, &fonts.mono, &fonts.name][i];
+            SendMessageW(*h, WM_SETFONT, Some(WPARAM(f.h.0 as usize)), Some(LPARAM(0)));
+        }
+        let mine = local_monitors();
+        let sw = [cfg.clipboard.enabled, cfg.clipboard.notify, cfg.autostart];
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
-                main,
-                canvas,
-                dpi,
-                font,
-                bold,
+                hwnd,
+                s,
+                th,
+                fonts,
+                surf: None,
+                mdc: CreateCompatibleDC(None),
+                edits,
+                edit_pos: [None; 3],
+                brush_fill: CreateSolidBrush(th.fill.colorref()),
+                brush_card: CreateSolidBrush(th.card.colorref()),
+                cfg_mtime: cfg_mtime(),
+                cfg,
                 mine,
-                peer,
-                peer_name,
-                peer_known,
+                peer: placeholder_peer(),
+                peer_file_name: String::new(),
+                peer_known: false,
+                connected: false,
+                status_name: String::new(),
+                rename_pending: None,
                 layout,
-                layout0: layout,
-                cfg: cfg.clone(),
-                ips: ips.clone(),
                 drag: None,
-                hover: false,
+                drop: None,
+                hover: Hot::None,
+                press: Hot::None,
+                tracking: false,
+                edit: None,
+                edit_text: String::new(),
+                draft_ip: None,
+                draft_key: None,
+                err_ip: None,
+                err_key: None,
+                err_name: false,
+                sw,
+                sw_t: [None; 3],
+                flash: None,
+                copied: None,
+                popover: false,
+                ips: lan_ips(),
+                frozen: false,
             })
         });
+        poll();
 
-        // 窗口大小：客户区按 DPI 缩放，居中到所在显示器的工作区
-        let mut rc = RECT { left: 0, top: 0, right: scale_px(CLIENT_W, dpi), bottom: scale_px(CLIENT_H, dpi) };
+        // 窗口大小：客户区 820 x 568 按 DPI 缩放，居中到所在显示器的工作区
+        let mut rc = RECT { left: 0, top: 0, right: scale_px(CLIENT_W, s), bottom: scale_px(CLIENT_H, s) };
         let _ = AdjustWindowRectExForDpi(&mut rc, style, false, WINDOW_EX_STYLE(0), dpi);
         let (ww, wh) = (rc.right - rc.left, rc.bottom - rc.top);
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         let (mut x, mut y) = (100, 100);
-        if GetMonitorInfoW(MonitorFromWindow(main, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+        if GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
             let wa = mi.rcWork;
             x = wa.left + ((wa.right - wa.left - ww) / 2).max(0);
             y = wa.top + ((wa.bottom - wa.top - wh) / 2).max(0);
         }
-        let _ = SetWindowPos(main, None, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
-        layout_controls(main, dpi);
-        apply_fonts(main, font, bold);
-
-        // 初始内容
-        if let Some(h) = dlg(main, ID_PEER) {
-            SendMessageW(h, EM_SETLIMITTEXT, Some(WPARAM(200)), None);
-            set_text(h, &cfg.peer);
-        }
-        if let Some(h) = dlg(main, ID_KEY) {
-            SendMessageW(h, EM_SETLIMITTEXT, Some(WPARAM(128)), None);
-            set_text(h, &cfg.key);
-        }
-        if let Some(h) = dlg(main, ID_ADDR) {
-            set_text(h, &if ips.is_empty() { "无".to_string() } else { ips.join("  ") });
-        }
+        let _ = SetWindowPos(hwnd, None, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+        SetTimer(Some(hwnd), TIMER_POLL, 500, None);
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        debug_state();
         refresh();
-
-        let _ = ShowWindow(main, SW_SHOW);
-        if let Some(h) = dlg(main, ID_PEER) {
-            let _ = SetFocus(Some(h));
-        }
 
         let mut msg = MSG::default();
         loop {
@@ -683,404 +1990,386 @@ pub fn run() {
             if r == 0 || r == -1 {
                 break;
             }
-            if !IsDialogMessageW(main, &msg).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+            if msg.message == WM_KEYDOWN && on_key(msg.hwnd, msg.wParam.0 as u16) {
+                continue;
             }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
 
         if let Some(app) = APP.with(|a| a.borrow_mut().take()) {
-            let _ = DeleteObject(app.font.into());
-            let _ = DeleteObject(app.bold.into());
+            let _ = DeleteDC(app.mdc);
+            let _ = DeleteObject(app.brush_fill.into());
+            let _ = DeleteObject(app.brush_card.into());
+        }
+        for ic in icons.into_iter().flatten() {
+            let _ = DestroyIcon(ic);
         }
     }
 }
 
-unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    unsafe {
-        match msg {
-            WM_COMMAND => {
-                let id = (wp.0 & 0xFFFF) as i32;
-                let code = ((wp.0 >> 16) & 0xFFFF) as u32;
-                if code != BN_CLICKED {
-                    return DefWindowProcW(hwnd, msg, wp, lp);
+/// KMLINK_UI：直接呈现某个状态（调试截图用）。
+fn debug_state() {
+    let Ok(v) = std::env::var("KMLINK_UI") else { return };
+    match v.as_str() {
+        "hover" => {
+            with_app(|a| {
+                a.hover = Hot::NameLocal;
+                a.frozen = true;
+            });
+        }
+        "offhover" => {
+            with_app(|a| {
+                a.hover = Hot::NamePeerOff;
+                a.frozen = true;
+            });
+        }
+        "popover" => {
+            with_app(|a| a.popover = true);
+        }
+        "drag" => {
+            with_app(|a| {
+                let g = a.layout_pos(&Layout { side: Side::Left, offset: 0, scale: a.layout.scale });
+                let view = a.fit_view(a.layout_pos(&a.layout));
+                let pos = (g.0 + 190.0, g.1 - 130.0);
+                // m0 = NaN：鼠标移动不改它（截图期间保持这个画面）
+                a.drag = Some(Drag { m0: (f32::NAN, f32::NAN), p0: pos, pos, view, active: true });
+            });
+        }
+        "edit" => {
+            activate(Field::LocalName);
+            if let Some(h) = with_app(|a| a.edits[2]) {
+                set_text(h, "书房台式");
+                unsafe {
+                    SendMessageW(h, EM_SETSEL, Some(WPARAM(4)), Some(LPARAM(4)));
                 }
-                match id {
-                    ID_SAVE => on_save(hwnd),
-                    ID_CANCEL => {
-                        let _ = DestroyWindow(hwnd);
-                    }
-                    ID_MINUS => on_scale(-1),
-                    ID_PLUS => on_scale(1),
-                    ID_COPY => {
-                        if let Some(h) = dlg(hwnd, ID_KEY) {
-                            let key: String = get_text(h).chars().filter(|c| !c.is_whitespace()).collect();
-                            if !copy_text(hwnd, &key) {
-                                crate::log!("设置窗口：复制到剪贴板失败");
-                                warn(hwnd, "复制失败，请重试");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 输入框里的按键：回车提交、Esc 取消、Tab 换框、Ctrl+A 全选。处理了返回 true（不再分发）。
+fn on_key(target: HWND, vk: u16) -> bool {
+    let Some((main, edits, editing, popover)) = with_app(|a| (a.hwnd, a.edits, a.edit, a.popover)) else { return false };
+    let slot = edits.iter().position(|h| *h == target);
+    if slot.is_none() {
+        if target == main {
+            if vk == VK_ESCAPE.0 && popover {
+                with_app(|a| a.popover = false);
+                refresh();
+                return true;
+            }
+            if vk == VK_TAB.0 {
+                activate(Field::Ip);
+                return true;
+            }
+        }
+        return false;
+    }
+    let Some(f) = editing else { return false };
+    unsafe {
+        if vk == VK_RETURN.0 {
+            finish(f, true, true);
+            return true;
+        }
+        if vk == VK_ESCAPE.0 {
+            finish(f, false, false);
+            return true;
+        }
+        if vk == VK_TAB.0 {
+            match f {
+                // 只有两个框：Tab / Shift+Tab 都是在两者之间来回
+                Field::Ip => activate(Field::Key),
+                Field::Key => activate(Field::Ip),
+                _ => finish(f, true, false),
+            }
+            return true;
+        }
+        if vk == b'A' as u16 && GetKeyState(VK_CONTROL.0 as i32) < 0 {
+            SendMessageW(target, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+            return true;
+        }
+    }
+    false
+}
+
+/// 打开某个输入框（先把正在编辑的那个提交掉）。
+fn activate(f: Field) {
+    if let Some(cur) = with_app(|a| a.edit).flatten() {
+        if cur == f {
+            return;
+        }
+        finish(cur, true, false);
+    }
+    let Some(Some((h, text))) = with_app(|a| {
+        if f == Field::PeerName && !a.connected {
+            return None;
+        }
+        a.popover = false;
+        let text = match f {
+            Field::Ip => a.draft_ip.clone().unwrap_or_else(|| a.cfg.peer.trim().to_string()),
+            Field::Key => a.draft_key.clone().unwrap_or_else(|| a.cfg.key.clone()),
+            Field::LocalName => a.local_name(),
+            Field::PeerName => {
+                let n = a.peer_name();
+                if a.peer_known || !a.status_name.is_empty() { n } else { String::new() }
+            }
+        };
+        a.edit = Some(f);
+        a.err_name = false;
+        a.edit_text = text.clone();
+        Some((a.edits[f.slot()], text))
+    }) else {
+        return;
+    };
+    set_text(h, &text);
+    refresh();
+    unsafe {
+        let _ = SetFocus(Some(h));
+        SendMessageW(h, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+    }
+}
+
+/// 写配置（加锁读-改-写，只动自己的字段）。
+fn write_cfg(f: impl FnOnce(&mut Config)) -> bool {
+    let Some(fallback) = with_app(|a| a.cfg.clone()) else { return false };
+    match config::update(&fallback, f) {
+        Ok(c) => {
+            with_app(|a| a.cfg = c);
+            true
+        }
+        Err(e) => {
+            crate::log!("设置窗口：保存失败 {e}");
+            false
+        }
+    }
+}
+
+enum Outcome {
+    Keep,
+    Done,
+    SetPeer(String),
+    SetKey(String),
+    SetName(String),
+    Rename(String),
+}
+
+/// 结束编辑。commit：提交（否则取消）；enter：回车提交（不对就留在框里改）。
+fn finish(f: Field, commit: bool, enter: bool) {
+    let Some((h, main, ips)) = with_app(|a| (a.edits[f.slot()], a.hwnd, a.ips.clone())) else { return };
+    let text = get_text(h);
+    let Some(out) = with_app(|a| {
+        if a.edit != Some(f) {
+            return None;
+        }
+        let out = if !commit {
+            match f {
+                Field::Ip => {
+                    a.draft_ip = None;
+                    a.err_ip = None;
+                }
+                Field::Key => {
+                    a.draft_key = None;
+                    a.err_key = None;
+                }
+                _ => {}
+            }
+            Outcome::Done
+        } else {
+            match f {
+                Field::Ip => {
+                    let bad = if peer_ip(&text).is_err() {
+                        Some("格式不对")
+                    } else if is_own_addr(&text, &ips) {
+                        Some("这是本机地址")
+                    } else {
+                        None
+                    };
+                    match bad {
+                        None => {
+                            a.draft_ip = None;
+                            a.err_ip = None;
+                            Outcome::SetPeer(text.trim().to_string())
+                        }
+                        Some(e) => {
+                            a.err_ip = Some(e);
+                            if enter {
+                                Outcome::Keep
+                            } else {
+                                a.draft_ip = Some(text.trim().to_string());
+                                Outcome::Done
                             }
                         }
                     }
-                    ID_NEWKEY => {
-                        if let Some(h) = dlg(hwnd, ID_KEY) {
-                            set_text(h, &config::new_key_hex());
+                }
+                Field::Key => {
+                    let k: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                    if config::parse_key(&k).is_some() {
+                        a.draft_key = None;
+                        a.err_key = None;
+                        Outcome::SetKey(k.to_ascii_lowercase())
+                    } else {
+                        a.err_key = Some("须为 64 位十六进制");
+                        if enter {
+                            Outcome::Keep
+                        } else {
+                            a.draft_key = Some(k);
+                            Outcome::Done
                         }
                     }
-                    _ => {}
                 }
-                LRESULT(0)
+                Field::LocalName | Field::PeerName => match clean_name(&text) {
+                    Some(n) if f == Field::LocalName => {
+                        if n == a.local_name() {
+                            Outcome::Done
+                        } else {
+                            Outcome::SetName(n)
+                        }
+                    }
+                    Some(n) => {
+                        if !a.connected || n == a.peer_name() {
+                            Outcome::Done
+                        } else {
+                            Outcome::Rename(n)
+                        }
+                    }
+                    None if enter => {
+                        a.err_name = true;
+                        Outcome::Keep
+                    }
+                    None => Outcome::Done,
+                },
             }
-            WM_CTLCOLORSTATIC => {
-                let hdc = HDC(wp.0 as *mut _);
-                let id = GetDlgCtrlID(HWND(lp.0 as *mut _));
-                let fg = if id == ID_PEER_HINT || id == ID_KEY_HINT { C_HINT } else { COLORREF(GetSysColor(COLOR_WINDOWTEXT)) };
-                SetTextColor(hdc, fg);
-                SetBkColor(hdc, COLORREF(GetSysColor(COLOR_WINDOW)));
-                LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
+        };
+        if !matches!(out, Outcome::Keep) {
+            a.edit = None;
+            a.err_name = false;
+        }
+        Some(out)
+    })
+    .flatten() else {
+        return;
+    };
+    match out {
+        Outcome::Keep => {
+            refresh();
+            return;
+        }
+        Outcome::Done => {}
+        Outcome::SetPeer(p) => {
+            let same = with_app(|a| a.cfg.peer.trim() == p).unwrap_or(false);
+            if !same {
+                write_cfg(|c| c.peer = p);
             }
-            WM_DPICHANGED => {
-                let dpi = (wp.0 & 0xFFFF) as u32;
-                let font = make_font(dpi, false);
-                let bold = make_font(dpi, true);
-                let old = with_app(|a| {
-                    a.dpi = dpi;
-                    (std::mem::replace(&mut a.font, font), std::mem::replace(&mut a.bold, bold))
+        }
+        Outcome::SetKey(k) => {
+            write_cfg(|c| c.key = k);
+        }
+        Outcome::SetName(n) => {
+            if write_cfg(|c| c.name = n) {
+                with_app(|a| a.flash = Some((Field::LocalName, Instant::now())));
+            }
+        }
+        Outcome::Rename(n) => {
+            if write_rename_peer(&n) {
+                with_app(|a| {
+                    a.rename_pending = Some((n, Instant::now()));
+                    a.flash = Some((Field::PeerName, Instant::now()));
                 });
-                let r = lp.0 as *const RECT;
-                if !r.is_null() {
-                    let r = *r;
-                    let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
-                }
-                layout_controls(hwnd, dpi);
-                match old {
-                    Some((f, b)) => {
-                        // 先换上新字体，再删旧的
-                        apply_fonts(hwnd, font, bold);
-                        let _ = DeleteObject(f.into());
-                        let _ = DeleteObject(b.into());
-                    }
-                    // 没存进状态（极少见）：控件继续用旧字体，新的删掉
-                    None => {
-                        let _ = DeleteObject(font.into());
-                        let _ = DeleteObject(bold.into());
-                    }
-                }
-                refresh();
-                LRESULT(0)
             }
-            WM_CLOSE => {
-                let _ = DestroyWindow(hwnd);
-                LRESULT(0)
-            }
-            WM_DESTROY => {
-                PostQuitMessage(0);
-                LRESULT(0)
-            }
-            _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
     }
-}
-
-fn on_scale(steps: i32) {
-    with_app(|a| {
-        a.layout.scale = step_scale(a.layout.scale, steps);
-        let (pw, ph) = a.peer_wh();
-        a.layout.offset = clamp_offset(a.mine.bounds(), a.layout.side, pw, ph, a.layout.offset);
-    });
+    // 先把焦点交回主窗口（此时 a.edit 已清空，EN_KILLFOCUS 不会再提交一次），再隐藏
+    unsafe {
+        if windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == h {
+            let _ = SetFocus(Some(main));
+        }
+    }
     refresh();
 }
 
-fn warn(main: HWND, text: &str) {
-    let t = sys::wide(text);
-    let cap = sys::wide(TITLE);
-    unsafe {
-        MessageBoxW(Some(main), PCWSTR(t.as_ptr()), PCWSTR(cap.as_ptr()), MB_OK | MB_ICONWARNING);
-    }
-}
-
-fn on_save(main: HWND) {
-    let peer = dlg(main, ID_PEER).map(get_text).unwrap_or_default();
-    let key: String = dlg(main, ID_KEY).map(get_text).unwrap_or_default().chars().filter(|c| !c.is_whitespace()).collect();
-    if config::parse_key(&key).is_none() {
-        warn(main, "配对密钥应为 64 位十六进制");
-        if let Some(h) = dlg(main, ID_KEY) {
-            unsafe {
-                let _ = SetFocus(Some(h));
-            }
-        }
-        return;
-    }
-    let Some((layout, layout0, opened, ips)) = with_app(|a| (a.layout, a.layout0, a.cfg.clone(), a.ips.clone())) else {
-        return;
-    };
-    let bad_peer = if peer_ip(&peer).is_err() {
-        Some("对方地址格式不对，例：192.168.1.8")
-    } else if is_own_addr(&peer, &ips) {
-        Some("对方 IP 是本机地址，请填另一台的 IP")
-    } else {
-        None
-    };
-    if let Some(text) = bad_peer {
-        warn(main, text);
-        if let Some(h) = dlg(main, ID_PEER) {
-            unsafe {
-                let _ = SetFocus(Some(h));
-            }
-        }
-        return;
-    }
-    // 加锁读-改-写：只改自己负责的字段，主程序期间写入的（含对方同步来的排布）都保留
-    match config::update(&opened, |c| apply_save(c, &peer, key, &layout0, &layout)) {
-        Ok(_) => unsafe {
-            let _ = DestroyWindow(main);
-        },
-        Err(e) => {
-            crate::log!("设置窗口：保存失败 {e}");
-            warn(main, "保存失败");
-        }
-    }
-}
-
-unsafe extern "system" fn canvas_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    unsafe {
-        let mx = (lp.0 & 0xFFFF) as u16 as i16 as i32;
-        let my = ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
-        match msg {
-            WM_ERASEBKGND => LRESULT(1),
-            WM_PAINT => {
-                paint_canvas(hwnd);
-                LRESULT(0)
-            }
-            WM_SETCURSOR if (lp.0 as usize & 0xFFFF) == HTCLIENT => {
-                let busy = with_app(|a| a.hover || a.drag.is_some()).unwrap_or(false);
-                let _ = SetCursor(LoadCursorW(None, if busy { IDC_SIZEALL } else { IDC_ARROW }).ok());
-                LRESULT(1)
-            }
-            WM_LBUTTONDOWN => {
-                let cs = client_size(hwnd);
-                let started = with_app(|a| {
-                    if a.drag.is_some() {
-                        return false;
-                    }
-                    let v = a.fit_view(cs.0, cs.1);
-                    if !a.hit_peer(&v, mx, my) {
-                        return false;
-                    }
-                    let p = a.peer_pos();
-                    a.drag = Some(Drag { m0: (mx, my), p0: p, pos: p, view: v });
-                    true
-                })
-                .unwrap_or(false);
-                if started {
-                    SetCapture(hwnd);
-                    let _ = SetCursor(LoadCursorW(None, IDC_SIZEALL).ok());
-                    refresh();
+/// 每 500ms：连接状态、对方屏幕、配置文件。
+fn poll() {
+    let (connected, status_name) = read_status();
+    let peer = read_peer();
+    let mt = cfg_mtime();
+    let reload = with_app(|a| a.cfg_mtime != mt).unwrap_or(false);
+    let new_cfg = if reload { Config::load() } else { None };
+    let r = with_app(|a| {
+        let before = (a.connected, a.status_name.clone(), a.peer_file_name.clone(), a.peer.clone(), a.rename_pending.is_some());
+        a.connected = connected;
+        a.status_name = status_name;
+        let busy = a.drag.is_some() || a.drop.is_some();
+        if !busy {
+            match peer {
+                Some((n, ms)) => {
+                    a.peer_file_name = n;
+                    a.peer = ms;
+                    a.peer_known = true;
                 }
-                LRESULT(0)
+                None => {
+                    a.peer_known = false;
+                    a.peer = placeholder_peer();
+                }
             }
-            WM_MOUSEMOVE => {
-                let cs = client_size(hwnd);
-                let r = with_app(|a| {
-                    if let Some(d) = a.drag.as_mut() {
-                        d.pos = (d.p0.0 + (mx - d.m0.0) as f64 / d.view.k, d.p0.1 + (my - d.m0.1) as f64 / d.view.k);
-                        (true, true)
-                    } else {
-                        let v = a.fit_view(cs.0, cs.1);
-                        a.hover = a.hit_peer(&v, mx, my);
-                        (false, a.hover)
-                    }
-                });
-                if let Some((dragging, over)) = r {
-                    let _ = SetCursor(LoadCursorW(None, if over { IDC_SIZEALL } else { IDC_ARROW }).ok());
-                    if dragging {
-                        refresh();
+        }
+        if let Some((n, t0)) = &a.rename_pending
+            && (t0.elapsed() > Duration::from_secs(10) || (a.connected && a.status_name == *n) || a.peer_file_name == *n)
+        {
+            a.rename_pending = None;
+        }
+        if reload {
+            a.cfg_mtime = mt;
+            if let Some(c) = new_cfg {
+                let sw = [c.clipboard.enabled, c.clipboard.notify, c.autostart];
+                for i in 0..3 {
+                    if sw[i] != a.sw[i] {
+                        a.sw[i] = sw[i];
+                        a.sw_t[i] = Some(Instant::now());
                     }
                 }
-                LRESULT(0)
-            }
-            WM_LBUTTONUP => {
-                let done = with_app(|a| match a.drag.take() {
-                    Some(d) => {
-                        let (pw, ph) = a.peer_wh();
-                        let (side, offset) = snap(a.mine.bounds(), pw, ph, d.pos.0, d.pos.1);
-                        a.layout.side = side;
-                        a.layout.offset = offset;
-                        true
-                    }
-                    None => false,
-                })
-                .unwrap_or(false);
-                if done {
-                    // 先清掉拖动状态再放开捕获（WM_CAPTURECHANGED 会同步进来）
-                    let _ = ReleaseCapture();
-                    refresh();
+                if !busy {
+                    let mut l = c.layout.layout;
+                    l.scale = sanitize_scale(l.scale);
+                    a.layout = l;
                 }
-                LRESULT(0)
+                a.cfg = c;
             }
-            WM_CAPTURECHANGED => {
-                // 捕获被意外拿走：放弃这次拖动
-                if with_app(|a| a.drag.take().is_some()).unwrap_or(false) {
-                    refresh();
-                }
-                LRESULT(0)
-            }
-            _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
+        let after = (a.connected, a.status_name.clone(), a.peer_file_name.clone(), a.peer.clone(), a.rename_pending.is_some());
+        (a.edit == Some(Field::PeerName) && !a.connected, reload || before != after)
+    });
+    let Some((cancel, changed)) = r else { return };
+    if cancel {
+        finish(Field::PeerName, false, false);
+    }
+    if changed {
+        refresh();
     }
 }
 
-fn client_size(hwnd: HWND) -> (i32, i32) {
-    let mut rc = RECT::default();
-    unsafe {
-        let _ = GetClientRect(hwnd, &mut rc);
+fn write_layout(l: Layout) {
+    write_cfg(|c| apply_layout(c, &l));
+}
+
+fn on_scale(steps: i32) {
+    let l = with_app(|a| {
+        let mut l = a.layout;
+        l.scale = step_scale(l.scale, steps);
+        let pb = a.peer_desk().bounds();
+        let (pw, ph) = (pb.w() as f64 * l.scale, pb.h() as f64 * l.scale);
+        l.offset = clamp_offset(a.mine_desk().bounds(), l.side, pw, ph, l.offset);
+        a.layout = l;
+        l
+    });
+    if let Some(l) = l {
+        write_layout(l);
     }
-    (rc.right - rc.left, rc.bottom - rc.top)
+    refresh();
 }
 
-/// 双缓冲绘制画布。
-fn paint_canvas(hwnd: HWND) {
-    unsafe {
-        let mut ps = PAINTSTRUCT::default();
-        let hdc = BeginPaint(hwnd, &mut ps);
-        let (w, h) = client_size(hwnd);
-        if w > 0 && h > 0 && !hdc.is_invalid() {
-            let mem = CreateCompatibleDC(Some(hdc));
-            let bmp = CreateCompatibleBitmap(hdc, w, h);
-            if !mem.is_invalid() && !bmp.is_invalid() {
-                let old = SelectObject(mem, bmp.into());
-                let rc = RECT { left: 0, top: 0, right: w, bottom: h };
-                let old_brush = SelectObject(mem, GetStockObject(DC_BRUSH));
-                let old_pen = SelectObject(mem, GetStockObject(DC_PEN));
-                SetDCBrushColor(mem, C_BG);
-                FillRect(mem, &rc, HBRUSH(GetStockObject(DC_BRUSH).0));
-                APP.with(|a| {
-                    if let Ok(g) = a.try_borrow()
-                        && let Some(app) = g.as_ref()
-                    {
-                        draw(mem, app, w, h);
-                    }
-                });
-                // 外框
-                SelectObject(mem, GetStockObject(NULL_BRUSH));
-                SelectObject(mem, GetStockObject(DC_PEN));
-                SetDCPenColor(mem, C_FRAME);
-                let _ = Rectangle(mem, 0, 0, w, h);
-                let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
-                // 全部换回原来的对象，再删位图和 DC
-                SelectObject(mem, old_pen);
-                SelectObject(mem, old_brush);
-                SelectObject(mem, old);
-            }
-            if !bmp.is_invalid() {
-                let _ = DeleteObject(bmp.into());
-            }
-            if !mem.is_invalid() {
-                let _ = DeleteDC(mem);
-            }
-        }
-        let _ = EndPaint(hwnd, &ps);
-    }
-}
-
-/// 一块显示器的画布矩形，内缩 1 像素让相邻显示器之间有缝。
-fn box_rect(v: &View, l: f64, t: f64, r: f64, b: f64) -> RECT {
-    let x0 = (v.ox + l * v.k).round() as i32;
-    let y0 = (v.oy + t * v.k).round() as i32;
-    let x1 = (v.ox + r * v.k).round() as i32;
-    let y1 = (v.oy + b * v.k).round() as i32;
-    if x1 - x0 > 4 && y1 - y0 > 4 { RECT { left: x0 + 1, top: y0 + 1, right: x1 - 1, bottom: y1 - 1 } } else { RECT { left: x0, top: y0, right: x1.max(x0 + 1), bottom: y1.max(y0 + 1) } }
-}
-
-unsafe fn draw_box(hdc: HDC, r: &RECT, fill: COLORREF, edge: COLORREF) {
-    unsafe {
-        SelectObject(hdc, GetStockObject(DC_BRUSH));
-        SelectObject(hdc, GetStockObject(DC_PEN));
-        SetDCBrushColor(hdc, fill);
-        SetDCPenColor(hdc, edge);
-        let _ = Rectangle(hdc, r.left, r.top, r.right, r.bottom);
-    }
-}
-
-unsafe fn draw_label(hdc: HDC, r: &RECT, text: &str, color: COLORREF) {
-    let mut t = wide_nz(text);
-    let mut rc = *r;
-    unsafe {
-        SetTextColor(hdc, color);
-        DrawTextW(hdc, &mut t, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-    }
-}
-
-fn largest(rs: &[RECT]) -> Option<&RECT> {
-    rs.iter().max_by_key(|r| (r.right - r.left) as i64 * (r.bottom - r.top) as i64)
-}
-
-fn draw(hdc: HDC, a: &App, w: i32, h: i32) {
-    let v = match &a.drag {
-        Some(d) => d.view,
-        None => a.fit_view(w, h),
-    };
-    unsafe {
-        let old_font = SelectObject(hdc, a.font.into());
-        SetBkMode(hdc, TRANSPARENT);
-
-        // 本机
-        let mine: Vec<RECT> = a.mine.monitors.iter().map(|m| box_rect(&v, m.l as f64, m.t as f64, m.r as f64, m.b as f64)).collect();
-        for r in &mine {
-            draw_box(hdc, r, C_MINE_FILL, C_MINE_EDGE);
-        }
-        if let Some(r) = largest(&mine) {
-            draw_label(hdc, r, "本机", C_TEXT);
-        }
-
-        // 对方：各显示器相对对方外接矩形的位置 × scale，放到 peer_pos
-        let pb = a.peer.bounds();
-        let s = sanitize_scale(a.layout.scale);
-        let (pl, pt) = a.peer_pos();
-        let edge = if a.drag.is_some() { C_PEER_DRAG } else { C_PEER_EDGE };
-        let peer: Vec<RECT> = a
-            .peer
-            .monitors
-            .iter()
-            .map(|m| {
-                let l = pl + (m.l - pb.l) as f64 * s;
-                let t = pt + (m.t - pb.t) as f64 * s;
-                box_rect(&v, l, t, l + m.w() as f64 * s, t + m.h() as f64 * s)
-            })
-            .collect();
-        for r in &peer {
-            draw_box(hdc, r, C_PEER_FILL, edge);
-        }
-        if let Some(r) = largest(&peer) {
-            let name = if a.peer_name.trim().is_empty() { "对方" } else { a.peer_name.trim() };
-            draw_label(hdc, r, name, C_TEXT);
-        }
-
-        // 拖动中：虚线框标出松手后的吸附位置
-        if a.drag.is_some() {
-            let (l, t, r, b) = a.projected().peer_rect_in_mine(&a.mine, &a.peer);
-            let g = box_rect(&v, l, t, r, b);
-            let pen = CreatePen(PS_DOT, 1, C_GHOST);
-            if !pen.is_invalid() {
-                let old = SelectObject(hdc, pen.into());
-                SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                let _ = Rectangle(hdc, g.left - 1, g.top - 1, g.right + 1, g.bottom + 1);
-                SelectObject(hdc, old);
-                let _ = DeleteObject(pen.into());
-            }
-        }
-
-        if !a.peer_known {
-            let m = a.px(10);
-            let mut rc = RECT { left: m, top: a.px(6), right: w - m, bottom: a.px(28) };
-            let mut t = wide_nz("对方未连接，按默认尺寸");
-            SetTextColor(hdc, C_HINT);
-            DrawTextW(hdc, &mut t, &mut rc, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
-        }
-        SelectObject(hdc, old_font);
-    }
-}
-
-/// 复制文字到剪贴板（密钥不进 Win+V 历史、不上云剪贴板）。先分配好内存再打开剪贴板；
+/// 复制文字到剪贴板（不进 Win+V 历史、不上云剪贴板）。先分配好内存再打开剪贴板；
 /// 剪贴板被别的程序占着时短暂重试（共约 0.5 秒）。
 fn copy_text(owner: HWND, s: &str) -> bool {
     let w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1095,7 +2384,7 @@ fn copy_text(owner: HWND, s: &str) -> bool {
                 break;
             }
             if i < 24 {
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(Duration::from_millis(20));
             }
         }
         let mut ok = false;
@@ -1139,55 +2428,453 @@ unsafe fn global_from(data: &[u16]) -> Option<HGLOBAL> {
     }
 }
 
-/// 本机 IPv4：已连接、非回环网卡上的单播地址（跳过 169.254 自动地址）。
-fn local_ipv4() -> Vec<String> {
-    use windows::Win32::NetworkManagement::IpHelper::{
-        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, GET_ADAPTERS_ADDRESSES_FLAGS, GetAdaptersAddresses,
-        IF_TYPE_SOFTWARE_LOOPBACK, IP_ADAPTER_ADDRESSES_LH,
-    };
-    use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
-    use windows::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
+fn mouse_xy(lp: LPARAM) -> (i32, i32) {
+    ((lp.0 & 0xFFFF) as u16 as i16 as i32, ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32)
+}
 
-    const ERROR_BUFFER_OVERFLOW: u32 = 111;
-    let flags = GET_ADAPTERS_ADDRESSES_FLAGS(GAA_FLAG_SKIP_ANYCAST.0 | GAA_FLAG_SKIP_MULTICAST.0 | GAA_FLAG_SKIP_DNS_SERVER.0);
-    let mut out: Vec<String> = Vec::new();
-    let mut size: u32 = 16 * 1024;
-    for _ in 0..4 {
-        // u64 保证 8 字节对齐
-        let mut buf = vec![0u64; (size as usize).div_ceil(8).max(1)];
-        let p = buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
-        let r = unsafe { GetAdaptersAddresses(AF_INET.0 as u32, flags, None, Some(p), &mut size) };
-        if r == ERROR_BUFFER_OVERFLOW {
-            continue;
+fn on_click(hot: Hot) {
+    let Some(main) = with_app(|a| a.hwnd) else { return };
+    match hot {
+        Hot::Switch(i) => {
+            let v = with_app(|a| {
+                a.sw[i] = !a.sw[i];
+                a.sw_t[i] = Some(Instant::now());
+                a.sw[i]
+            });
+            if let Some(v) = v {
+                write_cfg(|c| match i {
+                    0 => c.clipboard.enabled = v,
+                    1 => c.clipboard.notify = v,
+                    _ => c.autostart = v,
+                });
+            }
         }
-        if r != 0 {
-            crate::log!("GetAdaptersAddresses 失败：{r}");
-            return out;
-        }
-        let mut a = p as *const IP_ADAPTER_ADDRESSES_LH;
-        while !a.is_null() {
-            let ad = unsafe { &*a };
-            if ad.OperStatus == IfOperStatusUp && ad.IfType != IF_TYPE_SOFTWARE_LOOPBACK {
-                let mut u = ad.FirstUnicastAddress as *const windows::Win32::NetworkManagement::IpHelper::IP_ADAPTER_UNICAST_ADDRESS_LH;
-                while !u.is_null() {
-                    let ua = unsafe { &*u };
-                    let sa = ua.Address.lpSockaddr;
-                    if !sa.is_null() && unsafe { (*sa).sa_family } == AF_INET {
-                        let sin = unsafe { &*(sa as *const SOCKADDR_IN) };
-                        let ip = std::net::Ipv4Addr::from(unsafe { sin.sin_addr.S_un.S_addr }.to_ne_bytes());
-                        let s = ip.to_string();
-                        if !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified() && !out.contains(&s) {
-                            out.push(s);
-                        }
-                    }
-                    u = ua.Next;
+        Hot::Minus => on_scale(-1),
+        Hot::Plus => on_scale(1),
+        Hot::CopyKey | Hot::CopyIp => {
+            let t = with_app(|a| if hot == Hot::CopyKey { a.cfg.key.clone() } else { a.ips.first().cloned().unwrap_or_default() });
+            if let Some(t) = t
+                && !t.is_empty()
+            {
+                if copy_text(main, &t) {
+                    with_app(|a| a.copied = Some((hot, Instant::now())));
+                } else {
+                    crate::log!("设置窗口：复制到剪贴板失败");
                 }
             }
-            a = ad.Next;
         }
-        return out;
+        Hot::NewKey => {
+            with_app(|a| a.popover = !a.popover);
+        }
+        Hot::PopCancel => {
+            with_app(|a| a.popover = false);
+        }
+        Hot::PopOk => {
+            with_app(|a| {
+                a.popover = false;
+                a.draft_key = None;
+                a.err_key = None;
+            });
+            write_cfg(|c| c.key = config::new_key_hex());
+        }
+        _ => {}
     }
-    out
+    refresh();
+}
+
+fn on_down(hwnd: HWND, x: f32, y: f32) {
+    let Some((hot, editing, popover)) = with_app(|a| {
+        let sc = scene(a);
+        (hit(a, &sc, x, y), a.edit, a.popover)
+    }) else {
+        return;
+    };
+    // 点到别处：先提交正在编辑的
+    if let Some(f) = editing {
+        let same = matches!((f, hot), (Field::Ip, Hot::Ip) | (Field::Key, Hot::Key));
+        if !same {
+            finish(f, true, false);
+        }
+    }
+    unsafe {
+        if windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() != hwnd && !matches!(hot, Hot::Ip | Hot::Key) {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+    if popover && !matches!(hot, Hot::PopOk | Hot::PopCancel | Hot::Pop | Hot::NewKey) {
+        with_app(|a| a.popover = false);
+        refresh();
+        return;
+    }
+    match hot {
+        Hot::Peer | Hot::NamePeerOff => {
+            let ok = with_app(|a| {
+                let p = a.layout_pos(&a.layout);
+                let view = a.fit_view(p);
+                a.drag = Some(Drag { m0: (x, y), p0: p, pos: p, view, active: false });
+            });
+            if ok.is_some() {
+                unsafe {
+                    SetCapture(hwnd);
+                }
+            }
+        }
+        Hot::Ip => activate(Field::Ip),
+        Hot::Key => activate(Field::Key),
+        Hot::NameLocal => activate(Field::LocalName),
+        Hot::NamePeer => activate(Field::PeerName),
+        Hot::None | Hot::Pop => {}
+        h => {
+            with_app(|a| a.press = h);
+        }
+    }
+    refresh();
+}
+
+fn on_move(hwnd: HWND, x: f32, y: f32) {
+    let track = with_app(|a| {
+        if let Some(d) = a.drag.as_mut() {
+            if d.m0.0.is_nan() {
+                return (false, true);
+            }
+            let (dx, dy) = (x - d.m0.0, y - d.m0.1);
+            if !d.active && dx.abs().max(dy.abs()) < 3.0 {
+                return (false, true);
+            }
+            d.active = true;
+            let k = d.view.k;
+            let mut pos = (d.p0.0 + dx as f64 / k, d.p0.1 + dy as f64 / k);
+            // 别拖出舞台：对方整组留在舞台里（不盖住下面的说明行）；比舞台还大就居中
+            let (pw, ph) = a.peer_wh();
+            let v = a.drag.as_ref().map(|d| d.view).unwrap_or(View { k: 1.0, ox: 0.0, oy: 0.0 });
+            let keep = |p: f64, len: f64, lo: f64, hi: f64, o: f64| {
+                let x = o + p * v.k;
+                let w = len * v.k;
+                let nx = if w >= hi - lo { lo + (hi - lo - w) / 2.0 } else { x.clamp(lo, hi - w) };
+                p + (nx - x) / v.k
+            };
+            pos.0 = keep(pos.0, pw, 8.0, CLIENT_W as f64 - 8.0, v.ox);
+            pos.1 = keep(pos.1, ph, 8.0, AREA.y as f64 + AREA.h as f64 + 4.0, v.oy);
+            if let Some(d) = a.drag.as_mut() {
+                d.pos = pos;
+            }
+            a.hover = Hot::None;
+            return (true, true);
+        }
+        if a.frozen {
+            return (false, true);
+        }
+        let sc = scene(a);
+        let h = hit(a, &sc, x, y);
+        let changed = h != a.hover;
+        a.hover = h;
+        let need_track = !a.tracking;
+        a.tracking = true;
+        (changed, !need_track)
+    });
+    let Some((changed, tracked)) = track else { return };
+    if !tracked {
+        let mut t = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+        unsafe {
+            let _ = TrackMouseEvent(&mut t);
+        }
+    }
+    if changed {
+        refresh();
+    }
+}
+
+fn on_up(x: f32, y: f32) {
+    let r = with_app(|a| {
+        if let Some(d) = a.drag.take() {
+            if d.active {
+                let (pw, ph) = a.peer_wh();
+                let (side, offset) = snap(a.mine_desk().bounds(), pw, ph, d.pos.0, d.pos.1);
+                a.layout.side = side;
+                a.layout.offset = offset;
+                a.drop = Some(DropAnim { from: d.pos, view0: d.view, t0: Instant::now() });
+            }
+            return (true, Hot::None);
+        }
+        let sc = scene(a);
+        let h = hit(a, &sc, x, y);
+        let pressed = std::mem::replace(&mut a.press, Hot::None);
+        (false, if pressed == h { h } else { Hot::None })
+    });
+    match r {
+        Some((true, _)) => unsafe {
+            let _ = ReleaseCapture();
+            refresh();
+        },
+        Some((false, h)) if h != Hot::None => on_click(h),
+        _ => {}
+    }
+}
+
+fn on_timer(hwnd: HWND, id: usize) {
+    if id == TIMER_POLL {
+        poll();
+        return;
+    }
+    let r = with_app(|a| {
+        let mut done = None;
+        if let Some(d) = &a.drop
+            && ms_since(d.t0) >= DROP_MS
+        {
+            a.drop = None;
+            done = Some(a.layout);
+        }
+        if a.flash.is_some_and(|(_, t)| ms_since(t) > FLASH_MS + FADE_MS) {
+            a.flash = None;
+        }
+        (done, a.animating())
+    });
+    let Some((done, anim)) = r else { return };
+    if let Some(l) = done {
+        write_layout(l);
+        sync_edits();
+    }
+    if !anim {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_ANIM);
+        }
+    }
+    invalidate(hwnd);
+}
+
+fn on_paint(hwnd: HWND) {
+    unsafe {
+        let mut ps = PAINTSTRUCT::default();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        let mut rc = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rc);
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        if w > 0 && h > 0 && !hdc.is_invalid() {
+            with_app(|a| {
+                let mut surf = match a.surf.take() {
+                    Some(s) if s.w == w && s.h == h => Some(s),
+                    _ => Surface::new(w, h),
+                };
+                if let Some(sf) = surf.as_mut() {
+                    let sc = scene(a);
+                    let mut p = Painter::new(sf, a.s);
+                    render(&mut p, a, &sc);
+                    sf.blit(hdc);
+                }
+                a.surf = surf;
+            });
+        }
+        let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+/// 主题变了：重读、换标题栏颜色和输入框底色。
+fn on_theme(hwnd: HWND) {
+    let th = if system_dark() { DARK } else { LIGHT };
+    let old = with_app(|a| {
+        if a.th.dark == th.dark {
+            return None;
+        }
+        a.th = th;
+        let old = (a.brush_fill, a.brush_card);
+        unsafe {
+            a.brush_fill = CreateSolidBrush(th.fill.colorref());
+            a.brush_card = CreateSolidBrush(th.card.colorref());
+        }
+        Some((old, a.edits))
+    })
+    .flatten();
+    if let Some(((b1, b2), edits)) = old {
+        apply_caption(hwnd, &th);
+        unsafe {
+            for e in edits {
+                let _ = InvalidateRect(Some(e), None, true);
+            }
+            let _ = DeleteObject(b1.into());
+            let _ = DeleteObject(b2.into());
+        }
+        refresh();
+    }
+}
+
+fn on_dpi(hwnd: HWND, dpi: u32, suggested: *const RECT) {
+    let s = dpi as f32 / 96.0;
+    let fonts = Fonts::new(s);
+    let edits = with_app(|a| {
+        a.s = s;
+        a.edit_pos = [None; 3];
+        let old = std::mem::replace(&mut a.fonts, fonts);
+        let e = a.edits;
+        let hf = [a.fonts.input.h, a.fonts.mono.h, a.fonts.name.h];
+        (e, hf, old)
+    });
+    if let Some((edits, hf, old)) = edits {
+        unsafe {
+            for (e, f) in edits.iter().zip(hf) {
+                SendMessageW(*e, WM_SETFONT, Some(WPARAM(f.0 as usize)), Some(LPARAM(1)));
+            }
+        }
+        drop(old); // 控件已换上新字体，旧的可以删了
+    }
+    unsafe {
+        if !suggested.is_null() {
+            let r = *suggested;
+            let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+    refresh();
+}
+
+unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        let s = with_app(|a| a.s).unwrap_or(1.0);
+        let logical = |lp: LPARAM| {
+            let (x, y) = mouse_xy(lp);
+            (x as f32 / s, y as f32 / s)
+        };
+        match msg {
+            WM_PAINT => {
+                on_paint(hwnd);
+                LRESULT(0)
+            }
+            WM_ERASEBKGND => LRESULT(1),
+            WM_SIZE => {
+                if wp.0 != SIZE_MINIMIZED {
+                    invalidate(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE => {
+                let (x, y) = logical(lp);
+                on_move(hwnd, x, y);
+                LRESULT(0)
+            }
+            WM_MOUSELEAVE => {
+                let changed = with_app(|a| {
+                    a.tracking = false;
+                    std::mem::replace(&mut a.hover, Hot::None) != Hot::None
+                });
+                if changed == Some(true) {
+                    refresh();
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN => {
+                let (x, y) = logical(lp);
+                on_down(hwnd, x, y);
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                let (x, y) = logical(lp);
+                on_up(x, y);
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
+                // 捕获被意外拿走：放弃这次拖动
+                if with_app(|a| a.drag.take().is_some()).unwrap_or(false) {
+                    refresh();
+                }
+                LRESULT(0)
+            }
+            WM_SETCURSOR if (lp.0 as usize & 0xFFFF) == HTCLIENT => {
+                let c = with_app(|a| {
+                    if a.drag.as_ref().is_some_and(|d| d.active) {
+                        return IDC_SIZEALL;
+                    }
+                    match a.hover {
+                        Hot::NameLocal | Hot::NamePeer => IDC_HAND,
+                        Hot::Peer => IDC_SIZEALL,
+                        Hot::Ip | Hot::Key => IDC_IBEAM,
+                        _ => IDC_ARROW,
+                    }
+                })
+                .unwrap_or(IDC_ARROW);
+                let _ = SetCursor(LoadCursorW(None, c).ok());
+                LRESULT(1)
+            }
+            WM_TIMER => {
+                on_timer(hwnd, wp.0);
+                LRESULT(0)
+            }
+            WM_COMMAND => {
+                let id = (wp.0 & 0xFFFF) as i32;
+                let code = ((wp.0 >> 16) & 0xFFFF) as u32;
+                if let Some(slot) = EDIT_IDS.iter().position(|i| *i == id) {
+                    let ctl = HWND(lp.0 as *mut _);
+                    if code == EN_CHANGE {
+                        let text = get_text(ctl);
+                        let r = with_app(|a| {
+                            let f = a.edit.filter(|f| f.slot() == slot)?;
+                            match f {
+                                Field::Ip => a.err_ip = None,
+                                Field::Key => a.err_key = None,
+                                _ => {
+                                    a.err_name = false;
+                                    a.edit_text = text;
+                                }
+                            }
+                            Some(())
+                        });
+                        if r.flatten().is_some() {
+                            refresh();
+                        }
+                    } else if code == EN_KILLFOCUS
+                        && let Some(Some(f)) = with_app(|a| a.edit.filter(|f| f.slot() == slot))
+                    {
+                        finish(f, true, false);
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_CTLCOLOREDIT => {
+                let hdc = HDC(wp.0 as *mut _);
+                let ctl = HWND(lp.0 as *mut _);
+                match with_app(|a| {
+                    let name = ctl == a.edits[2];
+                    (if name { a.th.card } else { a.th.fill }, a.th.fg, if name { a.brush_card } else { a.brush_fill })
+                }) {
+                    Some((bg, fg, br)) => {
+                        SetTextColor(hdc, fg.colorref());
+                        SetBkColor(hdc, bg.colorref());
+                        LRESULT(br.0 as isize)
+                    }
+                    None => DefWindowProcW(hwnd, msg, wp, lp),
+                }
+            }
+            WM_DPICHANGED => {
+                on_dpi(hwnd, (wp.0 & 0xFFFF) as u32, lp.0 as *const RECT);
+                LRESULT(0)
+            }
+            WM_SETTINGCHANGE => {
+                let p = lp.0 as *const u16;
+                if !p.is_null() && PCWSTR(p).to_string().is_ok_and(|s| s == "ImmersiveColorSet") {
+                    on_theme(hwnd);
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_DISPLAYCHANGE => {
+                let mine = local_monitors();
+                with_app(|a| a.mine = mine);
+                refresh();
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_CLOSE => {
+                if let Some(Some(f)) = with_app(|a| a.edit) {
+                    finish(f, true, false);
+                }
+                if let Some((true, l)) = with_app(|a| (a.drop.take().is_some(), a.layout)) {
+                    write_layout(l);
+                }
+                let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                PostQuitMessage(0);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wp, lp),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1266,21 +2953,19 @@ mod tests {
     }
 
     #[test]
-    fn save_keeps_layout_when_untouched() {
+    fn layout_write_only_when_changed() {
         let l0 = Layout { side: Side::Right, offset: 0, scale: 1.0 };
         assert!(!layout_changed(&l0, &l0));
         assert!(layout_changed(&l0, &Layout { offset: 1, ..l0 }));
         assert!(layout_changed(&l0, &Layout { side: Side::Left, ..l0 }));
         assert!(layout_changed(&l0, &Layout { scale: 1.05, ..l0 }));
 
-        // 磁盘上已有对方同步来的排布；只改 IP/密钥不能动它和 rev
+        // 磁盘上已是这个排布（比如对方刚同步来的）：不动 rev
         let theirs = Layout { side: Side::Left, offset: 200, scale: 1.0 };
         let mut c = Config::default();
         c.layout.layout = theirs;
         c.layout.rev = 123;
-        apply_save(&mut c, " 10.0.0.2 ", "ab".repeat(32), &l0, &l0);
-        assert_eq!(c.peer, "10.0.0.2");
-        assert_eq!(c.key, "ab".repeat(32));
+        apply_layout(&mut c, &theirs);
         assert_eq!(c.layout.layout, theirs);
         assert_eq!(c.layout.rev, 123);
 
@@ -1288,7 +2973,7 @@ mod tests {
         let mine = Layout { side: Side::Bottom, offset: -10, scale: 1.0 };
         let far = config::now_ms() + 10_000_000;
         c.layout.rev = far;
-        apply_save(&mut c, "", "ab".repeat(32), &l0, &mine);
+        apply_layout(&mut c, &mine);
         assert_eq!(c.layout.layout, mine);
         assert_eq!(c.layout.rev, far + 1);
     }
@@ -1347,10 +3032,105 @@ mod tests {
 
     #[test]
     fn status_texts() {
-        assert_eq!(status_text(&Layout { side: Side::Right, offset: 120, scale: 1.0 }), "对方在右侧，下移 120 像素");
-        assert_eq!(status_text(&Layout { side: Side::Left, offset: 0, scale: 1.0 }), "对方在左侧，对齐");
-        assert_eq!(status_text(&Layout { side: Side::Left, offset: -30, scale: 1.0 }), "对方在左侧，上移 30 像素");
-        assert_eq!(status_text(&Layout { side: Side::Top, offset: 5, scale: 1.0 }), "对方在上方，右移 5 像素");
-        assert_eq!(status_text(&Layout { side: Side::Bottom, offset: -7, scale: 1.0 }), "对方在下方，左移 7 像素");
+        assert_eq!(status_text(&Layout { side: Side::Right, offset: 120, scale: 1.0 }), "在本机右侧 · 下移 120 像素");
+        assert_eq!(status_text(&Layout { side: Side::Left, offset: 0, scale: 1.0 }), "在本机左侧 · 对齐");
+        assert_eq!(status_text(&Layout { side: Side::Left, offset: -30, scale: 1.0 }), "在本机左侧 · 上移 30 像素");
+        assert_eq!(status_text(&Layout { side: Side::Top, offset: 5, scale: 1.0 }), "在本机上方 · 右移 5 像素");
+        assert_eq!(status_text(&Layout { side: Side::Bottom, offset: -7, scale: 1.0 }), "在本机下方 · 左移 7 像素");
+    }
+
+    #[test]
+    fn names() {
+        assert_eq!(clean_name("  书房台式 ").as_deref(), Some("书房台式"));
+        assert_eq!(clean_name("   "), None);
+        assert_eq!(clean_name(""), None);
+        assert_eq!(clean_name(&"字".repeat(16)).as_deref(), Some("字".repeat(16).as_str()));
+        assert_eq!(clean_name(&"字".repeat(17)), None);
+        assert_eq!(clean_name("a\tb"), None);
+    }
+
+    #[test]
+    fn key_display() {
+        let k = "982e0241aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2895a8b";
+        assert_eq!(short_key(k), "982e0241…2895a8b");
+        assert_eq!(short_key("abc"), "abc");
+    }
+
+    #[test]
+    fn lan_filter() {
+        assert!(usable_lan_ip("192.168.1.8".parse().unwrap()));
+        assert!(usable_lan_ip("10.200.96.48".parse().unwrap()));
+        assert!(!usable_lan_ip("127.0.0.1".parse().unwrap()));
+        assert!(!usable_lan_ip("169.254.3.4".parse().unwrap()));
+        assert!(!usable_lan_ip("198.18.0.1".parse().unwrap()));
+        assert!(!usable_lan_ip("198.19.255.1".parse().unwrap()));
+        assert!(usable_lan_ip("198.20.0.1".parse().unwrap()));
+        assert!(!usable_lan_ip("0.0.0.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn resolution_text() {
+        let r = Rect::new(0, 0, 3840, 2160);
+        assert_eq!(res_text(&r, Some(144)), "3840×2160 · 150%");
+        assert_eq!(res_text(&r, Some(96)), "3840×2160 · 100%");
+        assert_eq!(res_text(&r, None), "3840×2160");
+    }
+
+    #[test]
+    fn peer_file() {
+        let (n, ms) = parse_peer(r#"{"name":"WiFi电脑","monitors":[{"l":0,"t":0,"r":2560,"b":1600}],"dpis":[144]}"#).unwrap();
+        assert_eq!(n, "WiFi电脑");
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].dpi, Some(144));
+        assert!(ms[0].primary);
+        // 老版本：没有 dpis；dpis 比显示器少
+        let (_, ms) = parse_peer(r#"{"name":"b","monitors":[{"l":-1920,"t":0,"r":0,"b":1080},{"l":0,"t":0,"r":2560,"b":1440}]}"#).unwrap();
+        assert_eq!(ms[0].dpi, None);
+        assert!(!ms[0].primary && ms[1].primary);
+        let (_, ms) = parse_peer(r#"{"name":"b","monitors":[{"l":0,"t":0,"r":10,"b":10},{"l":10,"t":0,"r":20,"b":10}],"dpis":[120]}"#).unwrap();
+        assert_eq!((ms[0].dpi, ms[1].dpi), (Some(120), None));
+        assert!(parse_peer(r#"{"name":"b","monitors":[]}"#).is_none());
+        assert!(parse_peer("garbage").is_none());
+    }
+
+    #[test]
+    fn status_file() {
+        let s = r#"{"pid":1234,"connected":true,"peer_name":"WiFi电脑","peer_addr":"10.0.0.2:47900","paused":false,"t":1}"#;
+        assert_eq!(parse_status(s), Some((1234, true, "WiFi电脑".to_string())));
+        assert_eq!(parse_status(r#"{"pid":5,"connected":false}"#), Some((5, false, String::new())));
+        assert_eq!(parse_status("{}"), None);
+        assert!(!pid_alive(0));
+        assert!(pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn contacts() {
+        // 本机 3840x2160，对方 2560x1600 在左侧下移 416：相接 416..2016
+        let mine = [Rect::new(0, 0, 3840, 2160)];
+        let peer = [(-2560.0, 416.0, 0.0, 2016.0)];
+        let (line, segs) = contact_segments(&mine, &peer, peer[0], Side::Left);
+        assert_eq!(line, 0.0);
+        assert_eq!(segs, vec![(416.0, 2016.0)]);
+        // 本机两块（右边那块矮），对方在右侧：只有右边那块的右边缘算
+        let mine = [Rect::new(0, 0, 3840, 2160), Rect::new(3840, 540, 5760, 1620)];
+        let peer = [(5760.0, 0.0, 8320.0, 1600.0)];
+        let (line, segs) = contact_segments(&mine, &peer, peer[0], Side::Right);
+        assert_eq!(line, 5760.0);
+        assert_eq!(segs, vec![(540.0, 1600.0)]);
+        // 在下方，错开到不相交
+        let mine = [Rect::new(0, 0, 100, 100)];
+        let peer = [(200.0, 100.0, 300.0, 200.0)];
+        assert!(contact_segments(&mine, &peer, peer[0], Side::Bottom).1.is_empty());
+    }
+
+    #[test]
+    fn adjacency_and_primary() {
+        let a = Rect::new(0, 0, 100, 100);
+        let b = Rect::new(100, 20, 200, 80);
+        assert_eq!(adjacent(&a, &[a, b]), [false, false, true, false]);
+        assert_eq!(adjacent(&b, &[a, b]), [true, false, false, false]);
+        let mut ms = vec![Mon { r: b, dpi: None, primary: false }, Mon { r: a, dpi: None, primary: false }];
+        fix_primary(&mut ms);
+        assert!(!ms[0].primary && ms[1].primary);
     }
 }
