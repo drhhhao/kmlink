@@ -7,7 +7,7 @@
 //!   rename_peer.json 设置窗口写（给对方改名）：{name, t}。主程序每秒看一次，读了就删；连着且 t 在 10 秒内才发给对方。
 //! 名字（本机、对方）：去掉首尾空白，不能为空，最多 NAME_MAX 个字符。
 
-use crate::geom::{Desk, Layout};
+use crate::geom::{Desk, Layout, Side};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -30,6 +30,9 @@ pub struct Config {
     pub audio: AudioCfg,
     /// 开机自启（写 HKCU\...\Run）。
     pub autostart: bool,
+    /// 本机编号（设置窗口舞台上的大数字、声音“1 / 2”）：1 或 2，0 = 还没定。第一次连上时按当时的排布定
+    /// （左边或上边那台是 1），之后不再跟着排布变；两台在 Hello 里互报，对不上时自动纠正（resolve_num）。
+    pub num: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -185,6 +188,41 @@ impl AudioCfg {
 }
 
 #[cfg(test)]
+mod num_tests {
+    use super::*;
+
+    #[test]
+    fn numbers_agree_on_both_sides() {
+        // 都没定：按排布（两台看到的排布互为镜像）
+        assert_eq!(resolve_num(0, 0, Side::Right, 1, 2), 1);
+        assert_eq!(resolve_num(0, 0, Side::Left, 2, 1), 2);
+        assert_eq!(resolve_num(0, 0, Side::Bottom, 1, 2), 1);
+        // 定了就不跟排布变
+        assert_eq!(resolve_num(2, 1, Side::Right, 1, 2), 2);
+        assert_eq!(resolve_num(1, 0, Side::Left, 1, 2), 1);
+        // 本机没定：取对方的另一个
+        assert_eq!(resolve_num(0, 1, Side::Right, 1, 2), 2);
+        // 撞号：id 小的保留
+        let (a, b) = (resolve_num(1, 1, Side::Right, 5, 9), resolve_num(1, 1, Side::Left, 9, 5));
+        assert_eq!((a, b), (1, 2));
+        // 坏值当没定
+        assert_eq!(resolve_num(7, 0, Side::Left, 1, 2), 2);
+    }
+
+    #[test]
+    fn audio_slots_map_to_own_view() {
+        for me_one in [true, false] {
+            for k in 0..4 {
+                assert_eq!(audio_mode_slot(audio_slot_mode(k, me_one), me_one), k);
+            }
+        }
+        assert_eq!(audio_slot_mode(1, true), AudioMode::Here);
+        assert_eq!(audio_slot_mode(1, false), AudioMode::There);
+        assert_eq!(audio_mode_slot(AudioMode::Here, false), 2);
+    }
+}
+
+#[cfg(test)]
 mod audio_cfg_tests {
     use super::*;
 
@@ -231,8 +269,70 @@ impl Default for Config {
             clipboard: ClipCfg::default(),
             audio: AudioCfg::default(),
             autostart: false,
+            num: 0,
         }
     }
+}
+
+impl Config {
+    /// 本机是不是 1 号：编号定了按编号；还没定（没连上过）按排布临时算（对方在右边或下边 = 本机是 1）。
+    pub fn me_one(&self) -> bool {
+        match self.num {
+            1 => true,
+            2 => false,
+            _ => matches!(self.layout.layout.side, Side::Right | Side::Bottom),
+        }
+    }
+}
+
+/// 两台的编号（Hello 里互报）：已定的不变；本机没定就取对方的另一个，都没定按排布（对方在右/下 = 本机 1）；
+/// 两台撞号（比如一台重装过）由 id 小的那台保留，另一台改成另一个号。两台算出来的结果一致。
+pub fn resolve_num(mine: u8, theirs: u8, side: Side, my_id: u64, peer_id: u64) -> u8 {
+    let ok = |n: u8| n == 1 || n == 2;
+    match (ok(mine), ok(theirs)) {
+        (true, true) if mine == theirs => {
+            if my_id < peer_id {
+                mine
+            } else {
+                3 - mine
+            }
+        }
+        (true, _) => mine,
+        (false, true) => 3 - theirs,
+        (false, false) => {
+            if matches!(side, Side::Right | Side::Bottom) {
+                1
+            } else {
+                2
+            }
+        }
+    }
+}
+
+/// 声音分段（设置窗口、托盘共用）：0 关、1 = 1 号放、2 = 2 号放、3 两台。配置里仍存本机视角的 here/there。
+pub fn audio_slot_mode(slot: usize, me_one: bool) -> AudioMode {
+    match slot {
+        1 => {
+            if me_one {
+                AudioMode::Here
+            } else {
+                AudioMode::There
+            }
+        }
+        2 => {
+            if me_one {
+                AudioMode::There
+            } else {
+                AudioMode::Here
+            }
+        }
+        3 => AudioMode::Both,
+        _ => AudioMode::Off,
+    }
+}
+
+pub fn audio_mode_slot(m: AudioMode, me_one: bool) -> usize {
+    (0..4).find(|&k| audio_slot_mode(k, me_one) == m).unwrap_or(0)
 }
 
 impl Default for LayoutCfg {
@@ -275,6 +375,31 @@ pub fn status_path() -> PathBuf {
 /// 设置窗口要给对方改名（主程序读了就删）。
 pub fn rename_peer_path() -> PathBuf {
     dir().join("rename_peer.json")
+}
+
+/// 设置窗口让主程序做的更新动作（"check" / "update"）+ 时间，主程序每秒取走。
+pub fn update_cmd_path() -> PathBuf {
+    dir().join("update_cmd.json")
+}
+
+#[derive(Serialize, Deserialize)]
+struct UpdateCmd {
+    cmd: String,
+    t: u64,
+}
+
+#[allow(dead_code)] // 设置窗口用
+pub fn update_cmd_json(cmd: &str, t: u64) -> String {
+    serde_json::to_string(&UpdateCmd { cmd: cmd.into(), t }).unwrap_or_default()
+}
+
+/// 主程序每秒调一次：有 update_cmd.json 就取走（删掉），没过期（RENAME_TTL_MS）返回命令。
+pub fn take_update_cmd(now: u64) -> Option<String> {
+    let p = update_cmd_path();
+    let s = std::fs::read_to_string(&p).ok()?;
+    let _ = std::fs::remove_file(&p);
+    let c: UpdateCmd = serde_json::from_str(&s).ok()?;
+    (now.abs_diff(c.t) <= RENAME_TTL_MS && (c.cmd == "check" || c.cmd == "update")).then_some(c.cmd)
 }
 
 impl Config {
@@ -531,6 +656,15 @@ pub struct StatusFile {
     pub paused: bool,
     /// 写入时间（毫秒）。
     pub t: u64,
+    /// 本机程序版本、对方程序版本（没连上为空）、对方支持一键更新
+    pub app: String,
+    pub peer_app: String,
+    pub peer_upd: bool,
+    /// 检查更新的状态（update::State 的简写：""/checking/latest/avail/down/restart/fail/done）+ 版本、进度、原因
+    pub upd: String,
+    pub upd_ver: String,
+    pub upd_pct: u8,
+    pub upd_err: String,
 }
 
 /// 原子写 status.json。
@@ -665,7 +799,15 @@ peer = \"10.0.0.1\"
         // 截断后末尾的空白也去掉
         assert_eq!(clean_name(&format!("{} x", "a".repeat(15))), Some("a".repeat(15)));
 
-        let st = StatusFile { pid: 42, connected: true, peer_name: "客厅".into(), peer_addr: "10.0.0.2:47900".into(), paused: false, t: 7 };
+        let st = StatusFile {
+            pid: 42,
+            connected: true,
+            peer_name: "客厅".into(),
+            peer_addr: "10.0.0.2:47900".into(),
+            paused: false,
+            t: 7,
+            ..Default::default()
+        };
         let s = serde_json::to_string(&st).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         for k in ["pid", "connected", "peer_name", "peer_addr", "paused", "t"] {

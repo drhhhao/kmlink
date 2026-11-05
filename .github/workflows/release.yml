@@ -2,6 +2,7 @@ name: Release
 
 # 推版本标签（v0.1.1 这样，要和 Cargo.toml 的 version 一致）→ 测试、编译、发 GitHub Release。
 # 手动运行（Actions 页 Run workflow）只编译打包、上传构建产物，不发 Release，用来试流程。
+# 附件里单独放 kmlink.exe：程序里的“一键更新”直接下它，再用 SHA256SUMS.txt 校验（src/update.rs）。
 on:
   push:
     tags: ['v*']
@@ -62,5 +63,5 @@ jobs:
         shell: pwsh
         run: |
           gh release create $env:GITHUB_REF_NAME `
-            "dist/${{ steps.pkg.outputs.name }}.zip" dist/SHA256SUMS.txt `
+            "dist/${{ steps.pkg.outputs.name }}.zip" target/release/kmlink.exe dist/SHA256SUMS.txt `
             --title "kmlink $env:GITHUB_REF_NAME" --generate-notes

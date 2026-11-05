@@ -34,7 +34,8 @@ cargo build --release
 日常：
 
 - **Scroll Lock**：在本机时锁定不跨屏（再按解锁）；在对方时立刻回到本机。
-- **托盘菜单**：设置 / 暂停共享 / 键盘跟随 / 开机自启 / 打开配置文件夹 / 退出。
+- **托盘面板**：点托盘图标弹出——暂停共享、声音、键盘跟随、开机自启、检查更新、设置、退出。
+- **检查更新**：启动后和每天自动查 GitHub Release，有新版一键更新两台（下载后校验 SHA256 再替换）。
 - 配置文件和日志在 `%APPDATA%\kmlink\`（`config.toml`、`kmlink.log`）。
 
 ## 已知限制
@@ -46,3 +47,8 @@ cargo build --release
 ## 许可证
 
 [GPL-3.0-or-later](LICENSE)
+
+界面字体（打包在程序里，只裁了界面用到的字）：
+
+- 中文：[源樣黑體圓 Resource Han Rounded](https://github.com/CyanoHao/Resource-Han-Rounded) 改名为 Km Rounded，[SIL OFL 1.1](assets/fonts/OFL-KmRounded.txt)
+- 英文数字：[Nunito](https://github.com/googlefonts/nunito)，[SIL OFL 1.1](assets/fonts/OFL-Nunito.txt)

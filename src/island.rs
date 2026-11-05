@@ -10,6 +10,13 @@
 //!   ( [⌨] 键盘 已收回 )  键盘被意外收回（断线、管理员窗口、锁屏）：琥珀图标，两台都弹；加强版警示——
 //!                        停留 KBD_HOLD_FAIL，抖得更明显（STRONG_AMP），隔一会儿再抖一次。
 //!
+//! 检查更新的提示（设计稿 设计\检查更新\island.html）：
+//!   ( [↑] 新版 0.2.0 [更新] ) 自动检查发现新版：只在用户正在用的那台弹（另一台收到 Msg::UpdTip 就不再弹同一版本），
+//!                              带一个“更新”按钮（对方不支持一键更新时不带），停 UPD_HOLD，光标在胶囊上时不收。
+//!   ( [◔] 更新中 45% ) / ( [↻] 正在重启 ) 更新过程中一直停着，原地刷新；( [✓] 已更新 0.2.0 ) 重启后弹一次；
+//!   ( [↑] 更新失败 网络不通 ) 琥珀 + 轻抖。
+//!   胶囊照旧点击穿透；按钮上另叠一个几乎全透明（alpha 1）的小窗口接鼠标（不抢焦点、手形光标、悬停变浅、点了调 update_both）。
+//!
 //! 跑在 desktop 线程（有消息循环）。窗口：WS_EX_LAYERED | TOPMOST | TOOLWINDOW | NOACTIVATE | TRANSPARENT ——
 //! 不抢焦点、点击穿透。液态玻璃全在 CPU 上算（不引入 Direct2D/GDI+，省内存），参数见设计稿 设计\灵动岛\液态玻璃\glass.py：
 //!   弹出前（窗口还隐藏着）截下胶囊背后那块屏幕 → 三次盒式模糊（≈高斯）+ 提饱和度（只算一次）→
@@ -20,27 +27,28 @@
 //! 连续复制：原地换名字，宽度用弹簧变过去，停留重新计时。全屏游戏 / 演示（SHQueryUserNotificationState）时不弹。
 //! 收起后释放全部缓冲，只留一个隐藏窗口。
 
+use crate::ui::{Font, draw_text_px, text_px};
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BitBlt,
-    CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DIB_RGB_COLORS, DeleteDC,
-    DeleteObject, GdiFlush, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, HBITMAP, HDC, HFONT, HGDIOBJ,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, OUT_DEFAULT_PRECIS, ReleaseDC, SRCCOPY, SelectObject,
-    SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
+    AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BitBlt, CreateCompatibleDC,
+    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::Shell::{
-    QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Shell::{QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetCursorPos, HWND_TOPMOST, KillTimer, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetTimer, SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow,
-    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    CreateWindowExW, DefWindowProcW, GetCursorPos, HWND_TOPMOST, IDC_HAND, KillTimer, LWA_ALPHA, LoadCursorW, MA_NOACTIVATE,
+    RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetCursor,
+    SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WM_LBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
     WS_POPUP,
 };
+/// WM_MOUSELEAVE（windows crate 里没有导出常量的版本也能用）
+const WM_MOUSELEAVE: u32 = 0x02A3;
 use windows::core::w;
 
 // ───────────────────────── 提示内容 ─────────────────────────
@@ -89,6 +97,14 @@ enum Icon {
     Copy,
     /// 键盘（键盘跟随）
     Keyboard,
+    /// 向上箭头（有新版 / 更新失败）
+    Up,
+    /// 进度环（更新中，0..=100）
+    Ring(u8),
+    /// 转圈箭头（正在重启）
+    Restart,
+    /// 对勾（已更新）
+    Check,
 }
 
 /// 实际显示的内容：粗体主词 + 常规后半句（可空）+ 图标；strong = 加强版警示（停更久、抖更明显、抖两次）。
@@ -101,17 +117,25 @@ struct Tip {
     icon: Icon,
     ok: bool,
     strong: bool,
+    /// 右边的按钮（“更新”），None = 没有
+    button: Option<&'static str>,
+    /// 停留时间（None = 按 ok / strong 定）
+    hold: Option<Duration>,
 }
 
 impl Tip {
     fn clip(n: &Note) -> Tip {
-        Tip { word: n.who.clone(), verb: VERB.into(), cut_verb: false, icon: Icon::Copy, ok: n.ok, strong: false }
+        Tip { word: n.who.clone(), verb: VERB.into(), cut_verb: false, icon: Icon::Copy, ok: n.ok, strong: false, button: None, hold: None }
     }
 
     /// ok：“键盘 <本机名>”；否则“键盘 已收回”。
     fn keyboard(ok: bool, here: &str) -> Tip {
         let verb = if ok { here.trim().to_string() } else { "已收回".to_string() };
-        Tip { word: "键盘".into(), verb, cut_verb: true, icon: Icon::Keyboard, ok, strong: !ok }
+        Tip { word: "键盘".into(), verb, cut_verb: true, icon: Icon::Keyboard, ok, strong: !ok, button: None, hold: None }
+    }
+
+    fn upd(word: &str, verb: String, icon: Icon, ok: bool, button: Option<&'static str>, hold: Duration) -> Tip {
+        Tip { word: word.into(), verb, cut_verb: true, icon, ok, strong: false, button, hold: Some(hold) }
     }
 
     /// 最小宽度：剪贴板沿用 MIN_W；键盘提示按内容来（“键盘”只有 80）。
@@ -120,7 +144,9 @@ impl Tip {
     }
 
     fn hold(&self) -> Duration {
-        if self.strong {
+        if let Some(h) = self.hold {
+            h
+        } else if self.strong {
             KBD_HOLD_FAIL
         } else if self.ok {
             HOLD
@@ -192,6 +218,18 @@ const PAD_R: f32 = 15.0;
 const WORD_GAP: f32 = 5.0;
 const FONT_PX: f32 = 14.0;
 const MIN_W: f32 = 120.0;
+/// 胶囊里的按钮：高、左右内边距、离文字的间距、离胶囊右边的距离
+const BTN_H: f32 = 26.0;
+const BTN_PAD: f32 = 12.0;
+const BTN_GAP: f32 = 10.0;
+const BTN_R: f32 = 5.0;
+const BTN_FONT_PX: f32 = 13.0;
+/// 有新版：停这么久（光标在胶囊上时不收）
+const UPD_HOLD: Duration = Duration::from_secs(10);
+/// 更新中 / 正在重启：一直停着（状态变了原地刷新）
+const UPD_BUSY_HOLD: Duration = Duration::from_secs(300);
+/// 已更新：停这么久
+const UPD_DONE_HOLD: Duration = Duration::from_millis(3000);
 const MAX_W: f32 = 300.0;
 /// 胶囊四周留给投影、上浮、弹簧过冲的边（窗口比胶囊大这么多）。
 const MARGIN: f32 = 40.0;
@@ -458,7 +496,9 @@ fn contrast(a: f32, b: f32) -> f32 {
 /// 一维滑动平均（半径 r），边缘钳到边。
 fn box_pass(src: &[[f32; 3]], dst: &mut [[f32; 3]], w: usize, h: usize, r: usize, horizontal: bool) {
     let (n, lines) = if horizontal { (w, h) } else { (h, w) };
-    let idx = |line: usize, i: usize| if horizontal { line * w + i } else { i * w + line };
+    let idx = |line: usize, i: usize| {
+        if horizontal { line * w + i } else { i * w + line }
+    };
     let k = 1.0 / (2 * r + 1) as f32;
     for line in 0..lines {
         let mut acc = [0.0f32; 3];
@@ -545,68 +585,56 @@ fn rgb(hex: u32) -> [f32; 3] {
     [((hex >> 16) & 0xFF) as f32 / 255.0, ((hex >> 8) & 0xFF) as f32 / 255.0, (hex & 0xFF) as f32 / 255.0]
 }
 
-fn font(px: f32, weight: i32) -> HFONT {
-    unsafe {
-        CreateFontW(
-            -(px.round() as i32).max(1),
-            0,
-            0,
-            0,
-            weight,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            ANTIALIASED_QUALITY,
-            0,
-            w!("Microsoft YaHei UI"),
-        )
-    }
-}
-
+/// 灵动岛用的字（界面字体 ui::Font::ui，透明底所以用灰度抗锯齿）。
 struct Fonts {
-    bold: HFONT,
-    regular: HFONT,
+    bold: Font,
+    regular: Font,
+    button: Font,
 }
 
 impl Fonts {
     fn new(s: f32) -> Fonts {
-        Fonts { bold: font(FONT_PX * s, 700), regular: font(FONT_PX * s, 400) }
+        let q = ANTIALIASED_QUALITY;
+        Fonts { bold: Font::ui(FONT_PX, 700, s, q), regular: Font::ui(FONT_PX, 400, s, q), button: Font::ui(BTN_FONT_PX, 700, s, q) }
     }
 }
 
-impl Drop for Fonts {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = DeleteObject(self.bold.into());
-            let _ = DeleteObject(self.regular.into());
-        }
-    }
+/// 按钮宽（逻辑像素）。
+fn btn_w(dc: HDC, fonts: &Fonts, label: &str, s: f32) -> f32 {
+    text_px(dc, &fonts.button, label) as f32 / s + 2.0 * BTN_PAD
 }
 
-fn text_width(dc: HDC, f: HFONT, s: &[u16]) -> i32 {
-    unsafe {
-        let old = SelectObject(dc, f.into());
-        let mut sz = SIZE::default();
-        let _ = GetTextExtentPoint32W(dc, s, &mut sz);
-        SelectObject(dc, old);
-        sz.cx
-    }
+/// 按钮在内容层里的位置（物理像素，左上 x、y，宽、高）。内容层宽 = wf·s + 2。
+fn btn_rect(label: &str, wf: f32, s: f32) -> Option<(f32, f32, f32, f32)> {
+    let fonts = Fonts::new(s);
+    let probe = Dib::new(1, 1)?;
+    let bw = btn_w(probe.dc, &fonts, label, s) * s;
+    let bh = BTN_H * s;
+    let cw = (wf * s).ceil() + 2.0;
+    let chh = (H * s).ceil() + 2.0;
+    Some((cw - 1.0 - BTN_R * s - bw, (chh - bh) / 2.0, bw, bh))
+}
+
+fn text_width(dc: HDC, f: &Font, s: &[u16]) -> i32 {
+    text_px(dc, f, &String::from_utf16_lossy(s))
 }
 
 /// 主词（粗）、后半句（常规，可空）和胶囊最终宽度（逻辑像素）。放不下时截短一段加省略号：
 /// cut_verb 截后半句，否则截主词（主词为空时用“对方”）。后半句为空时不留词间距。
-fn layout(name: &str, verb: &str, cut_verb: bool, min_w: f32, s: f32) -> Option<(Vec<u16>, Vec<u16>, f32)> {
+fn layout(name: &str, verb: &str, cut_verb: bool, min_w: f32, button: Option<&str>, s: f32) -> Option<(Vec<u16>, Vec<u16>, f32)> {
     let fonts = Fonts::new(s);
     let probe = Dib::new(1, 1)?;
-    let w = |t: &[u16], f: HFONT| text_width(probe.dc, f, t) as f32 / s;
+    let w = |t: &[u16], f: &Font| text_width(probe.dc, f, t) as f32 / s;
+    // 有按钮：右边距换成“文字—按钮间距 + 按钮宽 + 按钮右边距”
+    let pad_r = match button {
+        Some(b) => BTN_GAP + btn_w(probe.dc, &fonts, b, s) + BTN_R,
+        None => PAD_R,
+    };
     let name = if name.trim().is_empty() { "对方" } else { name.trim() };
     let verb = verb.trim();
     let total = |nm: &[u16], vb: &[u16]| {
-        let vw = if vb.is_empty() { 0.0 } else { WORD_GAP + w(vb, fonts.regular) };
-        PAD_L + ICON + GAP + w(nm, fonts.bold) + vw + PAD_R
+        let vw = if vb.is_empty() { 0.0 } else { WORD_GAP + w(vb, &fonts.regular) };
+        PAD_L + ICON + GAP + w(nm, &fonts.bold) + vw + pad_r
     };
     let mut nm: Vec<u16> = name.encode_utf16().collect();
     let mut vb: Vec<u16> = verb.encode_utf16().collect();
@@ -626,7 +654,16 @@ fn layout(name: &str, verb: &str, cut_verb: bool, min_w: f32, s: f32) -> Option<
 }
 
 /// 画内容层：图标（绿/琥珀圆 + 白色线条图标）+ 主词（粗）+ 动词（常规，可空）+ 文字晕影。
-fn draw_content(name: &[u16], verb: &[u16], icon: Icon, wf: f32, s: f32, ok: bool, light: bool) -> Option<Content> {
+fn draw_content(
+    name: &[u16],
+    verb: &[u16],
+    icon: Icon,
+    wf: f32,
+    s: f32,
+    ok: bool,
+    light: bool,
+    button: Option<(&str, bool)>,
+) -> Option<Content> {
     let cw = (wf * s).ceil() as i32 + 2;
     let chh = (H * s).ceil() as i32 + 2;
     let (cwu, chu) = (cw as usize, chh as usize);
@@ -634,29 +671,44 @@ fn draw_content(name: &[u16], verb: &[u16], icon: Icon, wf: f32, s: f32, ok: boo
     let fonts = Fonts::new(s);
     let tx = ((PAD_L + ICON + GAP) * s).round() as i32;
     let mut masks = Vec::new();
-    for (txt, f, x) in [(name, fonts.bold, tx), (verb, fonts.regular, 0)] {
+    for (txt, f, x) in [(name, &fonts.bold, tx), (verb, &fonts.regular, 0)] {
         let mut m = Dib::new(cw, chh)?;
         let x = if masks.is_empty() {
             x
         } else {
-            let nw = text_width(m.dc, fonts.bold, name);
+            let nw = text_width(m.dc, &fonts.bold, name);
             tx + nw + (WORD_GAP * s).round() as i32
         };
         unsafe {
             SetBkMode(m.dc, TRANSPARENT);
             SetTextColor(m.dc, COLORREF(0x00FF_FFFF));
-            let old = SelectObject(m.dc, f.into());
-            // 竖直居中：用字体高度
-            let mut sz = SIZE::default();
-            let _ = GetTextExtentPoint32W(m.dc, txt, &mut sz);
-            let y = (chh - sz.cy) / 2 + (0.5 * s).round() as i32;
-            let _ = TextOutW(m.dc, x, y, txt);
-            SelectObject(m.dc, old);
+            // 竖直居中：按字号算基线（ui::Font::baseline_at）
+            let y = f.baseline_at(chh as f32 / 2.0 + 0.5 * s).round() as i32;
+            draw_text_px(m.dc, f, x, y, &String::from_utf16_lossy(txt));
             let _ = GdiFlush();
         }
         let cov: Vec<f32> = m.bytes().chunks_exact(4).map(|p| p[0].max(p[1]).max(p[2]) as f32 / 255.0).collect();
         masks.push(cov);
     }
+    // 按钮文字蒙版
+    let btn = match button {
+        Some((label, hover)) => {
+            let (bx, by, bw, bh) = btn_rect(label, wf, s)?;
+            let mut m = Dib::new(cw, chh)?;
+            unsafe {
+                SetBkMode(m.dc, TRANSPARENT);
+                SetTextColor(m.dc, COLORREF(0x00FF_FFFF));
+                let tw = text_px(m.dc, &fonts.button, label);
+                let x = (bx + (bw - tw as f32) / 2.0).round() as i32;
+                let y = fonts.button.baseline_at(by + bh / 2.0 + 0.5 * s).round() as i32;
+                draw_text_px(m.dc, &fonts.button, x, y, label);
+                let _ = GdiFlush();
+            }
+            let cov: Vec<f32> = m.bytes().chunks_exact(4).map(|p| p[0].max(p[1]).max(p[2]) as f32 / 255.0).collect();
+            Some((bx, by, bw, bh, cov, hover))
+        }
+        None => None,
+    };
     drop(fonts);
 
     let mut px = vec![[0.0f32; 4]; cwu * chu];
@@ -723,6 +775,52 @@ fn draw_content(name: &[u16], verb: &[u16], icon: Icon, wf: f32, s: f32, ok: boo
                     d = d.min(sd_rrect(fx, fy, icx, icy + k(1.25), k(1.95), k(0.75), k(0.75)));
                     over(p, [1.0, 1.0, 1.0], sat(0.5 - d) * cov);
                 }
+                Icon::Up => {
+                    // 竖线 + 两撇（22 单位画布：从 (11, 15.5) 到 (11, 6.5)，箭头两翼 3.6）
+                    let k = |v: f32| v * u;
+                    let d = seg_d(fx, fy, icx, icy + k(4.5), icx, icy - k(4.5))
+                        .min(seg_d(fx, fy, icx - k(3.6), icy - k(0.9), icx, icy - k(4.5)))
+                        .min(seg_d(fx, fy, icx + k(3.6), icy - k(0.9), icx, icy - k(4.5)))
+                        - sw * 0.6;
+                    over(p, [1.0, 1.0, 1.0], sat(0.5 - d) * cov);
+                }
+                Icon::Check => {
+                    let k = |v: f32| v * u;
+                    let d = seg_d(fx, fy, icx - k(4.2), icy + k(0.2), icx - k(1.2), icy + k(3.2)).min(seg_d(
+                        fx,
+                        fy,
+                        icx - k(1.2),
+                        icy + k(3.2),
+                        icx + k(4.5),
+                        icy - k(3.0),
+                    )) - sw * 0.6;
+                    over(p, [1.0, 1.0, 1.0], sat(0.5 - d) * cov);
+                }
+                Icon::Ring(pct) => {
+                    // 淡的整圈 + 从 12 点顺时针的进度弧
+                    let rr = 5.6 * u;
+                    let dr = ((fx - icx).powi(2) + (fy - icy).powi(2)).sqrt() - rr;
+                    let band = sat(0.5 - (dr.abs() - sw * 0.6));
+                    let ang = (fx - icx).atan2(-(fy - icy)); // 12 点 = 0，顺时针为正
+                    let ang = if ang < 0.0 { ang + std::f32::consts::TAU } else { ang };
+                    let done = pct as f32 / 100.0 * std::f32::consts::TAU;
+                    over(p, [1.0, 1.0, 1.0], band * cov * if ang <= done { 1.0 } else { 0.35 });
+                }
+                Icon::Restart => {
+                    // 3/4 圈 + 箭头
+                    let rr = 5.4 * u;
+                    let dr = ((fx - icx).powi(2) + (fy - icy).powi(2)).sqrt() - rr;
+                    let ang = (fx - icx).atan2(-(fy - icy));
+                    let ang = if ang < 0.0 { ang + std::f32::consts::TAU } else { ang };
+                    let arc = if ang > 0.9 { sat(0.5 - (dr.abs() - sw * 0.6)) } else { 0.0 };
+                    // 弧的终点在 12 点，箭头顺着顺时针方向朝右
+                    let k = |v: f32| v * u;
+                    let (ax, ay) = (icx + k(1.4), icy - rr);
+                    let head = sat(0.5
+                        - (seg_d(fx, fy, ax, ay, ax - k(2.8), ay - k(2.6)).min(seg_d(fx, fy, ax, ay, ax - k(2.8), ay + k(2.6)))
+                            - sw * 0.6));
+                    over(p, [1.0, 1.0, 1.0], arc.max(head) * cov);
+                }
             }
         }
     }
@@ -733,7 +831,31 @@ fn draw_content(name: &[u16], verb: &[u16], icon: Icon, wf: f32, s: f32, ok: boo
         over(&mut px[i], tc, masks[0][i] * na);
         over(&mut px[i], tc, masks[1][i] * va);
     }
+    // 按钮：浅玻璃上黑底白字，深玻璃上白底黑字；悬停变浅
+    if let Some((bx, by, bw, bh, cov, hover)) = btn {
+        let (bg, fg) = if light { ([0.110, 0.110, 0.118], [1.0, 1.0, 1.0]) } else { ([0.949, 0.949, 0.969], [0.110, 0.110, 0.118]) };
+        let ba = if hover { 0.78 } else { 1.0 };
+        let (bcx, bcy) = (bx + bw / 2.0, by + bh / 2.0);
+        for y in 0..chu {
+            for x in 0..cwu {
+                let d = sd_rrect(x as f32 + 0.5, y as f32 + 0.5, bcx, bcy, bw / 2.0, bh / 2.0, bh / 2.0);
+                let a = sat(0.5 - d);
+                if a > 0.0 {
+                    let i = y * cwu + x;
+                    over(&mut px[i], bg, a * ba);
+                    over(&mut px[i], fg, cov[i] * a);
+                }
+            }
+        }
+    }
     Some(Content { w: cwu, h: chu, px })
+}
+
+/// 点到线段 (ax, ay)–(bx, by) 的距离。
+fn seg_d(x: f32, y: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let (dx, dy) = (bx - ax, by - ay);
+    let t = (((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy).max(1e-6)).clamp(0.0, 1.0);
+    ((x - ax - t * dx).powi(2) + (y - ay - t * dy).powi(2)).sqrt()
 }
 
 /// 圆角矩形的有向距离（中心 c，半宽高 hw/hh，圆角 r）。
@@ -952,6 +1074,11 @@ struct Island {
     hold: Duration,
     /// 正在显示的提示
     note: Option<Tip>,
+    /// 接按钮点击的小窗口（几乎全透明）；悬停中
+    hit: Option<HWND>,
+    hover: bool,
+    /// 排好的主词、后半句（悬停变化时重画内容层用）
+    name_verb: Option<(Vec<u16>, Vec<u16>)>,
 }
 
 thread_local! {
@@ -973,6 +1100,38 @@ pub fn keyboard(ok: bool, here: &str) {
         return;
     }
     with_island(|is| is.present(&Tip::keyboard(ok, here)));
+}
+
+/// 检查更新的提示要显示成什么。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Upd {
+    /// 有新版；with_button = 能一键更新两台（带“更新”按钮）
+    Available {
+        version: String,
+        with_button: bool,
+    },
+    Downloading(u8),
+    Restarting,
+    Updated(String),
+    /// 更新失败，短原因（≤ 4 字，可空）
+    Failed(&'static str),
+}
+
+/// 弹出 / 原地刷新检查更新的提示。只能在 desktop 线程调用。
+pub fn update(u: &Upd) {
+    if busy_fullscreen() && matches!(u, Upd::Available { .. } | Upd::Updated(_)) {
+        return;
+    }
+    let tip = match u {
+        Upd::Available { version, with_button } => {
+            Tip::upd("新版", version.clone(), Icon::Up, true, with_button.then_some("更新"), UPD_HOLD)
+        }
+        Upd::Downloading(p) => Tip::upd("更新中", format!("{p}%"), Icon::Ring(*p), true, None, UPD_BUSY_HOLD),
+        Upd::Restarting => Tip::upd("正在重启", String::new(), Icon::Restart, true, None, UPD_BUSY_HOLD),
+        Upd::Updated(v) => Tip::upd("已更新", v.clone(), Icon::Check, true, None, UPD_DONE_HOLD),
+        Upd::Failed(why) => Tip::upd("更新失败", why.to_string(), Icon::Up, false, None, HOLD_FAIL),
+    };
+    with_island(|is| is.present(&tip));
 }
 
 /// 收起正显示的“键盘 <本机名>”（用户到另一台干活了，那台弹它自己的）：两台同时只留一颗。
@@ -1032,6 +1191,9 @@ fn with_island(f: impl FnOnce(&mut Island)) {
                 phase: Phase::Hidden,
                 hold: HOLD,
                 note: None,
+                hit: None,
+                hover: false,
+                name_verb: None,
             });
         }
         if let Some(is) = g.as_mut() {
@@ -1063,6 +1225,66 @@ fn create_window() -> Option<HWND> {
                 None
             }
         }
+    }
+}
+
+/// 按钮上的接点击窗口：分层、alpha 1（看不见但能接鼠标）、不抢焦点。
+fn create_hit_window() -> Option<HWND> {
+    unsafe {
+        let hinst = GetModuleHandleW(None).ok()?;
+        let class = w!("kmlink-island-hit");
+        let wc = WNDCLASSW { lpfnWndProc: Some(hit_proc), hInstance: hinst.into(), lpszClassName: class, ..Default::default() };
+        let _ = RegisterClassW(&wc);
+        let ex = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+        let h = CreateWindowExW(ex, class, w!(""), WS_POPUP, 0, 0, 0, 0, None, None, Some(hinst.into()), None).ok()?;
+        let _ = SetLayeredWindowAttributes(h, COLORREF(0), 1, LWA_ALPHA);
+        Some(h)
+    }
+}
+
+unsafe extern "system" fn hit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let set_hover = |on: bool| {
+        ISLAND.with(|cell| {
+            if let Ok(mut g) = cell.try_borrow_mut()
+                && let Some(is) = g.as_mut()
+            {
+                is.set_hover(on);
+            }
+        });
+    };
+    match msg {
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_SETCURSOR => unsafe {
+            let _ = SetCursor(LoadCursorW(None, IDC_HAND).ok());
+            LRESULT(1)
+        },
+        WM_MOUSEMOVE => {
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            unsafe {
+                let _ = TrackMouseEvent(&mut tme);
+            }
+            set_hover(true);
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            set_hover(false);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            crate::update::update_both();
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            // 胶囊原地变成“更新中 0%”（状态变化随后也会刷新）
+            update(&Upd::Downloading(0));
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
 }
 
@@ -1137,7 +1359,9 @@ impl Island {
             }
         }
         let s = self.s;
-        let Some((name, verb, wf)) = layout(&note.word, &note.verb, note.cut_verb, note.min_w(), s) else { return };
+        let Some((name, verb, wf)) = layout(&note.word, &note.verb, note.cut_verb, note.min_w(), note.button, s) else {
+            return;
+        };
         let old_wf = self.wf;
         self.wf = wf;
         if fresh {
@@ -1147,10 +1371,14 @@ impl Island {
             self.light = light;
             self.tint_a = a;
         }
-        self.content = draw_content(&name, &verb, note.icon, wf, s, note.ok, self.light);
+        if note.button.is_none() || self.note.as_ref().is_none_or(|n| n.button != note.button) {
+            self.hover = false;
+        }
+        self.content = draw_content(&name, &verb, note.icon, wf, s, note.ok, self.light, note.button.map(|b| (b, self.hover)));
         if self.content.is_none() {
             return;
         }
+        self.name_verb = Some((name, verb));
         self.hold = note.hold();
         let was_ok = self.note.as_ref().is_none_or(|n| n.ok);
         self.note = Some(note.clone());
@@ -1194,9 +1422,19 @@ impl Island {
                     break (appear(t, wf), FRAME_MS);
                 }
                 Phase::Hold { until, resize, shake: sh } => {
+                    let has_btn = self.note.as_ref().is_some_and(|n| n.button.is_some());
                     if now >= until {
+                        // 有按钮的提示：光标还在胶囊上就再停一会儿
+                        if has_btn && self.cursor_on_capsule() {
+                            self.phase = Phase::Hold { until: now + Duration::from_millis(600), resize, shake: sh };
+                            continue;
+                        }
                         self.phase = Phase::Leave { start: now };
+                        self.place_hit(false);
                         continue;
+                    }
+                    if has_btn {
+                        self.place_hit(resize.is_none_or(|(t0, _)| ms(t0) >= RESIZE_MS));
                     }
                     let mut p = Pose { w: wf, h: H, alpha: 1.0, content: 1.0, dy: 0.0, dx: 0.0 };
                     let mut animating = false;
@@ -1215,6 +1453,8 @@ impl Island {
                         }
                     }
                     let next = if animating { FRAME_MS } else { (until - now).as_millis().clamp(1, 60_000) as u32 };
+                    // 有按钮时多看看光标（停留到期前光标进来了要续上）
+                    let next = if has_btn { next.min(250) } else { next };
                     break (p, next);
                 }
                 Phase::Leave { start } => {
@@ -1262,11 +1502,84 @@ impl Island {
             let _ = KillTimer(Some(self.hwnd), TIMER_ANIM);
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
+        self.place_hit(false);
+        self.hover = false;
         // 缓冲用完即还
         self.dib = None;
         self.bd = None;
         self.content = None;
         self.note = None;
+        self.name_verb = None;
+    }
+
+    /// 胶囊在屏幕上的矩形（物理像素，停稳时）。
+    fn capsule_rect(&self) -> RECT {
+        let (ww, wh) = Island::win_size(self.s);
+        let (cx, cy) = (self.x + ww / 2, self.y + wh / 2);
+        let (hw, hh) = ((self.wf * self.s / 2.0).ceil() as i32, (H * self.s / 2.0).ceil() as i32);
+        RECT { left: cx - hw, top: cy - hh, right: cx + hw, bottom: cy + hh }
+    }
+
+    fn cursor_on_capsule(&self) -> bool {
+        let mut p = POINT::default();
+        if unsafe { GetCursorPos(&mut p) }.is_err() {
+            return false;
+        }
+        let r = self.capsule_rect();
+        p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
+    }
+
+    /// 按钮上的接点击窗口：show = 摆到按钮上并显示，否则隐藏。
+    fn place_hit(&mut self, show: bool) {
+        if !show {
+            if let Some(h) = self.hit {
+                unsafe {
+                    let _ = ShowWindow(h, SW_HIDE);
+                }
+            }
+            return;
+        }
+        let Some(label) = self.note.as_ref().and_then(|n| n.button) else {
+            return;
+        };
+        let Some((bx, by, bw, bh)) = btn_rect(label, self.wf, self.s) else {
+            return;
+        };
+        if self.hit.is_none() {
+            self.hit = create_hit_window();
+        }
+        let Some(h) = self.hit else { return };
+        let (ww, wh) = Island::win_size(self.s);
+        let cw = (self.wf * self.s).ceil() + 2.0;
+        let chh = (H * self.s).ceil() + 2.0;
+        let ox = self.x as f32 + ww as f32 / 2.0 - cw / 2.0;
+        let oy = self.y as f32 + wh as f32 / 2.0 - chh / 2.0;
+        unsafe {
+            let _ = SetWindowPos(
+                h,
+                Some(HWND_TOPMOST),
+                (ox + bx).round() as i32,
+                (oy + by).round() as i32,
+                bw.round() as i32,
+                bh.round() as i32,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+    }
+
+    /// 按钮悬停变了：重画内容层。
+    fn set_hover(&mut self, on: bool) {
+        if self.hover == on {
+            return;
+        }
+        self.hover = on;
+        let (Some(n), Some((name, verb))) = (self.note.as_ref(), self.name_verb.as_ref()) else {
+            return;
+        };
+        if let Some(c) = draw_content(name, verb, n.icon, self.wf, self.s, n.ok, self.light, n.button.map(|b| (b, on))) {
+            self.content = Some(c);
+            self.tick();
+        }
     }
 }
 
@@ -1338,7 +1651,7 @@ mod tests {
             let (ww, wh) = Island::win_size(scale);
             let (wu, hu) = (ww as usize, wh as usize);
             let bd = Backdrop { w: wu, h: hu, blurred: vec![bgc; wu * hu], mean_lum: lum(bgc) };
-            let (name, verb, wf) = layout("WiFi电脑", VERB, false, MIN_W, scale).expect("layout");
+            let (name, verb, wf) = layout("WiFi电脑", VERB, false, MIN_W, None, scale).expect("layout");
             assert!((MIN_W..=MAX_W).contains(&wf));
             let (light, a) = choose_glass(&bd, wu as f32 / 2.0, hu as f32 / 2.0, wf, scale);
             // 明显亮 / 明显暗时浅深玻璃是定的；中间调（橙色）两种都可能
@@ -1346,7 +1659,7 @@ mod tests {
                 assert_eq!(light, lum(bgc) > 0.5, "bg {bgc:?}");
             }
             assert!((LIGHT.a.min(DARK.a)..=A_MAX + 0.02).contains(&a));
-            let content = draw_content(&name, &verb, Icon::Copy, wf, scale, true, light).expect("content");
+            let content = draw_content(&name, &verb, Icon::Copy, wf, scale, true, light, None).expect("content");
             let f = Frame { bd: &bd, content: &content, light, tint_a: a, s: scale, cx: wu as f32 / 2.0, cy: hu as f32 / 2.0 };
             let mut out = vec![0u8; wu * hu * 4];
             f.draw(Pose { w: wf, h: H, alpha: 1.0, content: 1.0, dy: 0.0, dx: 0.0 }, &mut out);
@@ -1361,7 +1674,7 @@ mod tests {
 
     #[test]
     fn keyboard_tip_layout_and_shake() {
-        let lay = |t: &Tip| layout(&t.word, &t.verb, t.cut_verb, t.min_w(), 1.0).expect("layout");
+        let lay = |t: &Tip| layout(&t.word, &t.verb, t.cut_verb, t.min_w(), None, 1.0).expect("layout");
         // “键盘 工位电脑”：不受剪贴板的 MIN_W 限制，名字跟在后面
         let (word, verb, w_ok) = lay(&Tip::keyboard(true, "工位电脑"));
         assert_eq!(String::from_utf16_lossy(&word), "键盘");
@@ -1376,9 +1689,9 @@ mod tests {
         assert!(String::from_utf16_lossy(&verb).ends_with('…'));
         assert!(w_long <= MAX_W);
         // 剪贴板照旧（截主词）
-        let (_, _, w_clip) = layout("A", VERB, false, MIN_W, 1.0).expect("layout");
+        let (_, _, w_clip) = layout("A", VERB, false, MIN_W, None, 1.0).expect("layout");
         assert_eq!(w_clip, MIN_W);
-        let (nm, vb, _) = layout(&"名".repeat(60), VERB, false, MIN_W, 1.0).expect("layout");
+        let (nm, vb, _) = layout(&"名".repeat(60), VERB, false, MIN_W, None, 1.0).expect("layout");
         assert!(String::from_utf16_lossy(&nm).ends_with('…'));
         assert_eq!(String::from_utf16_lossy(&vb), VERB);
         // 加强版：停得更久，抖两次，幅度更大
@@ -1391,8 +1704,8 @@ mod tests {
         assert_eq!(shake_strong(shake_len(true) + 1.0), 0.0);
         for ok in [true, false] {
             let t = Tip::keyboard(ok, "机械革命");
-            let (word, verb, wf) = layout(&t.word, &t.verb, true, H, 1.5).expect("layout");
-            assert!(draw_content(&word, &verb, Icon::Keyboard, wf, 1.5, ok, true).is_some());
+            let (word, verb, wf) = layout(&t.word, &t.verb, true, H, None, 1.5).expect("layout");
+            assert!(draw_content(&word, &verb, Icon::Keyboard, wf, 1.5, ok, true, None).is_some());
         }
     }
 
@@ -1400,15 +1713,16 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_keyboard_tips() {
+        crate::ui::load_fonts();
         let scale = 2.0f32;
         for (tag, bgc) in [("light", [0.95, 0.95, 0.96]), ("dark", [0.06, 0.08, 0.14])] {
             for (verb, ok) in [("工位电脑", true), ("已收回", false)] {
                 let (ww, wh) = Island::win_size(scale);
                 let (wu, hu) = (ww as usize, wh as usize);
                 let bd = Backdrop { w: wu, h: hu, blurred: vec![bgc; wu * hu], mean_lum: lum(bgc) };
-                let (name, verb, wf) = layout("键盘", verb, true, H, scale).unwrap();
+                let (name, verb, wf) = layout("键盘", verb, true, H, None, scale).unwrap();
                 let (light, a) = choose_glass(&bd, wu as f32 / 2.0, hu as f32 / 2.0, wf, scale);
-                let content = draw_content(&name, &verb, Icon::Keyboard, wf, scale, ok, light).unwrap();
+                let content = draw_content(&name, &verb, Icon::Keyboard, wf, scale, ok, light, None).unwrap();
                 let f = Frame { bd: &bd, content: &content, light, tint_a: a, s: scale, cx: wu as f32 / 2.0, cy: hu as f32 / 2.0 };
                 let mut out = vec![0u8; wu * hu * 4];
                 f.draw(Pose { w: wf, h: H, alpha: 1.0, content: 1.0, dy: 0.0, dx: 0.0 }, &mut out);
@@ -1439,6 +1753,63 @@ mod tests {
                     bmp.extend_from_slice(&r);
                 }
                 let path = std::env::temp_dir().join(format!("kmlink-island-{tag}-{}.bmp", if ok { "ok" } else { "lost" }));
+                std::fs::write(&path, bmp).unwrap();
+            }
+        }
+    }
+
+    /// 检查更新的几种提示渲染成 BMP（手动跑：cargo test -- --ignored dump_update_tips），看样子用。
+    #[test]
+    #[ignore]
+    fn dump_update_tips() {
+        crate::ui::load_fonts();
+        let scale = 2.0f32;
+        let tips = [
+            ("avail", Tip::upd("新版", "0.2.0".into(), Icon::Up, true, Some("更新"), UPD_HOLD), false),
+            ("avail-hover", Tip::upd("新版", "0.2.0".into(), Icon::Up, true, Some("更新"), UPD_HOLD), true),
+            ("solo", Tip::upd("新版", "0.2.0".into(), Icon::Up, true, None, UPD_HOLD), false),
+            ("down", Tip::upd("更新中", "45%".into(), Icon::Ring(45), true, None, UPD_BUSY_HOLD), false),
+            ("restart", Tip::upd("正在重启", String::new(), Icon::Restart, true, None, UPD_BUSY_HOLD), false),
+            ("done", Tip::upd("已更新", "0.2.0".into(), Icon::Check, true, None, UPD_DONE_HOLD), false),
+            ("fail", Tip::upd("更新失败", "网络不通".into(), Icon::Up, false, None, HOLD_FAIL), false),
+        ];
+        for (tag, bgc) in [("light", [0.95, 0.95, 0.96]), ("dark", [0.06, 0.08, 0.14])] {
+            for (name_tag, t, hover) in &tips {
+                let (ww, wh) = Island::win_size(scale);
+                let (wu, hu) = (ww as usize, wh as usize);
+                let bd = Backdrop { w: wu, h: hu, blurred: vec![bgc; wu * hu], mean_lum: lum(bgc) };
+                let (name, verb, wf) = layout(&t.word, &t.verb, true, t.min_w(), t.button, scale).unwrap();
+                let (light, a) = choose_glass(&bd, wu as f32 / 2.0, hu as f32 / 2.0, wf, scale);
+                let content = draw_content(&name, &verb, t.icon, wf, scale, t.ok, light, t.button.map(|b| (b, *hover))).unwrap();
+                let f = Frame { bd: &bd, content: &content, light, tint_a: a, s: scale, cx: wu as f32 / 2.0, cy: hu as f32 / 2.0 };
+                let mut out = vec![0u8; wu * hu * 4];
+                f.draw(Pose { w: wf, h: H, alpha: 1.0, content: 1.0, dy: 0.0, dx: 0.0 }, &mut out);
+                let mut bmp = Vec::new();
+                let row = (wu * 3 + 3) & !3;
+                let size = 54 + row * hu;
+                bmp.extend_from_slice(b"BM");
+                bmp.extend_from_slice(&(size as u32).to_le_bytes());
+                bmp.extend_from_slice(&[0; 4]);
+                bmp.extend_from_slice(&54u32.to_le_bytes());
+                bmp.extend_from_slice(&40u32.to_le_bytes());
+                bmp.extend_from_slice(&(wu as i32).to_le_bytes());
+                bmp.extend_from_slice(&(hu as i32).to_le_bytes());
+                bmp.extend_from_slice(&1u16.to_le_bytes());
+                bmp.extend_from_slice(&24u16.to_le_bytes());
+                bmp.extend_from_slice(&[0; 24]);
+                for y in (0..hu).rev() {
+                    let mut r = Vec::with_capacity(row);
+                    for x in 0..wu {
+                        let p = &out[(y * wu + x) * 4..][..4];
+                        let k = 1.0 - p[3] as f32 / 255.0;
+                        for (c, bgv) in [(p[0], bgc[2]), (p[1], bgc[1]), (p[2], bgc[0])] {
+                            r.push((c as f32 + bgv * 255.0 * k).round().clamp(0.0, 255.0) as u8);
+                        }
+                    }
+                    r.resize(row, 0);
+                    bmp.extend_from_slice(&r);
+                }
+                let path = std::env::temp_dir().join(format!("kmlink-upd-{tag}-{name_tag}.bmp"));
                 std::fs::write(&path, bmp).unwrap();
             }
         }

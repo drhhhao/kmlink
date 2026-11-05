@@ -1,6 +1,6 @@
 [package]
 name = "kmlink"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "两台 Windows 电脑共用一套键鼠 + 剪贴板同步（轻量、单进程）"
 license = "GPL-3.0-or-later"
@@ -24,12 +24,14 @@ x25519-dalek = { version = "3.0.0", default-features = false }
 version = "0.61"
 features = [
   "Win32_Foundation",
+  "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",
   "Win32_Media",
   "Win32_Media_Audio",
   "Win32_Media_Audio_Endpoints",
   "Win32_NetworkManagement_IpHelper",
   "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinHttp",
   "Win32_Networking_WinSock",
   "Win32_Security",
   "Win32_System_Console",

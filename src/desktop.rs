@@ -62,7 +62,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -507,14 +507,19 @@ struct Items {
     quit: MenuItem,
 }
 
-const AUDIO_MENU: [(&str, AudioMode); 4] =
-    [("关", AudioMode::Off), ("本机", AudioMode::Here), ("对方", AudioMode::There), ("两台", AudioMode::Both)];
+/// 托盘“声音”四项（和设置窗口的分段一致：关 / 1 号放 / 2 号放 / 两台，见 config::audio_slot_mode）。
+/// 托盘里看不到舞台上的大编号，所以 1、2 后面带上那台的名字：“1 机械革命”。
+fn audio_labels(c: &Config, peer_name: &str) -> [String; 4] {
+    let peer = if peer_name.trim().is_empty() { "对方" } else { peer_name };
+    let (one, two) = if c.me_one() { (c.name.as_str(), peer) } else { (peer, c.name.as_str()) };
+    ["关".into(), format!("1 {one}"), format!("2 {two}"), "两台".into()]
+}
 
 impl Items {
-    /// 只勾当前模式那一项。
-    fn check_audio(&self, m: AudioMode) {
-        for (it, (_, mode)) in self.audio_items.iter().zip(AUDIO_MENU) {
-            it.set_checked(mode == m);
+    /// 只勾第 slot 项。
+    fn check_audio(&self, slot: usize) {
+        for (k, it) in self.audio_items.iter().enumerate() {
+            it.set_checked(k == slot);
         }
     }
 }
@@ -530,7 +535,9 @@ impl Incoming {
     fn describe(&self) -> String {
         match self {
             Incoming::Text(t) => format!("文字 {} 字节", t.len()),
-            Incoming::Data(b) if b.format == clip::CF_UNICODETEXT => format!("文字 {} 字节", b.text_len),
+            Incoming::Data(b) if b.format == clip::CF_UNICODETEXT => {
+                format!("文字 {} 字节", b.text_len)
+            }
             Incoming::Data(b) => format!("图片 {} 字节", b.mem.len()),
         }
     }
@@ -587,12 +594,14 @@ struct State {
     hwnd: HWND,
     rx: Receiver<ToDesktop>,
     mrx: Receiver<MenuId>,
+    /// 托盘图标被点（左键 / 右键抬起）：图标的矩形（物理像素）→ 开关托盘面板
+    trx: Receiver<RECT>,
     /// 已收到退出：不再处理 channel，等 WM_QUIT。
     quitting: bool,
     tray: Option<TrayIcon>,
     items: Items,
-    /// 托盘“声音”子菜单当前勾的模式。
-    audio_shown: Option<AudioMode>,
+    /// 托盘“声音”子菜单当前勾的那项和四项的文字。
+    audio_shown: Option<(usize, [String; 4])>,
     /// 上次处理过的剪贴板序号（同一序号不重复处理）。
     last_seq: Option<u32>,
     /// 剪贴板打不开时的重试：(序号, 已重试次数)。
@@ -615,6 +624,12 @@ struct State {
     /// 托盘上次显示的内容（变了才刷新）。
     shown: Option<(bool, String)>,
     connected: bool,
+    /// 检查更新：上次看到的状态；已弹过“新版”的版本（本机弹过或对方弹过）；等用户回到这台再弹的版本；
+    /// 刚从旧版更新上来，这个时刻之后弹“已更新”
+    upd_prev: crate::update::State,
+    upd_tip_seen: Option<String>,
+    upd_pending: Option<String>,
+    upd_done_at: Option<Instant>,
 }
 
 fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
@@ -622,6 +637,18 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
         Ok(mut g) => g.as_mut().map(f),
         Err(_) => None,
     })
+}
+
+/// 用户正在用这台：对方的鼠标在这台上（被控），或者没在控制对方、最近 2 分钟这台有过真人输入。
+fn user_here(st: &Status) -> bool {
+    if st.driven {
+        return true;
+    }
+    if st.driving {
+        return false;
+    }
+    let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
+    crate::input::last_physical_input().is_some_and(|t| now.wrapping_sub(t) < 120_000)
 }
 
 fn cfg_mtime(p: &Path) -> Option<SystemTime> {
@@ -655,6 +682,21 @@ impl State {
     /// drain 菜单事件和 ToDesktop；收到退出时 PostQuitMessage，由消息循环收尾。
     fn pump(&mut self) {
         while !self.quitting {
+            if let Ok(r) = self.trx.try_recv() {
+                crate::panel::toggle(r, self.panel_view());
+                continue;
+            }
+            let cmds = crate::panel::take_cmds();
+            if !cmds.is_empty() {
+                for c in cmds {
+                    if !self.panel_cmd(c) {
+                        self.quit();
+                        break;
+                    }
+                }
+                crate::panel::refresh(self.panel_view());
+                continue;
+            }
             if let Ok(id) = self.mrx.try_recv() {
                 if !self.menu(&id) {
                     self.quit();
@@ -768,12 +810,72 @@ impl State {
     }
 
     /// 处理一条 ToDesktop；返回 false 表示退出。
+    /// 检查更新的状态变了：按情况弹灵动岛。
+    /// 有新版：只在用户正在用的这台弹、同一版本两台只弹一次（弹了告诉对方 Msg::UpdTip）；用户在另一台就等他回来。
+    /// 更新中 / 重启 / 更新失败（下载安装时的）：两台各弹各的。
+    fn update_changed(&mut self) {
+        use crate::update::State as U;
+        let st = crate::update::state();
+        let prev = std::mem::replace(&mut self.upd_prev, st.clone());
+        match st {
+            U::Available(v) => {
+                if self.upd_tip_seen.as_deref() != Some(v.as_str()) {
+                    self.upd_pending = Some(v);
+                    self.update_tick();
+                }
+            }
+            U::Downloading(_, p) => {
+                self.upd_pending = None;
+                island::update(&island::Upd::Downloading(p));
+            }
+            U::Restarting(_) => island::update(&island::Upd::Restarting),
+            U::Failed(e) if matches!(prev, U::Downloading(..)) => {
+                island::update(&island::Upd::Failed(crate::update::short_reason(&e)));
+            }
+            _ => {}
+        }
+    }
+
+    /// 每秒：等着弹的“新版”（用户回到这台了就弹）、刚更新上来的“已更新”。
+    fn update_tick(&mut self) {
+        if let Some(t) = self.upd_done_at
+            && Instant::now() >= t
+        {
+            self.upd_done_at = None;
+            if let crate::update::State::Updated(v) = crate::update::state() {
+                island::update(&island::Upd::Updated(v));
+            }
+        }
+        let Some(v) = self.upd_pending.clone() else {
+            return;
+        };
+        if !matches!(crate::update::state(), crate::update::State::Available(ref a) if *a == v) {
+            self.upd_pending = None;
+            return;
+        }
+        let st = self.hub.status();
+        if !user_here(&st) {
+            return;
+        }
+        self.upd_pending = None;
+        self.upd_tip_seen = Some(v.clone());
+        // 对方不支持一键更新时不给按钮（只更新一台会连不上），去托盘 / 设置窗口里更新本机
+        let with_button = !st.connected || st.peer_caps & crate::proto::CAP_UPDATE != 0;
+        island::update(&island::Upd::Available { version: v.clone(), with_button });
+        if st.connected && st.peer_caps & crate::proto::CAP_UPDATE != 0 {
+            self.hub.send(crate::proto::Msg::UpdTip { version: v });
+        }
+    }
+
     fn handle(&mut self, m: ToDesktop) -> bool {
         match m {
             m @ (ToDesktop::ClipText(_) | ToDesktop::ClipData(_)) => self.incoming(m),
             ToDesktop::HideCursor => cursor::hide(),
             ToDesktop::ShowCursor => cursor::show(),
-            ToDesktop::Status => self.refresh_tray(),
+            ToDesktop::Status => {
+                self.refresh_tray();
+                crate::panel::refresh(self.panel_view());
+            }
             ToDesktop::ClipForget => sync(|s| s.forget()),
             ToDesktop::PeerForget => {
                 sync(|s| s.forget());
@@ -785,6 +887,12 @@ impl State {
             ToDesktop::KbdNote(ok) => self.kbd_note(ok),
             ToDesktop::Rename(name) => self.renamed_by_peer(&name),
             ToDesktop::KbdTipGone => island::keyboard_gone(),
+            ToDesktop::Update => {
+                self.refresh_tray();
+                self.update_changed();
+                crate::panel::refresh(self.panel_view());
+            }
+            ToDesktop::UpdTipSeen(v) => self.upd_tip_seen = Some(v),
             ToDesktop::Quit => return false,
         }
         true
@@ -895,6 +1003,68 @@ impl State {
         }
     }
 
+    /// 托盘面板上要显示的东西。
+    fn panel_view(&self) -> crate::panel::View {
+        let st = self.hub.status();
+        let cfg = self.hub.cfg();
+        let slot = config::audio_mode_slot(cfg.audio.mode, cfg.me_one());
+        let labels = audio_labels(&cfg, &st.peer_name);
+        let who = |k: usize| -> String { labels[k].split_once(' ').map(|(_, n)| n).unwrap_or("").chars().take(8).collect() };
+        let audio_hint = match slot {
+            0 => "各放各的".to_string(),
+            1 | 2 => format!("全在 {} 放", who(slot)),
+            _ => "两台一起放".to_string(),
+        };
+        crate::panel::View {
+            connected: st.connected,
+            paused: st.paused,
+            peer_name: st.peer_name.clone(),
+            audio: slot,
+            audio_hint,
+            follow: cfg.input.kbd_follow,
+            autostart: self.items.autostart.is_checked(),
+            upd: crate::update::state(),
+            peer_upd: st.connected && st.peer_caps & crate::proto::CAP_UPDATE != 0,
+        }
+    }
+
+    /// 托盘面板上点的动作（和原来菜单项做的一样）；返回 false 表示退出。
+    fn panel_cmd(&mut self, c: crate::panel::Cmd) -> bool {
+        use crate::panel::Cmd;
+        match c {
+            Cmd::Pause(on) => {
+                self.items.pause.set_checked(on);
+                self.hub.to_input(ToInput::Pause(on));
+                self.hub.set_status(|s| s.paused = on);
+            }
+            Cmd::Follow(on) => {
+                self.items.follow.set_checked(on);
+                self.save_follow(on);
+            }
+            Cmd::Autostart(want) => {
+                sys::autostart_set(want);
+                let actual = sys::autostart_get().is_some();
+                self.items.autostart.set_checked(actual);
+                self.save_autostart(actual);
+            }
+            Cmd::Audio(k) => {
+                let m = config::audio_slot_mode(k, self.hub.cfg().me_one());
+                self.items.check_audio(k);
+                self.save_audio(m);
+            }
+            Cmd::Check => crate::update::check_now(),
+            Cmd::Update => crate::update::update_both(),
+            Cmd::Settings => open_settings(),
+            Cmd::Quit => {
+                log!("托盘：退出");
+                self.tray = None;
+                self.hub.to_input(ToInput::Quit);
+                return false;
+            }
+        }
+        true
+    }
+
     /// 菜单事件；返回 false 表示退出。
     fn menu(&mut self, id: &MenuId) -> bool {
         let it = &self.items;
@@ -908,8 +1078,8 @@ impl State {
             let on = it.follow.is_checked();
             self.save_follow(on);
         } else if let Some(k) = it.audio_items.iter().position(|x| x.id() == id) {
-            let m = AUDIO_MENU[k].1;
-            it.check_audio(m);
+            let m = config::audio_slot_mode(k, self.hub.cfg().me_one());
+            it.check_audio(k);
             self.save_audio(m);
         } else if id == it.autostart.id() {
             let want = it.autostart.is_checked();
@@ -966,12 +1136,19 @@ impl State {
     }
 
     /// 托盘勾选和当前声音模式对齐（设置窗口改的、对方同步过来的都在这里跟上）。
+    /// 编号、名字变了（连上对方、改名）也在这里换文字。
     fn sync_audio_menu(&mut self) {
-        let m = self.hub.cfg().audio.mode;
-        if self.audio_shown != Some(m) {
-            self.audio_shown = Some(m);
-            self.items.check_audio(m);
+        let c = self.hub.cfg();
+        let slot = config::audio_mode_slot(c.audio.mode, c.me_one());
+        let labels = audio_labels(&c, &self.hub.status().peer_name);
+        if self.audio_shown.as_ref().is_some_and(|(s, l)| *s == slot && *l == labels) {
+            return;
         }
+        for (it, t) in self.items.audio_items.iter().zip(&labels) {
+            it.set_text(t);
+        }
+        self.items.check_audio(slot);
+        self.audio_shown = Some((slot, labels));
     }
 
     /// 把 autostart 存进配置文件（读-改-写，只动这一项）。不更新 cfg_mtime：让 check_config 照常重新加载，
@@ -1003,6 +1180,12 @@ impl State {
                 self.check_config();
                 self.sync_audio_menu();
                 self.check_rename_peer();
+                match config::take_update_cmd(config::now_ms()).as_deref() {
+                    Some("check") => crate::update::check_now(),
+                    Some("update") => crate::update::update_both(),
+                    _ => {}
+                }
+                self.update_tick();
                 // status.json 上次没写成就重试（内容没变时是空操作）
                 let st = self.hub.status();
                 self.write_status(&st);
@@ -1166,7 +1349,7 @@ impl State {
             let l = c.layout.layout;
             self.hub.send(Msg::Layout { side: l.side, offset: l.offset, scale: l.scale, rev: c.layout.rev });
         }
-        if c.name != old.name || c.port != old.port {
+        if c.name != old.name || c.port != old.port || c.num != old.num {
             self.hub.send(hello(&c, self.desk.clone(), self.dpis.clone()));
         }
         if c.input.kbd_follow != old.input.kbd_follow {
@@ -1180,7 +1363,17 @@ impl State {
 }
 
 fn hello(c: &Config, d: Desk, dpis: Vec<u32>) -> Msg {
-    Msg::Hello { ver: PROTO_VERSION, name: c.name.clone(), monitors: d.monitors, udp_port: c.port, id: crate::proto::instance_id(), dpis, caps: crate::proto::CAPS }
+    Msg::Hello {
+        ver: PROTO_VERSION,
+        name: c.name.clone(),
+        monitors: d.monitors,
+        udp_port: c.port,
+        id: crate::proto::instance_id(),
+        dpis,
+        caps: crate::proto::CAPS,
+        num: c.num,
+        app: crate::update::VERSION.into(),
+    }
 }
 
 /// status.json 的内容（t = 写入时间）。
@@ -1192,6 +1385,10 @@ fn status_file(st: &Status, t: u64) -> StatusFile {
         peer_addr: st.peer_addr.clone(),
         paused: st.paused,
         t,
+        app: crate::update::VERSION.into(),
+        peer_app: st.peer_app.clone(),
+        peer_upd: st.connected && st.peer_caps & crate::proto::CAP_UPDATE != 0,
+        ..crate::update::status_fields()
     }
 }
 
@@ -1332,7 +1529,9 @@ fn build_tray(items: &Items, st: &Status) -> Option<TrayIcon> {
     ]) {
         log!("托盘菜单创建失败：{e}");
     }
-    let mut b = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip(tip_text(st));
+    // 原生菜单不再挂到图标上（点图标弹自绘的托盘面板，panel.rs）；菜单项仍留作状态记录
+    let _ = menu;
+    let mut b = TrayIconBuilder::new().with_tooltip(tip_text(st));
     match Icon::from_rgba(icon_rgba(st.connected), ICON_SIZE, ICON_SIZE) {
         Ok(i) => b = b.with_icon(i),
         Err(e) => log!("生成托盘图标失败：{e}"),
@@ -1380,13 +1579,30 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
             let _ = PostMessageW(Some(HWND(hv as *mut core::ffi::c_void)), WM_APP_WAKE, WPARAM(0), LPARAM(0));
         }
     }));
-    // 托盘鼠标事件用不到；设个空处理器，免得事件堆在内部无界队列里
-    TrayIconEvent::set_event_handler(Some(|_e: TrayIconEvent| {}));
+    // 托盘图标左键 / 右键抬起 → 托盘面板（panel.rs）；别的鼠标事件丢掉（免得堆在内部无界队列里）
+    let (ttx, trx) = unbounded::<RECT>();
+    TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
+        if let TrayIconEvent::Click { rect, button_state: tray_icon::MouseButtonState::Up, button, .. } = e
+            && matches!(button, tray_icon::MouseButton::Left | tray_icon::MouseButton::Right)
+        {
+            let (x, y) = (rect.position.x.round() as i32, rect.position.y.round() as i32);
+            let _ = ttx.send(RECT { left: x, top: y, right: x + rect.size.width as i32, bottom: y + rect.size.height as i32 });
+            unsafe {
+                let _ = PostMessageW(Some(HWND(hv as *mut core::ffi::c_void)), WM_APP_WAKE, WPARAM(0), LPARAM(0));
+            }
+        }
+    }));
+    crate::panel::set_wake(hv);
 
     let cfg = hub.cfg();
     let autostart_on = autostart_sync(cfg.autostart);
     let st = hub.status();
-    let audio_items = AUDIO_MENU.map(|(name, m)| CheckMenuItem::new(name, true, cfg.audio.mode == m, None));
+    let slot = config::audio_mode_slot(cfg.audio.mode, cfg.me_one());
+    let mut k = 0;
+    let audio_items = audio_labels(&cfg, &st.peer_name).map(|t| {
+        k += 1;
+        CheckMenuItem::new(t, true, k - 1 == slot, None)
+    });
     let audio = Submenu::new("声音", true);
     for it in &audio_items {
         if let Err(e) = audio.append(it) {
@@ -1412,6 +1628,7 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
         hwnd,
         rx,
         mrx,
+        trx,
         quitting: false,
         tray,
         items,
@@ -1429,6 +1646,10 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
         status_failed: false,
         shown: Some((st.connected, tip_text(&st))),
         connected: st.connected,
+        upd_prev: crate::update::state(),
+        upd_tip_seen: None,
+        upd_pending: None,
+        upd_done_at: matches!(crate::update::state(), crate::update::State::Updated(_)).then(|| Instant::now() + Duration::from_secs(2)),
     };
     STATE.with(|s| *s.borrow_mut() = Some(state));
 

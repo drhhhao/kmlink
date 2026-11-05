@@ -26,8 +26,10 @@ pub const PROTO_VERSION: u32 = 2;
 pub const CAP_KBD: u32 = 1;
 /// Hello.caps：支持声音（Audio / AudioAck 消息，UDP 声音包）。
 pub const CAP_AUDIO: u32 = 2;
+/// Hello.caps：支持一键更新（Update 消息）。
+pub const CAP_UPDATE: u32 = 4;
 /// 本机支持的能力。
-pub const CAPS: u32 = CAP_KBD | CAP_AUDIO;
+pub const CAPS: u32 = CAP_KBD | CAP_AUDIO | CAP_UPDATE;
 /// TCP 握手魔数（KML2：握手带 X25519 临时公钥）。
 pub const MAGIC: &[u8; 4] = b"KML2";
 /// 旧版魔数：收到它说明对方版本太旧。
@@ -74,6 +76,12 @@ pub enum Msg {
         /// 能力位（CAP_*）；旧版本不带 = 0。
         #[serde(default)]
         caps: u32,
+        /// 本机编号（config num：1 / 2，0 = 还没定）；旧版本不带 = 0。
+        #[serde(default)]
+        num: u8,
+        /// 程序版本（Cargo 版本号，如 "0.1.1"）；旧版本不带 = 空。
+        #[serde(default)]
+        app: String,
     },
     /// 排布（从发送方的角度）。接收方若 rev 更新，则镜像后保存。
     Layout { side: Side, offset: i32, scale: f64, rev: u64 },
@@ -141,6 +149,15 @@ pub enum Msg {
     /// 本机刚弹了“键盘 <本机名>”（用户在本机干活了）：对方收起它正显示的“键盘”提示——两台同时只留一颗。
     /// 旧版本收到会当成无法解析的帧忽略。
     KbdTip,
+    /// 一键更新两台：发送方要更新到这个版本了，接收方也自己去 GitHub 查、校验后更新。
+    /// 只发给 caps 带 CAP_UPDATE 的对方。
+    Update {
+        version: String,
+    },
+    /// 本机刚弹了“新版 x.y.z”：对方别再为同一版本弹。只发给 caps 带 CAP_UPDATE 的对方。
+    UpdTip {
+        version: String,
+    },
 }
 
 /// UDP 明文。
@@ -410,7 +427,9 @@ pub(crate) mod tests {
             _ => panic!(),
         }
         match decode_frame(&encode_chunk(3, 65536, b"abc")) {
-            Some(Frame::Chunk { id, offset, data }) => assert_eq!((id, offset, data), (3, 65536, &b"abc"[..])),
+            Some(Frame::Chunk { id, offset, data }) => {
+                assert_eq!((id, offset, data), (3, 65536, &b"abc"[..]))
+            }
             _ => panic!(),
         }
         match decode_frame(&encode_end(4, 123_456)) {
@@ -594,8 +613,12 @@ pub(crate) mod tests {
             id: 5,
             dpis: vec![144],
             caps: CAPS,
+            num: 2,
+            app: "0.1.1".into(),
         };
         assert_eq!(rt(&h), h);
+        let u = Msg::Update { version: "0.1.1".into() };
+        assert_eq!(rt(&u), u);
         // 键盘跟随的消息往返
         for m in [Msg::Active { epoch: 7 }, Msg::KbdEnter { epoch: 8, prev: 3 }, Msg::KbdLeave { epoch: 8 }, Msg::KbdTip] {
             assert_eq!(rt(&m), m);

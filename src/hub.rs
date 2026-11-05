@@ -85,6 +85,10 @@ pub enum ToDesktop {
     Rename(String),
     /// 收起正显示的“键盘 <本机名>”提示（用户到对方那台干活了：对方弹了提示 / 本机鼠标跨过去了）。
     KbdTipGone,
+    /// 检查更新 / 更新的状态变了（update::state()）。
+    Update,
+    /// 对方已经为这个版本弹过“新版”提示。
+    UpdTipSeen(String),
     Quit,
 }
 
@@ -296,6 +300,9 @@ pub struct Status {
     /// 本机键盘正打到对方（键盘跟随，只转发键盘）
     pub kbd_out: bool,
     pub last_error: String,
+    /// 对方 Hello 里的能力位和程序版本（没连上 = 0 / 空）
+    pub peer_caps: u32,
+    pub peer_app: String,
 }
 
 pub struct Hub {

@@ -4,13 +4,19 @@
 //! 坐标：调用方给逻辑像素（96 DPI 下的 px），Painter 乘 s 换成物理像素；距离场按物理像素算，边缘 1 像素抗锯齿。
 //! 颜色在 sRGB 里直接混合（和浏览器的 CSS 一样），所以照着设计稿的 HTML 取值就能对上。
 //! 画像素前先 GdiFlush，GDI 文字和像素绘制可以任意交错（后画的盖住先画的）。
+//!
+//! 界面字体（Font::ui，设计稿 设计\字体\ 方向 C）：中文用 “Km Rounded”（源樣黑體圓裁出来的，OFL），英文、数字、·、× 用
+//! Nunito（SemiBold / ExtraBold），都打包在 exe 里（assets/fonts/，tools/fonts.py 只裁了界面用到的字），启动时
+//! `load_fonts()` 私有加载（AddFontMemResourceEx，只本进程可见）。一行字按字符分段：拉丁走 Nunito，其余走 Km Rounded，
+//! Km Rounded 里没有的字（用户起的电脑名里的生僻字等）退回微软雅黑。各段按同一条基线画；竖直居中按字号算
+//! （基线 = 中线 + 0.37em），不按各字体的行高（几款字体的行高差很多）。私有字体没加载成功就整行用雅黑（和以前一样）。
 
 use windows::Win32::Foundation::SIZE;
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection,
-    CreateFontW, DEFAULT_CHARSET, DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetTextExtentPoint32W, GetTextFaceW,
-    GetTextMetricsW, HBITMAP, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, SRCCOPY, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW,
-    TRANSPARENT, TextOutW,
+    AddFontMemResourceEx, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
+    CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DIB_RGB_COLORS, DeleteDC, DeleteObject, FONT_QUALITY, GGI_MARK_NONEXISTING_GLYPHS,
+    GdiFlush, GetGlyphIndicesW, GetTextExtentPoint32W, GetTextFaceW, GetTextMetricsW, HBITMAP, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS,
+    SRCCOPY, SelectObject, SetBkMode, SetTextAlign, SetTextColor, TA_BASELINE, TA_LEFT, TEXTMETRICW, TRANSPARENT, TextOutW,
 };
 use windows::Win32::Foundation::COLORREF;
 use windows::core::PCWSTR;
@@ -107,6 +113,10 @@ impl Surface {
         }
     }
 
+    pub fn dc(&self) -> HDC {
+        self.dc
+    }
+
     pub fn blit(&self, dst: HDC) {
         unsafe {
             let _ = GdiFlush();
@@ -114,7 +124,7 @@ impl Surface {
         }
     }
 
-    fn pixels(&mut self) -> &mut [u32] {
+    pub fn pixels(&mut self) -> &mut [u32] {
         unsafe {
             let _ = GdiFlush();
             std::slice::from_raw_parts_mut(self.bits, (self.w * self.h) as usize)
@@ -134,19 +144,133 @@ impl Drop for Surface {
 
 // ───────────────────────── 字体 ─────────────────────────
 
-/// GDI 字体 + 行高（逻辑像素）。
+/// GDI 字体 + 行高（逻辑像素）。Font::ui 的还带拉丁字体（英文数字）和缺字时的退回字体。
 pub struct Font {
+    /// 主字体（中文；输入框 WM_SETFONT 也用它）
     pub h: HFONT,
+    /// 英文、数字、·、× 用的字体（None = 全用主字体）
+    latin: Option<HFONT>,
+    /// 主字体里没有的字退回这个（None = 不检查）
+    fb: Option<HFONT>,
     /// 字符单元高度（ascent + descent），逻辑像素
     pub cell: f32,
+    /// 基线离字符单元顶部多远（逻辑像素）
+    base: f32,
+    /// 字号（逻辑像素）、DPI 缩放
+    px: f32,
+    s: f32,
+}
+
+// ───────────────────────── 界面字体（私有加载） ─────────────────────────
+
+static FONT_KM_R: &[u8] = include_bytes!("../assets/fonts/KmRounded-Regular.ttf");
+static FONT_KM_B: &[u8] = include_bytes!("../assets/fonts/KmRounded-Bold.ttf");
+static FONT_NU_SB: &[u8] = include_bytes!("../assets/fonts/Nunito-SemiBold.ttf");
+static FONT_NU_XB: &[u8] = include_bytes!("../assets/fonts/Nunito-ExtraBold.ttf");
+static FONTS_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// 私有加载界面字体（每个进程一次；只本进程可见，不装进系统）。返回是否全部加载成功。
+pub fn load_fonts() -> bool {
+    *FONTS_OK.get_or_init(|| {
+        let mut ok = true;
+        for d in [FONT_KM_R, FONT_KM_B, FONT_NU_SB, FONT_NU_XB] {
+            let mut n = 0u32;
+            let h = unsafe { AddFontMemResourceEx(d.as_ptr() as *const _, d.len() as u32, None, &mut n) };
+            if h.is_invalid() || n == 0 {
+                ok = false;
+            }
+        }
+        if !ok {
+            crate::log!("界面字体加载失败，改用微软雅黑");
+        }
+        ok
+    })
+}
+
+fn fonts_ok() -> bool {
+    FONTS_OK.get().copied().unwrap_or(false)
+}
+
+/// 走拉丁字体（Nunito）的字：ASCII、Latin-1 和几个常用符号。
+fn is_latin(c: char) -> bool {
+    (' '..='~').contains(&c) || ('\u{a0}'..='\u{ff}').contains(&c) || matches!(c, '–' | '—' | '‘' | '’' | '“' | '”' | '…' | '·' | '•' | '×')
 }
 
 impl Font {
     /// faces：按顺序找第一个装了的字体；px：字号（逻辑像素，CSS 的 font-size）；s：DPI 缩放。
     pub fn new(faces: &[&str], px: f32, weight: i32, s: f32) -> Font {
+        Font::with_quality(faces, px, weight, s, CLEARTYPE_QUALITY)
+    }
+
+    /// 界面字体：中文 Km Rounded + 英文数字 Nunito（粗细加一档：常规 → SemiBold，600 及以上 → ExtraBold），
+    /// 缺字退回微软雅黑。私有字体没加载成功就是微软雅黑。q：抗锯齿方式（透明底上用 ANTIALIASED_QUALITY）。
+    pub fn ui(px: f32, weight: i32, s: f32, q: FONT_QUALITY) -> Font {
+        if !fonts_ok() {
+            return Font::with_quality(&["Microsoft YaHei UI"], px, weight, s, q);
+        }
+        let bold = weight >= 600;
+        let h = create_font("Km Rounded", px, if bold { 700 } else { 400 }, s, q);
+        let latin = create_font(if bold { "Nunito ExtraBold" } else { "Nunito SemiBold" }, px, 400, s, q);
+        let fb = create_font("Microsoft YaHei UI", px, weight, s, q);
+        // 单元高度沿用雅黑的比例（布局都是照它排的），基线按字号居中
+        let cell = (px * 1.32).round();
+        Font { h, latin: Some(latin), fb: Some(fb), cell, base: cell / 2.0 + 0.37 * px, px, s }
+    }
+
+    /// 竖直居中在 cy（物理像素）时的基线（物理像素）。
+    pub fn baseline_at(&self, cy: f32) -> f32 {
+        cy + (self.base - self.cell / 2.0) * self.s
+    }
+
+    #[allow(dead_code)]
+    pub fn px(&self) -> f32 {
+        self.px
+    }
+
+    /// 按字体分段：[(字体, 这一段的 UTF-16)]。拉丁字走 latin，其余走主字体；主字体里没有的字走 fb。
+    fn runs(&self, dc: HDC, text: &str) -> Vec<(HFONT, Vec<u16>)> {
+        let mut out: Vec<(HFONT, Vec<u16>)> = Vec::new();
+        let mut push = |f: HFONT, c: char| {
+            let mut b = [0u16; 2];
+            let u = c.encode_utf16(&mut b);
+            match out.last_mut() {
+                Some((lf, v)) if *lf == f => v.extend_from_slice(u),
+                _ => out.push((f, u.to_vec())),
+            }
+        };
+        // 主字体缺哪些字：一次查完（GetGlyphIndicesW 只认 BMP，补充平面的字直接退回）
+        let chars: Vec<char> = text.chars().collect();
+        let mut missing = vec![false; chars.len()];
+        if let Some(_fb) = self.fb {
+            let bmp: Vec<u16> = chars.iter().map(|c| if (*c as u32) < 0x10000 { *c as u32 as u16 } else { 0xFFFF }).collect();
+            let mut gi = vec![0u16; bmp.len()];
+            unsafe {
+                let old = SelectObject(dc, self.h.into());
+                let n = GetGlyphIndicesW(dc, PCWSTR(bmp.as_ptr()), bmp.len() as i32, gi.as_mut_ptr(), GGI_MARK_NONEXISTING_GLYPHS);
+                SelectObject(dc, old);
+                if n != u32::MAX {
+                    for (i, c) in chars.iter().enumerate() {
+                        missing[i] = gi[i] == 0xFFFF || (*c as u32) >= 0x10000;
+                    }
+                }
+            }
+        }
+        for (i, c) in chars.iter().enumerate() {
+            let f = match (self.latin, self.fb) {
+                (Some(l), _) if is_latin(*c) => l,
+                (_, Some(fb)) if missing[i] => fb,
+                _ => self.h,
+            };
+            push(f, *c);
+        }
+        out
+    }
+
+    /// 同 new，指定抗锯齿方式（画在透明底上要用灰度抗锯齿 ANTIALIASED_QUALITY，ClearType 会有彩边）。
+    pub fn with_quality(faces: &[&str], px: f32, weight: i32, s: f32, q: FONT_QUALITY) -> Font {
         let mut chosen = None;
         for (i, face) in faces.iter().enumerate() {
-            let f = create_font(face, px, weight, s);
+            let f = create_font(face, px, weight, s, q);
             if i + 1 == faces.len() || face_is(f, face) {
                 chosen = Some(f);
                 break;
@@ -155,17 +279,17 @@ impl Font {
                 let _ = DeleteObject(f.into());
             }
         }
-        let h = chosen.unwrap_or_else(|| create_font("Microsoft YaHei UI", px, weight, s));
-        let cell = unsafe {
+        let h = chosen.unwrap_or_else(|| create_font("Microsoft YaHei UI", px, weight, s, q));
+        let (cell, base) = unsafe {
             let dc = CreateCompatibleDC(None);
             let old = SelectObject(dc, h.into());
             let mut tm = TEXTMETRICW::default();
             let _ = GetTextMetricsW(dc, &mut tm);
             SelectObject(dc, old);
             let _ = DeleteDC(dc);
-            tm.tmHeight as f32 / s
+            (tm.tmHeight as f32 / s, tm.tmAscent as f32 / s)
         };
-        Font { h, cell }
+        Font { h, latin: None, fb: None, cell, base, px, s }
     }
 }
 
@@ -173,11 +297,14 @@ impl Drop for Font {
     fn drop(&mut self) {
         unsafe {
             let _ = DeleteObject(self.h.into());
+            for f in [self.latin, self.fb].into_iter().flatten() {
+                let _ = DeleteObject(f.into());
+            }
         }
     }
 }
 
-fn create_font(face: &str, px: f32, weight: i32, s: f32) -> HFONT {
+fn create_font(face: &str, px: f32, weight: i32, s: f32, q: FONT_QUALITY) -> HFONT {
     let w: Vec<u16> = face.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         CreateFontW(
@@ -192,7 +319,7 @@ fn create_font(face: &str, px: f32, weight: i32, s: f32) -> HFONT {
             DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
+            q,
             0,
             PCWSTR(w.as_ptr()),
         )
@@ -216,17 +343,47 @@ fn face_is(f: HFONT, face: &str) -> bool {
 
 /// 文字宽度（逻辑像素）。dc 任意（只用来量）。
 pub fn text_w(dc: HDC, font: &Font, s: f32, text: &str) -> f32 {
+    text_px(dc, font, text) as f32 / s
+}
+
+/// 文字宽度（物理像素）。
+pub fn text_px(dc: HDC, font: &Font, text: &str) -> i32 {
     if text.is_empty() {
-        return 0.0;
+        return 0;
     }
-    let w: Vec<u16> = text.encode_utf16().collect();
+    let mut w = 0;
+    for (f, run) in font.runs(dc, text) {
+        unsafe {
+            let old = SelectObject(dc, f.into());
+            let mut sz = SIZE::default();
+            let _ = GetTextExtentPoint32W(dc, &run, &mut sz);
+            SelectObject(dc, old);
+            w += sz.cx;
+        }
+    }
+    w
+}
+
+/// 在 dc 上画一行字：左边 x、基线 baseline（物理像素），各段字体按同一条基线。颜色、背景模式由调用方设好。
+/// 返回宽度（物理像素）。
+pub fn draw_text_px(dc: HDC, font: &Font, x: i32, baseline: i32, text: &str) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let mut cx = x;
     unsafe {
-        let old = SelectObject(dc, font.h.into());
-        let mut sz = SIZE::default();
-        let _ = GetTextExtentPoint32W(dc, &w, &mut sz);
-        SelectObject(dc, old);
-        sz.cx as f32 / s
+        let old_align = SetTextAlign(dc, TA_BASELINE | TA_LEFT);
+        for (f, run) in font.runs(dc, text) {
+            let old = SelectObject(dc, f.into());
+            let _ = TextOutW(dc, cx, baseline, &run);
+            let mut sz = SIZE::default();
+            let _ = GetTextExtentPoint32W(dc, &run, &mut sz);
+            SelectObject(dc, old);
+            cx += sz.cx;
+        }
+        SetTextAlign(dc, windows::Win32::Graphics::Gdi::TEXT_ALIGN_OPTIONS(old_align));
     }
+    cx - x
 }
 
 // ───────────────────────── 绘制 ─────────────────────────
@@ -614,13 +771,12 @@ impl<'a> Painter<'a> {
         if text.is_empty() {
             return;
         }
-        let w: Vec<u16> = text.encode_utf16().collect();
         unsafe {
             let dc = self.surf.dc;
-            let old = SelectObject(dc, font.h.into());
             SetTextColor(dc, c.colorref());
-            let _ = TextOutW(dc, (x * self.s).round() as i32, (y * self.s).round() as i32, &w);
-            SelectObject(dc, old);
+            let bx = (x * self.s).round() as i32;
+            let by = ((y + font.base) * self.s).round() as i32;
+            draw_text_px(dc, font, bx, by, text);
         }
     }
 

@@ -27,11 +27,13 @@ mod jitter;
 mod island;
 mod log;
 mod net;
+mod panel;
 mod proto;
 mod settings;
 mod smooth;
 mod sys;
 mod ui;
+mod update;
 
 use std::sync::Arc;
 use windows::Win32::Media::timeBeginPeriod;
@@ -48,6 +50,7 @@ fn main() {
         Some("settings") => {
             sys::dpi_aware();
             log::init("settings");
+            ui::load_fonts();
             settings::run();
         }
         Some("audio-probe") => {
@@ -66,6 +69,12 @@ fn main() {
         Some("audio-tone") => {
             console();
             audio_probe::tone(&args[2..]);
+        }
+        // 调试截图：kmlink panel-demo <状态> [秒]
+        Some("panel-demo") => {
+            sys::dpi_aware();
+            ui::load_fonts();
+            panel::demo(args.get(2).map(String::as_str).unwrap_or("idle"), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(6));
         }
         Some("keygen") => {
             console();
@@ -90,7 +99,10 @@ fn daemon(with_console: bool) {
     }
     sys::dpi_aware();
     log::init("kmlink");
+    ui::load_fonts();
 
+    // 刚被旧版本更新换上来：先等旧进程退出（它还占着单实例互斥量）
+    let updated_from = update::after_update(&std::env::args().collect::<Vec<_>>());
     // 只允许一个实例（另一个以管理员身份运行时也算）
     if sys::already_running(sys::DAEMON_MUTEX, true) {
         log!("已经在运行，退出");
@@ -104,6 +116,9 @@ fn daemon(with_console: bool) {
     sys::raise_process_priority();
 
     let (cfg, first_run) = config::Config::load_or_create();
+    if let Some(old) = &updated_from {
+        log!("更新：{old} → {}", update::VERSION);
+    }
     log!("kmlink {} 启动：本机 {}，端口 {}，对方 {}", env!("CARGO_PKG_VERSION"), cfg.name, cfg.port, if cfg.peer.is_empty() { "（等对方连接）" } else { &cfg.peer });
 
     // 上次若异常退出，光标可能还是透明的
@@ -118,6 +133,7 @@ fn daemon(with_console: bool) {
     let audio = audio::Port::new(hub.clone());
     audio::spawn(audio.clone());
     net::spawn(hub.clone(), rx.net, injector.clone(), audio.clone());
+    update::spawn(hub.clone(), updated_from);
     input::run(hub.clone(), rx.input); // 阻塞到“退出”
 
     injector.release_all();

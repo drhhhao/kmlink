@@ -901,7 +901,31 @@ impl Net {
     fn hello(&self, cfg: &Config) -> Msg {
         let udp_port = self.udp.get().and_then(|u| u.local_addr().ok()).map(|a| a.port()).unwrap_or(cfg.port);
         let (desk, dpis) = crate::sys::monitors_dpi();
-        Msg::Hello { ver: PROTO_VERSION, name: cfg.name.clone(), monitors: desk.monitors, udp_port, id: self.opts.id, dpis, caps: proto::CAPS }
+        Msg::Hello {
+            ver: PROTO_VERSION,
+            name: cfg.name.clone(),
+            monitors: desk.monitors,
+            udp_port,
+            id: self.opts.id,
+            dpis,
+            caps: proto::CAPS,
+            num: cfg.num,
+            app: crate::update::VERSION.into(),
+        }
+    }
+
+    /// 对方报来它的编号：算出本机的（config::resolve_num），变了就写进配置（重新加载后重发 Hello，对方再核对一次）。
+    fn settle_num(&self, theirs: u8, peer_id: u64) {
+        let cfg = self.hub.cfg();
+        let n = config::resolve_num(cfg.num, theirs, cfg.layout.layout.side, self.opts.id, peer_id);
+        if n == cfg.num {
+            return;
+        }
+        crate::log!("本机编号定为 {n}（对方报 {theirs}）");
+        // 只写文件：desktop 重新加载时看到 num 变了才会重发 Hello（内存里先改了它就看不出变化）
+        if let Err(e) = config::update(&cfg, |c| c.num = n) {
+            crate::log!("保存编号失败：{e}");
+        }
     }
 
     fn send_hello<W: Write>(&self, w: &mut W, tx: &mut Sealer, cfg: &Config) -> io::Result<()> {
@@ -1098,6 +1122,8 @@ impl Net {
         self.hub.set_status(|s| {
             s.connected = false;
             s.peer_addr.clear();
+            s.peer_caps = 0;
+            s.peer_app.clear();
         });
     }
 
@@ -1156,9 +1182,12 @@ impl Net {
     /// 处理一条消息。只在 reader 线程调用：绝不直接写 socket（回复走可靠队列 → net-tcp）。
     fn handle(&self, sess: &Session, m: Msg, st: &mut RxState) {
         match m {
-            Msg::Hello { ver, name, monitors, udp_port, dpis, caps, .. } => {
+            Msg::Hello { ver, name, monitors, udp_port, dpis, caps, num, app, .. } => {
                 if ver != PROTO_VERSION {
                     crate::log!("对方协议版本 {ver} 与本机 {PROTO_VERSION} 不同");
+                }
+                if self.opts.persist {
+                    self.settle_num(num, sess.peer_id);
                 }
                 let name = proto::sanitize_name(name);
                 let n_in = monitors.len();
@@ -1179,10 +1208,13 @@ impl Net {
                 let addr = sess.peer.to_string();
                 let n = name.clone();
                 let udp_down = self.udp.get().is_none();
+                let app = proto::sanitize_name(app);
                 self.hub.set_status(|s| {
                     s.connected = true;
                     s.peer_name = n;
                     s.peer_addr = addr;
+                    s.peer_caps = caps;
+                    s.peer_app = app;
                     if udp_down {
                         s.last_error = ERR_UDP_DOWN.into();
                     } else {
@@ -1247,6 +1279,8 @@ impl Net {
             Msg::Ping { t } => self.enqueue(Out::Msg(Msg::Pong { t })),
             Msg::Rename { name } => self.hub.to_desktop(ToDesktop::Rename(name)),
             Msg::KbdTip => self.hub.to_desktop(ToDesktop::KbdTipGone),
+            Msg::Update { version } => crate::update::peer_asks(version),
+            Msg::UpdTip { version } => self.hub.to_desktop(ToDesktop::UpdTipSeen(proto::sanitize_name(version))),
             Msg::Audio { mode, rev } => {
                 if let Some(a) = &self.opts.audio {
                     a.peer_mode(sess.id, sess.peer_id, mode, rev);
@@ -2050,7 +2084,9 @@ mod tests {
             _ => panic!("expected msg"),
         }
         match proto::decode_frame(&read_frame(&mut s, &mut sc.rx, MAX_FRAME).unwrap()) {
-            Some(Frame::Chunk { id, offset, data }) => assert_eq!((id, offset, data.len()), (9, 0, CHUNK)),
+            Some(Frame::Chunk { id, offset, data }) => {
+                assert_eq!((id, offset, data.len()), (9, 0, CHUNK))
+            }
             _ => panic!("expected chunk"),
         }
         // s → c

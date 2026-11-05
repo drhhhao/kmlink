@@ -1,12 +1,12 @@
 //! 设置窗口（单独进程：`kmlink.exe settings`，关掉就退出，不占主程序内存）。全部自绘（src/ui.rs），设计稿：设计\设置窗口\proof.html（方向 B「舞台」）。
 //!
-//! 窗口 820 x 600（含 32 高的系统标题栏，按 DPI 缩放），不可调大小，标题“kmlink”。跟随系统浅色 / 深色
+//! 窗口 820 x 640（含 32 高的系统标题栏，按 DPI 缩放），不可调大小，标题“kmlink”。跟随系统浅色 / 深色
 //! （注册表 AppsUseLightTheme；收到 WM_SETTINGCHANGE "ImmersiveColorSet" 重画），标题栏用 DWMWA_CAPTION_COLOR 涂成舞台顶色。
 //! 改了就生效，没有“保存 / 取消”。
 //!
 //! 1. 舞台（上方 820 x 292，柔和渐变）：两台的显示器缩放到 740 x 188 的区域里居中。每块屏幕是圆角矩形 + “壁纸”渐变
 //!    （本机偏蓝、对方偏绿）+ 柔和投影；主显示器底部一颗玻璃胶囊：名字（本机带“本机”标签）+ “3840×2160 · 150%”，
-//!    其它显示器只写尺寸。两台相接的区段画一条绿色细条（鼠标从这里过去）。左上“已连接 / 未连接”，右上“拖动摆放”，
+//!    其它显示器只写尺寸。主显示器中间一个大编号 1 / 2（config num，定了不随排布变），正放着声音的那台深、别的浅。两台相接的区段画一条绿色细条（鼠标从这里过去）。左上“已连接 / 未连接”，右上“拖动摆放”，
 //!    左下“WiFi电脑 在本机左侧 · 下移 416 像素”，右下“尺寸比例 − 1.00 +”（0.25 ~ 4，步进 0.05，点了立即生效）。
 //!    - 拖对方的屏幕：放大 2.5%、投影加深、94% 不透明，绿色虚线框标出松手后吸附的位置，左下文字实时变；拖动中画布比例不变。
 //!      松手后 240ms 滑进虚线框（cubic-bezier(.2,.8,.2,1)），然后写配置（rev = next_rev，排布真变了才写）。
@@ -16,18 +16,23 @@
 //!    - 对方屏幕来自 peer.json（主程序写，含每块屏的 DPI，没有就只写分辨率）；从没连上过：名字“对方”、尺寸“—”、1920×1080 灰色虚线占位。
 //! 2. 卡片（下方，两栏各 4 行，行高 50）：左“连接”——对方 IP（填一台即可）、配对密钥（两台须相同；只显示首尾，旁边复制 / 换新密钥，
 //!    换之前弹小确认框）、本机 IP（只列真实局域网 IPv4：去掉回环、169.254、Clash 的 198.18/15；有网关的优先）+ 复制、开机自启。
-//!    右“共用”——声音（四段分段控件 关 / 本机 / 对方 / 两台 = config audio.mode off/here/there/both，灰字随档位变，
+//!    右“共用”——声音（四段分段控件 关 / 1 / 2 / 两台：1、2 = 舞台上标着这个大数字的那台放，存成本机视角的
+//!    config audio.mode off/here/there/both（config::audio_slot_mode；编号见 config num），灰字随档位变，
 //!    未连接时灰字“连上后生效”；改了写 mode + 新 rev，主程序同步给对方）、键盘跟随、剪贴板同步、复制提示。点了立即写配置。
 //!    设计稿：设计\设置窗口\声音\（方案 A）。
 //!    输入框（对方 IP、密钥、名字）按回车或失焦时校验：对就写入；不对则该行提示变红、输入框红圈。输入框用真的 EDIT 控件
 //!    （光标、选择、中文输入法、粘贴都靠它），平时隐藏，点到哪个框才盖上去。
-//! 3. 状态：每 500ms 读 status.json（主程序写；connected 为真、主程序互斥量在且 pid 还活着才算已连接）、peer.json、config.toml（改了就重新读入）。
+//! 3. 底部一行（设计稿：设计\检查更新\settings.html）：左“kmlink 0.1.1”（对方不支持一键更新时带“· 对方 0.1.0”），
+//!    有新版时绿色小标签“新版 x.y.z”；右边一个动作：检查更新 / 正在检查… / 已是最新 / 更新两台（对方不支持：“对方需手动更新”+
+//!    更新本机）/ 正在更新 45% + 进度条 / 正在重启… / 已更新到 x / 更新失败 · 原因 + 重试。状态来自 status.json 的 upd* 字段；
+//!    点按钮写 update_cmd.json（"check" / "update"），主程序每秒取走。主程序没在运行时右边不放东西。
+//! 4. 状态：每 500ms 读 status.json（主程序写；connected 为真、主程序互斥量在且 pid 还活着才算已连接）、peer.json、config.toml（改了就重新读入）。
 //!
 //! 只允许一个设置窗口（命名互斥量 Local\kmlink-settings），再打开就把已有的窗口提到前面。
 //! 所有窗口坐标是物理像素（进程已 PerMonitorV2）；布局常量是 96 DPI 下的逻辑像素，乘 s = dpi/96。
 //! 调试截图用：KMLINK_THEME=dark|light 强制主题；KMLINK_UI=hover|edit|drag|offhover|popover 直接呈现某个状态。
 
-use crate::config::{self, AudioMode, Config};
+use crate::config::{self, Config};
 use crate::geom::{Desk, Layout, Rect, Side};
 use crate::sys;
 use crate::ui::{self, Font, Painter, Rgba, Seg, Surface, hex, hexa};
@@ -482,7 +487,9 @@ fn system_dark() -> bool {
 // ---------------------------------------------------------------------------
 
 const CLIENT_W: f32 = 820.0;
-const CLIENT_H: f32 = 568.0;
+const CLIENT_H: f32 = 608.0;
+/// 底部一行（版本 / 更新）的竖直中线
+const FOOT_CY: f32 = 580.0;
 const STAGE_H: f32 = 292.0;
 /// 舞台里画屏幕的区域
 const AREA: R = R::new(40.0, 46.0, 740.0, 188.0);
@@ -508,12 +515,12 @@ const SWITCH_LABELS: [&str; 4] = ["键盘跟随", "剪贴板同步", "复制提�
 const SW_N: usize = 4;
 /// 声音分段控件（右栏第 1 行，右边和开关对齐），每段 44，槽里留 2。
 const AUDIO_SEG: R = R::new(604.0, 353.0, 180.0, 28.0);
-const AUDIO_LABELS: [&str; 4] = ["关", "本机", "对方", "两台"];
-const AUDIO_HINTS: [&str; 4] = ["各放各的", "全在本机放", "全在对方放", "混在一起都放"];
-const AUDIO_MODES: [AudioMode; 4] = [AudioMode::Off, AudioMode::Here, AudioMode::There, AudioMode::Both];
+/// 1、2 = 舞台上标着这个大数字的那台放（config::audio_slot_mode 换成本机视角的 here/there）。
+const AUDIO_LABELS: [&str; 4] = ["关", "1", "2", "两台"];
+const AUDIO_HINTS: [&str; 4] = ["各放各的", "全在 1 号放", "全在 2 号放", "混在一起都放"];
 
-fn audio_index(m: AudioMode) -> usize {
-    AUDIO_MODES.iter().position(|&x| x == m).unwrap_or(0)
+fn audio_index(c: &Config) -> usize {
+    config::audio_mode_slot(c.audio.mode, c.me_one())
 }
 
 /// 分段控件里 x 落在第几段（两端的 2 像素边算进最近的段）。
@@ -587,6 +594,25 @@ enum Hot {
     PopCancel,
     PopOk,
     Pop,
+    /// 底部的更新按钮
+    Upd,
+}
+
+/// 底部一行的样子（由 status.json 的 upd* 字段得出）。
+#[derive(Clone, Debug, PartialEq)]
+enum UpdView {
+    /// 主程序没在运行
+    None,
+    Idle,
+    Checking,
+    Latest,
+    Avail(String),
+    /// 有新版，但对方连着却不支持一键更新
+    AvailSolo(String),
+    Down(u8),
+    Restarting,
+    Failed(String),
+    Done(String),
 }
 
 /// 可编辑的字段。
@@ -665,29 +691,47 @@ struct Fonts {
     mono: Font,
     btn: Font,
     seg_on: Font,
+    /// 舞台上每台主显示器中间的大编号
+    big: Font,
+    /// 底部一行
+    foot: Font,
+    foot_b: Font,
+    upchip: Font,
+    fbtn: Font,
+    fbtn_ink: Font,
 }
 
-const YAHEI: &[&str] = &["Microsoft YaHei UI"];
 const SEGOE: &[&str] = &["Segoe UI"];
+
+/// 界面字体（中文 Km Rounded + 英文数字 Nunito，ui::Font::ui）。
+fn uf(px: f32, weight: i32, s: f32) -> Font {
+    Font::ui(px, weight, s, windows::Win32::Graphics::Gdi::CLEARTYPE_QUALITY)
+}
 
 impl Fonts {
     fn new(s: f32) -> Fonts {
         Fonts {
-            name: Font::new(YAHEI, 13.5, 700, s),
-            res: Font::new(SEGOE, 11.5, 400, s),
-            tag: Font::new(YAHEI, 10.5, 700, s),
-            chip: Font::new(YAHEI, 12.0, 700, s),
-            small: Font::new(YAHEI, 12.0, 400, s),
-            stat: Font::new(YAHEI, 12.5, 400, s),
-            stat_b: Font::new(YAHEI, 12.5, 700, s),
-            step: Font::new(&["Segoe UI Semibold", "Segoe UI"], 12.5, 600, s),
-            group: Font::new(YAHEI, 12.0, 700, s),
-            label: Font::new(YAHEI, 13.0, 400, s),
-            hint: Font::new(YAHEI, 11.5, 400, s),
+            name: uf(13.5, 700, s),
+            res: uf(11.5, 400, s),
+            tag: uf(10.5, 700, s),
+            chip: uf(12.0, 700, s),
+            small: uf(12.0, 400, s),
+            stat: uf(12.5, 400, s),
+            stat_b: uf(12.5, 700, s),
+            step: uf(12.5, 600, s),
+            group: uf(12.0, 700, s),
+            label: uf(13.0, 400, s),
+            hint: uf(11.5, 400, s),
             input: Font::new(SEGOE, 13.0, 400, s),
             mono: Font::new(&["Cascadia Mono", "Consolas"], 12.0, 400, s),
-            btn: Font::new(YAHEI, 12.5, 400, s),
-            seg_on: Font::new(YAHEI, 12.5, 700, s),
+            btn: uf(12.5, 400, s),
+            seg_on: uf(12.5, 700, s),
+            big: uf(46.0, 600, s),
+            foot: uf(12.5, 400, s),
+            foot_b: uf(12.5, 700, s),
+            upchip: uf(11.5, 700, s),
+            fbtn: uf(12.5, 600, s),
+            fbtn_ink: uf(12.5, 700, s),
         }
     }
 }
@@ -749,6 +793,14 @@ struct App {
     ips: Vec<String>,
     /// 调试截图：悬停状态不随鼠标变
     frozen: bool,
+    /// status.json 里的版本 / 更新状态（upd* 等字段）；主程序没在运行时为默认值
+    upd: config::StatusFile,
+    /// 主程序在运行（能检查更新）
+    daemon: bool,
+    /// 刚点了“检查更新”：主程序取走命令前先显示“正在检查…”（最多 3 秒）
+    upd_click: Option<Instant>,
+    /// 转圈动画的起点
+    spin0: Instant,
 }
 
 thread_local! {
@@ -891,6 +943,41 @@ impl App {
             || self.audio_t.is_some_and(|t| ms_since(t) < SWITCH_MS + 20.0)
             || self.flash.is_some_and(|(_, t)| ms_since(t) < FLASH_MS + FADE_MS + 20.0)
             || self.copied.is_some_and(|(_, t)| ms_since(t) < FLASH_MS + 20.0)
+            || matches!(self.upd_view(), UpdView::Checking | UpdView::Restarting)
+    }
+
+    /// 底部一行现在该显示什么。
+    fn upd_view(&self) -> UpdView {
+        if !self.daemon {
+            return UpdView::None;
+        }
+        let u = &self.upd;
+        match u.upd.as_str() {
+            "checking" => UpdView::Checking,
+            "latest" => UpdView::Latest,
+            "avail" if self.connected && !u.peer_upd => UpdView::AvailSolo(u.upd_ver.clone()),
+            "avail" => UpdView::Avail(u.upd_ver.clone()),
+            "down" => UpdView::Down(u.upd_pct),
+            "restart" => UpdView::Restarting,
+            "fail" => UpdView::Failed(u.upd_err.clone()),
+            "done" => UpdView::Done(u.upd_ver.clone()),
+            _ if self.upd_click.is_some_and(|t| t.elapsed() < Duration::from_secs(3)) => UpdView::Checking,
+            _ => UpdView::Idle,
+        }
+    }
+
+    /// 底部右边按钮：(位置, 文字, 黑底)。没有按钮返回 None。
+    fn upd_button(&self) -> Option<(R, &'static str, bool)> {
+        let (t, ink) = match self.upd_view() {
+            UpdView::Idle => ("检查更新", false),
+            UpdView::Avail(_) => ("更新两台", true),
+            UpdView::AvailSolo(_) => ("更新本机", true),
+            UpdView::Failed(_) => ("重试", false),
+            _ => return None,
+        };
+        let f = if ink { &self.fonts.fbtn_ink } else { &self.fonts.fbtn };
+        let w = self.measure(f, t) + 28.0;
+        Some((R::new(CLIENT_W - 20.0 - w, FOOT_CY - 14.0, w, 28.0), t, ink))
     }
 
     fn measure(&self, f: &Font, t: &str) -> f32 {
@@ -1159,6 +1246,9 @@ fn hit(a: &App, sc: &Scene, x: f32, y: f32) -> Hot {
     if a.drag.is_some() || a.drop.is_some() {
         return Hot::None;
     }
+    if a.upd_button().is_some_and(|(r, ..)| r.contains(x, y)) {
+        return Hot::Upd;
+    }
     if IP_BOX.contains(x, y) {
         return Hot::Ip;
     }
@@ -1359,6 +1449,23 @@ fn draw_screen(p: &mut Painter, a: &App, s: &Scr) {
         p.rrect_with(r.x, r.y, r.w, r.h, 10.0, |x, y| wall.at(x - r.x, y - r.y, r.w, r.h));
         p.ring(r.x, r.y, r.w, r.h, 10.0, -1.0, 0.0, th.scrline);
     }
+    if s.pill.primary {
+        // 编号：主显示器中间（屏幕顶到名字胶囊之间）一个大数字；正放着声音的那台深，别的浅
+        let one = a.cfg.me_one() != s.peer;
+        let n = if one { 1 } else { 2 };
+        let playing = a.connected && (a.audio == n || a.audio == 3);
+        let top = r.y;
+        let bottom = if s.pill.glass { s.pill.r.y } else { r.y + r.h };
+        let cy = (top + bottom) / 2.0;
+        // GDI 文字不认透明度：和数字所在处的壁纸颜色混出深浅
+        let c = if s.offline {
+            th.mutd
+        } else {
+            let wall = if s.peer { th.wb } else { th.wa };
+            wall.at(r.cx() - r.x, cy - r.y, r.w, r.h).lerp(th.fg, if playing { 0.88 } else { 0.28 })
+        };
+        text_c(p, r.cx(), cy, if one { "1" } else { "2" }, &a.fonts.big, c);
+    }
     draw_pill(p, a, &s.pill);
 }
 
@@ -1537,6 +1644,8 @@ fn render(p: &mut Painter, a: &App, sc: &Scene) {
         p.circle(kx, r.cy(), 10.0, th.knob);
     }
 
+    draw_footer(p, a);
+
     // 提示 / 确认框
     if let Some(t) = sc.tip {
         p.shadow(t.x, t.y, t.w, t.h, 7.0, 0.0, 6.0, 16.0, -6.0, hexa(0, 0.25));
@@ -1558,6 +1667,101 @@ fn render(p: &mut Painter, a: &App, sc: &Scene) {
         p.rrect(ok.x, ok.y, ok.w, ok.h, 7.0, g);
         text_c(p, ok.cx(), ok.cy(), "更换", &f.btn, hex(0xFFFFFF));
     }
+}
+
+/// 底部一行：版本 + 更新（设计稿 设计\检查更新\settings.html）。
+fn draw_footer(p: &mut Painter, a: &App) {
+    let th = &a.th;
+    let f = &a.fonts;
+    let cy = FOOT_CY;
+    let view = a.upd_view();
+    let ink = if th.dark { hex(0xF2F2F7) } else { hex(0x1C1C1E) };
+    let ink_fg = if th.dark { hex(0x1C1C1E) } else { hex(0xFFFFFF) };
+    let orange = hex(0xFF9F0A);
+
+    // 左：kmlink 版本（· 对方版本）（新版标签）
+    let shown = match &view {
+        UpdView::Done(v) if !v.is_empty() => v.clone(),
+        _ => a.upd.app.clone(),
+    };
+    let shown = if shown.is_empty() { crate::update::VERSION.to_string() } else { shown };
+    let mut x = 24.0;
+    x += p.text_mid(x, cy, "kmlink", &f.foot_b, th.fg2) + 5.0;
+    let mut ver = shown;
+    if matches!(view, UpdView::AvailSolo(_)) && !a.upd.peer_app.is_empty() {
+        ver = format!("{ver} · 对方 {}", a.upd.peer_app);
+    }
+    x += p.text_mid(x, cy, &ver, &f.foot, th.mutd) + 10.0;
+    if let UpdView::Avail(v) | UpdView::AvailSolo(v) = &view {
+        let t = format!("新版 {v}");
+        let w = 6.0 + 10.0 + 4.0 + p.measure(&f.upchip, &t) + 8.0;
+        let (bg, fg) = if th.dark { (hexa(0x30D158, 0.18), hex(0x30D158)) } else { (hexa(0x34C759, 0.14), hex(0x248A3D)) };
+        p.rrect(x, cy - 11.0, w, 22.0, 7.0, bg);
+        arrow_up(p, x + 11.0, cy, 9.0, fg);
+        p.text_mid(x + 20.0, cy, &t, &f.upchip, fg);
+    }
+
+    // 右：按钮 / 状态
+    let mut right = CLIENT_W - 20.0;
+    if let Some((r, t, is_ink)) = a.upd_button() {
+        let hov = a.hover == Hot::Upd;
+        if is_ink {
+            p.rrect(r.x, r.y, r.w, r.h, 14.0, if hov { ink.lerp(th.bg, 0.15) } else { ink });
+            text_c(p, r.cx(), r.cy(), t, &f.fbtn_ink, ink_fg);
+        } else {
+            glass(p, th, r, 14.0);
+            if hov {
+                p.rrect(r.x, r.y, r.w, r.h, 14.0, th.hov);
+            }
+            text_c(p, r.cx(), r.cy(), t, &f.fbtn, th.fg);
+        }
+        right = r.x - 10.0;
+    }
+    let spin = |p: &mut Painter, rx: f32| {
+        let a0 = a.spin0.elapsed().as_secs_f32() * std::f32::consts::TAU * 1.2;
+        p.stroke(&[Seg::Arc(rx, cy, 5.5, a0, a0 + 4.2)], 1.6, th.mutd);
+    };
+    match &view {
+        UpdView::Checking | UpdView::Restarting => {
+            let t = if view == UpdView::Checking { "正在检查…" } else { "正在重启…" };
+            let w = p.measure(&f.foot, t);
+            p.text_mid(right - w, cy, t, &f.foot, th.mutd);
+            spin(p, right - w - 12.0);
+        }
+        UpdView::Latest | UpdView::Done(_) => {
+            let t = match &view {
+                UpdView::Done(v) => format!("已更新到 {v}"),
+                _ => "已是最新".to_string(),
+            };
+            let w = p.measure(&f.foot, &t);
+            p.text_mid(right - w, cy, &t, &f.foot, th.fg2);
+            icon(p, Icon::Check, right - w - 13.0, cy, 14.0, 2.4, th.green);
+        }
+        UpdView::AvailSolo(_) => text_r(p, right, cy, "对方需手动更新", &f.foot, th.mutd),
+        UpdView::Down(pct) => {
+            let bar = R::new(right - 120.0, cy - 2.0, 120.0, 4.0);
+            p.rrect(bar.x, bar.y, bar.w, bar.h, 2.0, th.fill);
+            let fw = (bar.w * (*pct as f32 / 100.0)).max(4.0);
+            p.rrect(bar.x, bar.y, fw, bar.h, 2.0, th.green);
+            text_r(p, bar.x - 10.0, cy, &format!("正在更新 {pct}%"), &f.foot, th.fg2);
+        }
+        UpdView::Failed(e) => {
+            // 括号里的细节（哪一步连不上）不上界面
+            let e = e.split('（').next().unwrap_or("").trim();
+            let t = if e.is_empty() { "更新失败".to_string() } else { format!("更新失败 · {e}") };
+            let w = p.measure(&f.foot, &t);
+            p.text_mid(right - w, cy, &t, &f.foot, th.fg2);
+            p.circle(right - w - 9.0, cy, 3.5, orange);
+        }
+        _ => {}
+    }
+}
+
+/// 向上的小箭头（新版标签里），中心 (cx, cy)，高 h。
+fn arrow_up(p: &mut Painter, cx: f32, cy: f32, h: f32, c: Rgba) {
+    let t = cy - h / 2.0;
+    let b = cy + h / 2.0;
+    p.stroke(&[Seg::Line(cx, b, cx, t + 1.0), Seg::Line(cx - 3.5, t + 3.5, cx, t), Seg::Line(cx + 3.5, t + 3.5, cx, t)], 1.6, c);
 }
 
 // ---------------------------------------------------------------------------
@@ -1847,6 +2051,10 @@ fn sync_edits() {
 
 /// 已有设置窗口：提到前面，返回 true（本进程该退出）。已有的那个以管理员身份运行时也算。
 fn already_running() -> bool {
+    // 调试截图（KMLINK_UPD）：不管已开着的设置窗口
+    if std::env::var_os("KMLINK_UPD").is_some() {
+        return false;
+    }
     if !sys::already_running(w!("Local\\kmlink-settings"), false) {
         return false;
     }
@@ -2030,7 +2238,7 @@ pub fn run() {
         let mine = local_monitors();
         // 开机自启以注册表为准（主程序没在跑时 config 里的值可能没生效）
         let sw = [cfg.input.kbd_follow, cfg.clipboard.enabled, cfg.clipboard.notify, sys::autostart_get().is_some()];
-        let audio = audio_index(cfg.audio.mode);
+        let audio = audio_index(&cfg);
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
                 hwnd,
@@ -2077,6 +2285,10 @@ pub fn run() {
                 popover: false,
                 ips: lan_ips(),
                 frozen: false,
+                upd: config::StatusFile::default(),
+                daemon: false,
+                upd_click: None,
+                spin0: Instant::now(),
             })
         });
         poll();
@@ -2409,6 +2621,28 @@ fn finish(f: Field, commit: bool, enter: bool) {
 /// 每 500ms：连接状态、对方屏幕、配置文件。
 fn poll() {
     let (connected, status_name) = read_status();
+    let mut daemon = sys::daemon_running();
+    let mut upd = if daemon { config::load_status().unwrap_or_default() } else { config::StatusFile::default() };
+    // 调试截图：KMLINK_UPD=状态[:版本或进度或原因]，如 avail:0.2.0、solo:0.2.0、down:45、fail:连不上 GitHub
+    if let Ok(v) = std::env::var("KMLINK_UPD") {
+        let (k, arg) = v.split_once(':').unwrap_or((v.as_str(), ""));
+        daemon = true;
+        upd.app = "0.1.1".into();
+        upd.peer_app = "0.1.0".into();
+        upd.peer_upd = k != "solo";
+        upd.upd = if k == "solo" {
+            "avail".into()
+        } else if k == "idle" {
+            String::new()
+        } else {
+            k.into()
+        };
+        match k {
+            "down" => upd.upd_pct = arg.parse().unwrap_or(0),
+            "fail" => upd.upd_err = arg.into(),
+            _ => upd.upd_ver = arg.into(),
+        }
+    }
     let peer = read_peer();
     let mt = cfg_mtime();
     // 拖动 / 落位动画中先不重新读入（也不记下新的修改时间），结束后第一次轮询再读，免得丢掉对方改的排布
@@ -2416,8 +2650,15 @@ fn poll() {
     let new_cfg = if reload { Config::load() } else { None };
     let r = with_app(|a| {
         let before = (a.connected, a.status_name.clone(), a.peer_file_name.clone(), a.peer.clone(), a.rename_pending.is_some());
+        let upd_before = (a.daemon, a.upd.clone(), a.upd_view());
         a.connected = connected;
         a.status_name = status_name;
+        a.daemon = daemon;
+        if upd.upd != a.upd.upd {
+            a.upd_click = None; // 主程序已经接手（状态变了）
+        }
+        a.upd = upd;
+        let upd_changed = upd_before != (a.daemon, a.upd.clone(), a.upd_view());
         let busy = a.drag.is_some() || a.drop.is_some();
         if !busy {
             match peer {
@@ -2441,7 +2682,7 @@ fn poll() {
             a.cfg_mtime = mt;
             if let Some(c) = new_cfg {
                 let sw = [c.input.kbd_follow, c.clipboard.enabled, c.clipboard.notify, c.autostart];
-                a.set_audio(audio_index(c.audio.mode));
+                a.set_audio(audio_index(&c));
                 for i in 0..SW_N {
                     if sw[i] != a.sw[i] {
                         a.sw[i] = sw[i];
@@ -2456,7 +2697,7 @@ fn poll() {
             }
         }
         let after = (a.connected, a.status_name.clone(), a.peer_file_name.clone(), a.peer.clone(), a.rename_pending.is_some());
-        (a.edit == Some(Field::PeerName) && !a.connected, reload || before != after)
+        (a.edit == Some(Field::PeerName) && !a.connected, reload || before != after || upd_changed)
     });
     let Some((cancel, changed)) = r else { return };
     if cancel {
@@ -2464,6 +2705,7 @@ fn poll() {
     }
     if changed {
         refresh();
+        ensure_anim();
     }
 }
 
@@ -2589,16 +2831,31 @@ fn on_click(hot: Hot) {
             let changed = with_app(|a| {
                 let c = a.audio != k;
                 a.set_audio(k);
-                c
+                c.then(|| config::audio_slot_mode(k, a.cfg.me_one()))
             });
-            if changed == Some(true) {
+            if let Some(Some(m)) = changed {
                 // 新 rev（rev_mode 跟着记）：主程序重新读配置后发给对方，对方换成它的视角
-                let m = AUDIO_MODES[k];
                 write_cfg(|c| {
                     c.audio.mode = m;
                     c.audio.rev = config::next_rev(c.audio.rev);
                     c.audio.rev_mode = Some(m);
                 });
+            }
+        }
+        Hot::Upd => {
+            let cmd = with_app(|a| match a.upd_view() {
+                UpdView::Avail(_) | UpdView::AvailSolo(_) => "update",
+                _ => {
+                    a.upd_click = Some(Instant::now());
+                    "check"
+                }
+            });
+            if let Some(cmd) = cmd {
+                if let Err(e) = write_atomic("update_cmd.json", &config::update_cmd_json(cmd, config::now_ms())) {
+                    crate::log!("设置窗口：写 update_cmd.json 失败 {e}");
+                }
+                refresh();
+                ensure_anim();
             }
         }
         Hot::Minus => on_scale(-1),
@@ -2957,7 +3214,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                         return IDC_SIZEALL;
                     }
                     match a.hover {
-                        Hot::NameLocal | Hot::NamePeer => IDC_HAND,
+                        Hot::NameLocal | Hot::NamePeer | Hot::Upd => IDC_HAND,
                         Hot::Peer => IDC_SIZEALL,
                         Hot::Ip | Hot::Key => IDC_IBEAM,
                         _ => IDC_ARROW,
@@ -3095,8 +3352,13 @@ mod tests {
         }
         assert_eq!(switch_row(3).x, 36.0, "开机自启在左栏");
         assert!(CARD.y > STAGE_H && CARD.y + CARD.h < CLIENT_H);
-        for (k, m) in AUDIO_MODES.iter().enumerate() {
-            assert_eq!(audio_index(*m), k);
+        let mut c = Config::default();
+        for num in [1, 2] {
+            c.num = num;
+            for k in 0..4 {
+                c.audio.mode = config::audio_slot_mode(k, c.me_one());
+                assert_eq!(audio_index(&c), k);
+            }
         }
     }
 
