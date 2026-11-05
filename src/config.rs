@@ -49,6 +49,8 @@ pub struct ClipCfg {
     pub images: bool,
     pub max_text_kb: u32,
     pub max_image_mb: u32,
+    /// 复制后在屏幕底部弹提示（两台同时弹）。
+    pub notify: bool,
 }
 
 impl Default for Config {
@@ -80,7 +82,7 @@ impl Default for InputCfg {
 
 impl Default for ClipCfg {
     fn default() -> Self {
-        Self { enabled: true, images: true, max_text_kb: 1024, max_image_mb: 32 }
+        Self { enabled: true, images: true, max_text_kb: 1024, max_image_mb: 32, notify: true }
     }
 }
 

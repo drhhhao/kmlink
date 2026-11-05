@@ -47,6 +47,7 @@ use crate::config::Config;
 use crate::geom::Desk;
 use crate::hub::{self, Hub, Out, Status, StreamTx, ToDesktop, ToInput, WM_APP_WAKE};
 use crate::proto::{self, Msg, PROTO_VERSION};
+use crate::island::{self, Kind, Note};
 use crate::{clip, config, cursor, log, sys};
 use crossbeam_channel::{Receiver, unbounded};
 use std::cell::{Cell, OnceCell, RefCell};
@@ -350,8 +351,14 @@ fn run_job(hub: &Hub, job: Job) {
     if !go {
         return;
     }
+    let (kind, detail) = match &data {
+        Payload::Text(t) => (Kind::Text, island::preview(t)),
+        Payload::Image(d) => (Kind::Image, island::size_text(d.len())),
+    };
     if stream_out(&data, &tx, &|| sync(|s| s.current(generation))) {
         tx.finish();
+        // 交完了才弹（至多还有 1 MiB 没发出）：和对方写入后弹的那颗差不多同时；没发完就不弹
+        hub.to_desktop(ToDesktop::Note(Note { who: hub.cfg().name, kind, detail, ok: true }));
         log!("剪贴板{}已发出（{} KB）", describe_format(format), raw_len / 1024);
     } else {
         // 没送到：撤销“已同步”。常见情形：很多程序放图片会连着触发两次剪贴板通知（放入、OleFlushClipboard），
@@ -575,6 +582,24 @@ impl Incoming {
     }
 }
 
+/// 写入对方内容时弹的提示：谁复制的、预览或大小。
+fn incoming_note(what: &mut Incoming, who: String) -> Note {
+    let (kind, detail) = match what {
+        Incoming::Text(t) => (Kind::Text, island::preview(t)),
+        Incoming::Data(b) if b.format == clip::CF_UNICODETEXT => {
+            // 大段文字：只解开头一小段
+            let head = b.mem.with(|m| {
+                let n = (m.len() / 2).min(256);
+                let units: Vec<u16> = (0..n).map(|i| u16::from_le_bytes([m[2 * i], m[2 * i + 1]])).take_while(|&u| u != 0).collect();
+                String::from_utf16_lossy(&units)
+            });
+            (Kind::Text, island::preview(&head.unwrap_or_default()))
+        }
+        Incoming::Data(b) => (Kind::Image, island::size_text(b.mem.len())),
+    };
+    Note { who, kind, detail, ok: true }
+}
+
 /// 对方内容是否写入本机：剪贴板同步开着（未暂停）、在上限内、不为空；图片还要求开着图片同步、格式是 DIB。
 fn accept_incoming(m: ToDesktop, c: &config::ClipCfg, paused: bool) -> Option<Incoming> {
     if !c.enabled || paused {
@@ -741,9 +766,30 @@ impl State {
             ToDesktop::ShowCursor => cursor::show(),
             ToDesktop::Status => self.refresh_tray(),
             ToDesktop::ClipForget => sync(|s| s.forget()),
+            ToDesktop::PeerForget => {
+                sync(|s| s.forget());
+                if self.hub.cfg().clipboard.notify {
+                    island::fail_own(&self.hub.cfg().name, "对方未接收");
+                }
+            }
+            ToDesktop::Note(n) => self.note(&n),
             ToDesktop::Quit => return false,
         }
         true
+    }
+
+    /// 弹剪贴板同步提示（设置里关了就不弹）。
+    fn note(&self, n: &Note) {
+        if self.hub.cfg().clipboard.notify {
+            island::show(n);
+        }
+    }
+
+    /// 本机复制的内容没同步（太大 / 敏感）：本机弹“未同步”，也让对方弹。
+    /// 对方弹不弹由对方自己的设置决定。
+    fn note_unsynced(&self, kind: Kind, detail: String) {
+        self.note(&Note { who: self.hub.cfg().name, kind, detail: detail.clone(), ok: false });
+        self.hub.send(Msg::ClipNote { kind: kind.code(), detail });
     }
 
     /// 对方发来的剪贴板内容：校验后写入（剪贴板被占则稍后重试）。
@@ -764,6 +810,8 @@ impl State {
 
     /// 写入对方内容；剪贴板被占则留着，定时器重试。
     fn try_write(&mut self, mut p: PendingWrite) {
+        // 提示要在写入前取（写入成功后那块内存就归系统了）
+        let note = incoming_note(&mut p.what, self.hub.status().peer_name);
         let r = match &mut p.what {
             Incoming::Text(t) => clip::write_text(self.hwnd, t),
             // 成功则这块内存归系统；失败时还在 b.mem 里（Busy 留着重试，放弃时随 p 释放）
@@ -784,6 +832,7 @@ impl State {
                 if matches!(p.what, Incoming::Data(_)) {
                     log!("已写入对方的{}", p.what.describe());
                 }
+                self.note(&note);
             }
             Err(clip::WriteError::Busy) if p.tries < WRITE_RETRIES => {
                 p.tries += 1;
@@ -942,9 +991,11 @@ impl State {
                     return;
                 }
                 self.drop_pending();
+                let detail = island::preview(&text);
                 // 先让 net 丢掉还没发完的旧图片，再发新内容
                 self.hub.to_net(Out::CancelClip);
                 self.hub.send(Msg::ClipText { text });
+                self.note(&Note { who: c.name.clone(), kind: Kind::Text, detail, ok: true });
             }
             clip::Content::Text(text) => {
                 let generation = sync(|s| s.local());
@@ -962,10 +1013,17 @@ impl State {
                     log!("剪贴板{}太大（约 {} KB），不同步", if image { "图片" } else { "文字" }, size / 1024);
                 }
                 self.local_other();
+                let (kind, limit) = if image {
+                    (Kind::Image, format!("{} MB", c.clipboard.max_image_mb))
+                } else {
+                    (Kind::Text, limit_text(c.clipboard.max_text_kb))
+                };
+                self.note_unsynced(kind, format!("超过 {limit}"));
             }
             clip::Content::Concealed => {
                 log!("本机剪贴板是敏感内容（密码等），不同步");
-                self.local_other()
+                self.local_other();
+                self.note_unsynced(Kind::Secret, "敏感内容".into());
             }
             clip::Content::Other => self.local_other(),
         }
@@ -1424,7 +1482,7 @@ mod tests {
 
     #[test]
     fn incoming_rules() {
-        let mut c = config::ClipCfg { enabled: true, images: true, max_text_kb: 1, max_image_mb: 1 };
+        let mut c = config::ClipCfg { enabled: true, images: true, max_text_kb: 1, max_image_mb: 1, notify: true };
         let ok = |m: ToDesktop, c: &config::ClipCfg, paused: bool| accept_incoming(m, c, paused).is_some();
         assert!(ok(ToDesktop::ClipText("a".into()), &c, false));
         assert!(!ok(ToDesktop::ClipText(String::new()), &c, false));
@@ -1634,6 +1692,11 @@ mod tests {
         let p = Path::new(r"C:\Program Files\kmlink\kmlink.exe");
         assert_eq!(run_value(p), "\"C:\\Program Files\\kmlink\\kmlink.exe\"");
     }
+}
+
+/// 文字上限的说法：整 MB 用 MB，否则 KB。
+fn limit_text(kb: u32) -> String {
+    if kb >= 1024 && kb % 1024 == 0 { format!("{} MB", kb / 1024) } else { format!("{kb} KB") }
 }
 
 fn describe_format(format: u32) -> &'static str {

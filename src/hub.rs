@@ -65,6 +65,11 @@ pub enum ToDesktop {
     ShowCursor,
     /// 连接状态变化（刷新托盘提示）。
     Status,
+    /// 对方发来 ClipForget（对方没接收本机的内容，或对方剪贴板变了）：清“已同步”记录；
+    /// 本机正显示着自己的“已同步”就改成“未同步”。
+    PeerForget,
+    /// 弹剪贴板同步提示（灵动岛）。
+    Note(crate::island::Note),
     Quit,
 }
 

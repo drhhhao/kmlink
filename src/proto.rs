@@ -90,6 +90,9 @@ pub enum Msg {
     /// format = CF_DIB(8) / CF_DIBV5(17) 图片，或 CF_UNICODETEXT(13) 大段文字（UTF-16 LE，不带结尾 0）；
     /// raw_len = 解压后的长度（接收方据此一次分配好）。
     ClipStart { id: u32, format: u32, raw_len: u32 },
+    /// 本机复制的内容没同步（太大 / 敏感）：对方也弹“未同步”提示。kind：0 文字、1 图片、2 敏感；
+    /// detail = 第二行（原因，≤ 24 字）。旧版本收到会当成无法解析的帧忽略。
+    ClipNote { kind: u8, detail: String },
     Ping { t: u64 },
     Pong { t: u64 },
 }

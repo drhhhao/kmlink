@@ -59,7 +59,9 @@
 //!   所以只在回调外停放后的 STALE_MS 内、头 STALE_EVENTS 个事件里，丢掉“离停放前位置比离停放点还近”的事件
 //!   （按距离比较，快速甩动的真实位移不会被吞）。
 //! - 对方还按着鼠标键（拖动中）时不回到本机，虚拟光标贴边停住。
-//! - 回到本机或被控结束后，要先看到光标离开过跨屏那条边，才允许再次跨屏（防止来回弹）。
+//! - 回到本机或被控结束后，要先看到光标离开过跨屏那条边，才允许再次跨屏（防止来回弹）；
+//!   但贴着边继续往外推够 REARM_PUSH_PX、或从回来后第一次移动起过了 REARM_MS，也放行
+//!  （刚回来又想马上过去时，不必先往回挪一下）。
 //! - 跨屏时就按着的 Alt/Win，若驱动期间转发过东西，它在本机的抬起改为：注入 vk 0xE8 按下抬起 + 该键抬起，
 //!   免得本机弹出菜单栏/开始菜单（在消息循环里 SendInput，不在钩子回调里）。
 //! - 光标隐藏/恢复走 cursor::request_hide/request_show（专用线程）；状态更新和 SendInput 推迟到消息循环执行。
@@ -159,6 +161,10 @@ const YIELD_MS: i32 = 300;
 const YIELD_MOVE_PX: i64 = 8;
 /// 被控时鼠标停这么久，累计位移清零。
 const YIELD_IDLE_MS: i32 = 500;
+/// 回到本机后光标一直贴着跨屏那条边：从回来后第一次移动起过了这么久，再往外推就放行。
+const REARM_MS: i32 = 300;
+/// 回到本机后贴着边往外推的累计像素（原始位移）超过这么多，就放行（手抖一两个像素不会弹回去）。
+const REARM_PUSH_PX: i64 = 20;
 /// 接受对方 Yield 回到本机后，这么久之内不跨屏。
 const YIELD_COOLDOWN_MS: i32 = 1500;
 /// 驱动中钩子这么久没被调用（而光标被挪走了、也有输入）：钩子丢了。
@@ -257,6 +263,9 @@ pub struct Kvm {
     probe: KeyProbe,
     /// 跨屏已就绪：回到本机/被控结束后，要先看到光标离开过跨屏那条边
     armed: bool,
+    /// 没就绪时：回来后第一次移动的时间、贴边往外推的累计像素
+    disarmed_at: Option<u32>,
+    push: i64,
     /// 前台是管理员窗口（定时器刷新的缓存）
     fg_blocked: bool,
     /// 已经提示过 FG_BLOCKED_MSG
@@ -296,6 +305,8 @@ impl Kvm {
             trace_n: 0,
             probe,
             armed: true,
+            disarmed_at: None,
+            push: 0,
             fg_blocked: false,
             warned: false,
             mask_up: [false; 256],
@@ -392,22 +403,37 @@ impl Kvm {
 
     fn try_cross(&mut self, pt: Point, cur: Option<Point>, time: u32, out: &mut Vec<Action>) -> bool {
         // 钩子里的坐标可能越出屏幕：先钳回桌面（钳在当前所在的显示器里）
-        let p = self.mine.clamp_from(cur.unwrap_or(pt), pt);
-        let r = self.try_cross_at(p, time, out);
+        let c = cur.unwrap_or(pt);
+        let p = self.mine.clamp_from(c, pt);
+        // 这次移动往跨屏那条边外推了多少（原始位移；光标已顶在边上时钩子坐标会越出屏幕）
+        let outward = match self.layout.side {
+            Side::Left => c.x as i64 - pt.x as i64,
+            Side::Right => pt.x as i64 - c.x as i64,
+            Side::Top => c.y as i64 - pt.y as i64,
+            Side::Bottom => pt.y as i64 - c.y as i64,
+        };
+        let r = self.try_cross_at(p, outward.max(0), time, out);
         // 顶在跨屏那条边上却没过去：记下原因（定时器里原因变化时写一行日志，钩子里不写）
         self.refused = if !r && self.mine.on_outer_edge(self.layout.side, p) { self.refuse_why } else { "" };
         r
     }
 
-    fn try_cross_at(&mut self, p: Point, time: u32, out: &mut Vec<Action>) -> bool {
+    fn try_cross_at(&mut self, p: Point, outward: i64, time: u32, out: &mut Vec<Action>) -> bool {
         self.refuse_why = "";
         if !self.armed {
-            // 回来后先要离开过跨屏那条边
+            // 回来后先要离开过跨屏那条边；或者贴着边继续往外推够了 / 过了一会儿
             if !self.mine.on_outer_edge(self.layout.side, p) {
                 self.armed = true;
+                return false;
             }
-            self.refuse_why = "刚回到本机，先离开这条边再过去";
-            return false;
+            let t0 = *self.disarmed_at.get_or_insert(time);
+            self.push = self.push.saturating_add(outward);
+            let waited = !(0..REARM_MS).contains(&since(time, t0));
+            if !(waited && outward > 0) && self.push < REARM_PUSH_PX {
+                self.refuse_why = "刚回到本机，先离开这条边再过去";
+                return false;
+            }
+            self.armed = true;
         }
         if self.paused || self.driven {
             self.refuse_why = if self.paused { "已暂停共享" } else { "本机正被对方控制" };
@@ -659,13 +685,20 @@ impl Kvm {
             }
         }
         // 先离开跨屏那条边才能再跨（防止立刻弹回去）
-        self.armed = false;
+        self.disarm();
         let land = self.inward(land);
         out.push(Action::Send(Msg::Leave { epoch: self.epoch }));
         out.push(Action::SetCursor(land));
         out.push(Action::ShowCursor);
         out.push(Action::Driving(false));
         Some(land)
+    }
+
+    /// 先离开跨屏那条边（或贴边推够了 / 过了 REARM_MS）才能再跨。
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.disarmed_at = None;
+        self.push = 0;
     }
 
     /// 落点钳进本机桌面，再往内侧挪 1 像素（若还在屏幕上）。
@@ -737,7 +770,7 @@ impl Kvm {
                     self.go_home_exit(out); // 双方同时跨屏：本机放手
                 } else {
                     // 对方放手时本机光标可能正停在共用的那条边上：先离开过边才跨
-                    self.armed = false;
+                    self.disarm();
                 }
             }
             ToInput::Pause(p) => {
@@ -851,6 +884,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_APP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
+
+/// 看门狗探针（注入 1 像素移动 + 一个空键 vk 0xE8 的抬起，两个钩子认出来就吞掉）：
+/// dwExtraInfo 标记、鼠标/键盘钩子是否各自看到了。两个都看到了才算钩子都还在。
+const PROBE_MARK: usize = 0x4B4D_5052;
+static PROBE_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static KEY_PROBE_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 本机最后一次物理输入（钩子看到的、不是注入的）的 GetTickCount；0 = 还没有。
 static LAST_PHYSICAL: AtomicU32 = AtomicU32::new(0);
@@ -1044,6 +1083,10 @@ unsafe extern "system" fn mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
     if code >= 0 && lp.0 != 0 {
         LAST_HOOK.with(|c| c.set(tick()));
         let ms = unsafe { &*(lp.0 as *const MSLLHOOKSTRUCT) };
+        if ms.dwExtraInfo == PROBE_MARK {
+            PROBE_SEEN.store(true, Ordering::Relaxed);
+            return LRESULT(1);
+        }
         if ms.dwExtraInfo != INJECT_MARK {
             if ms.flags & LLMHF_INJECTED == 0 {
                 note_physical();
@@ -1062,6 +1105,10 @@ unsafe extern "system" fn key_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
     if code >= 0 && lp.0 != 0 {
         LAST_HOOK.with(|c| c.set(tick()));
         let kb = unsafe { &*(lp.0 as *const KBDLLHOOKSTRUCT) };
+        if kb.dwExtraInfo == PROBE_MARK {
+            KEY_PROBE_SEEN.store(true, Ordering::Relaxed);
+            return LRESULT(1);
+        }
         if kb.dwExtraInfo != INJECT_MARK {
             let ev = key_event(kb);
             if !ev.injected {
@@ -1156,6 +1203,7 @@ pub fn run(hub: Arc<Hub>, rx: Receiver<ToInput>) {
     let mut ticks: u32 = 0;
     let mut trips: u32 = 0;
     let mut lost_streak: u32 = 0;
+    let mut false_alarms: u32 = 0;
     let mut last_refused: &'static str = "";
     let mut desk_was_ok = true;
     let mut quitting = false;
@@ -1217,7 +1265,15 @@ pub fn run(hub: Arc<Hub>, rx: Receiver<ToInput>) {
                 } else if ticks % WATCHDOG_TICKS == 0 {
                     // 连续两次异常才算钩子丢了（避开空闲后第一次输入的竞态）
                     trips = if watchdog_tripped() { trips + 1 } else { 0 };
-                    if trips >= 2 {
+                    if trips >= 2 && hook_alive() {
+                        // 钩子其实还在：那段输入来自钩子看不到的来源（触摸/笔/别的设备），不重装
+                        trips = 0;
+                        false_alarms += 1;
+                        if false_alarms == 1 || false_alarms % 30 == 0 {
+                            crate::log!("看门狗误报（第 {false_alarms} 次）：钩子还在，有钩子看不到的输入");
+                        }
+                        LAST_HOOK.with(|c| c.set(tick()));
+                    } else if trips >= 2 {
                         trips = 0;
                         lost_streak += 1;
                         if lost_streak == 1 || lost_streak % 30 == 0 {
@@ -1311,6 +1367,40 @@ fn drive_watchdog() -> bool {
         Verdict::Pass
     });
     lost
+}
+
+/// 注入探针（1 像素移动 + 空键 vk 0xE8 的抬起），看两个钩子还收不收得到（收到就吞掉，光标不动、没有按键）。
+/// 两个都收到才返回 true。最多等 100ms。钩子真丢了时漏到系统的只是 1 像素移动和一个没人用的键的抬起。
+fn hook_alive() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT};
+    PROBE_SEEN.store(false, Ordering::Relaxed);
+    KEY_PROBE_SEEN.store(false, Ordering::Relaxed);
+    let m = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT { dx: 1, dy: 0, mouseData: 0, dwFlags: MOUSEEVENTF_MOVE, time: 0, dwExtraInfo: PROBE_MARK },
+        },
+    };
+    let k = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT { wVk: VIRTUAL_KEY(VK_MASK), wScan: 0, dwFlags: KEYEVENTF_KEYUP, time: 0, dwExtraInfo: PROBE_MARK },
+        },
+    };
+    if unsafe { SendInput(&[m, k], std::mem::size_of::<INPUT>() as i32) } < 2 {
+        return false;
+    }
+    let t0 = tick();
+    loop {
+        flush_hook_calls();
+        if PROBE_SEEN.load(Ordering::Relaxed) && KEY_PROBE_SEEN.load(Ordering::Relaxed) {
+            return true;
+        }
+        if tick().wrapping_sub(t0) > 100 {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }
 
 /// 有输入发生、但钩子 1 秒以上没被调用：钩子丢了。
@@ -1809,19 +1899,51 @@ mod tests {
         t.rel(3, 0);
         t.rel(-10, 0); // 回到本机
         assert!(!t.k.driving());
-        // 还贴在边上：不跨
-        assert_eq!(t.mv(1919, 500), (Verdict::Pass, vec![]));
-        assert_eq!(t.mv(1919, 520), (Verdict::Pass, vec![]));
+        // 还贴在边上（沿边移动、往外只推一点）：不跨
+        t.t += 8;
+        assert_eq!(t.mouse_cur(MouseKind::Move, Point::new(1919, 500), Point::new(1918, 500), false), (Verdict::Pass, vec![]));
+        t.t += 8;
+        assert_eq!(t.mouse_cur(MouseKind::Move, Point::new(1920, 520), Point::new(1919, 519), false), (Verdict::Pass, vec![]));
         // 离开过边以后才跨
-        assert_eq!(t.mv(1918, 520), (Verdict::Pass, vec![]));
-        let (v, _) = t.mv(1919, 520);
+        t.t += 8;
+        assert_eq!(t.mouse_cur(MouseKind::Move, Point::new(1918, 520), Point::new(1919, 520), false), (Verdict::Pass, vec![]));
+        t.t += 8;
+        let (v, _) = t.mouse_cur(MouseKind::Move, Point::new(1920, 520), Point::new(1918, 520), false);
         assert_eq!(v, Verdict::Swallow);
         assert!(t.k.driving());
 
         // 热键回来也一样
         t.key(0x91, true);
         t.key(0x91, false);
-        assert_eq!(t.mv(1925, 520), (Verdict::Pass, vec![]));
+        t.t += 8;
+        assert_eq!(t.mouse_cur(MouseKind::Move, Point::new(1925, 520), Point::new(1919, 520), false), (Verdict::Pass, vec![]));
+    }
+
+    #[test]
+    fn rearm_by_pushing_or_waiting_at_edge() {
+        let mut t = setup();
+        let edge = |t: &mut T, dx: i32| {
+            t.t += 8;
+            t.mouse_cur(MouseKind::Move, Point::new(1919 + dx, 500), Point::new(1919, 500), false).0
+        };
+        // 刚回来又想马上过去：贴着边继续往外推够 REARM_PUSH_PX 就过去，不用先往回挪
+        t.cross();
+        t.rel(-10, 0);
+        assert!(!t.k.driving());
+        assert_eq!(edge(&mut t, 6), Verdict::Pass);
+        assert_eq!(edge(&mut t, 6), Verdict::Pass);
+        assert_eq!(edge(&mut t, 6), Verdict::Pass);
+        assert_eq!(edge(&mut t, 6), Verdict::Swallow);
+        assert!(t.k.driving());
+
+        // 停在边上过了 REARM_MS：往外推一下就过去
+        t.rel(-10, 0);
+        assert!(!t.k.driving());
+        assert_eq!(edge(&mut t, 1), Verdict::Pass);
+        t.t += REARM_MS as u32;
+        assert_eq!(edge(&mut t, 0), Verdict::Pass); // 没往外推：不过去
+        assert_eq!(edge(&mut t, 1), Verdict::Swallow);
+        assert!(t.k.driving());
     }
 
     #[test]
@@ -1830,8 +1952,10 @@ mod tests {
         t.msg(ToInput::Driven(true));
         t.msg(ToInput::Driven(false));
         // 对方放手时光标停在共用的边上：小动一下不能把本机扔过去
-        assert_eq!(t.mv(1919, 500), (Verdict::Pass, vec![]));
-        assert_eq!(t.mv(1919, 501), (Verdict::Pass, vec![]));
+        t.t += 8;
+        assert_eq!(t.mouse_cur(MouseKind::Move, Point::new(1919, 500), Point::new(1919, 499), false), (Verdict::Pass, vec![]));
+        t.t += 8;
+        assert_eq!(t.mouse_cur(MouseKind::Move, Point::new(1920, 501), Point::new(1919, 500), false), (Verdict::Pass, vec![]));
         t.cross();
     }
 

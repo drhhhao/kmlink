@@ -19,6 +19,7 @@ mod geom;
 mod hub;
 mod inject;
 mod input;
+mod island;
 mod log;
 mod net;
 mod proto;
@@ -77,6 +78,7 @@ fn daemon(with_console: bool) {
         let _ = timeBeginPeriod(1);
         no_power_throttling();
     }
+    sys::raise_process_priority();
 
     let (cfg, first_run) = config::Config::load_or_create();
     log!("kmlink {} 启动：本机 {}，端口 {}，对方 {}", env!("CARGO_PKG_VERSION"), cfg.name, cfg.port, if cfg.peer.is_empty() { "（等对方连接）" } else { &cfg.peer });

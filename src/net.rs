@@ -1056,6 +1056,8 @@ impl Net {
     }
 
     fn run_reader(&self, sess: SessionHandle, mut stream: TcpStream, mut opener: Opener, first: Msg) {
+        // 按键/按钮在这里注入；它也解压剪贴板，所以用 HIGHEST 而不是最高档
+        crate::sys::boost_thread(false);
         let mut st = RxState { clip_seen: self.clip_gen.load(Ordering::Relaxed), ..Default::default() };
         self.handle(&sess, first, &mut st);
         self.flush(&mut st, false);
@@ -1156,7 +1158,16 @@ impl Net {
                 self.injector.moved(sess.id, epoch, seq, x, y)
             }
             Msg::Yield { epoch } => self.hub.to_input(ToInput::Yield(epoch)),
-            Msg::ClipForget => self.hub.to_desktop(ToDesktop::ClipForget),
+            Msg::ClipForget => self.hub.to_desktop(ToDesktop::PeerForget),
+            Msg::ClipNote { kind, detail } => {
+                // 对方复制的内容没同步：本机也弹“未同步”（本机关了同步或暂停时不弹，和不接收对方内容一致）
+                let st = self.hub.status();
+                if self.hub.cfg().clipboard.enabled && !st.paused {
+                    use crate::island::{DETAIL_MAX, Kind, Note, clean};
+                    let n = Note { who: st.peer_name, kind: Kind::from_code(kind), detail: clean(&detail, DETAIL_MAX), ok: false };
+                    self.hub.to_desktop(ToDesktop::Note(n));
+                }
+            }
             Msg::ClipText { text } => {
                 let c = self.hub.cfg().clipboard;
                 if c.enabled && text.len() <= c.max_text_kb as usize * 1024 {
@@ -1324,6 +1335,8 @@ impl Net {
     }
 
     fn run_udp(self: Arc<Self>, port: u16) {
+        // 收鼠标位置并当场注入：一来包就要马上处理
+        crate::sys::boost_thread(true);
         let sock = loop {
             if let Some(s) = self.udp.get() {
                 break s;
@@ -1490,6 +1503,8 @@ impl Net {
 
     /// 常驻 net-out：独占 hub 的 net 通道，整个进程生命周期。不写 TCP（不会被慢网络卡住）。
     fn run_out(self: Arc<Self>, rx: Receiver<Out>) {
+        // 发鼠标位置：钩子交来就要马上发出去
+        crate::sys::boost_thread(true);
         let mut next_tick = Instant::now() + PING_EVERY;
         let mut mover = Mover::default();
         loop {
@@ -2478,7 +2493,7 @@ mod tests {
 
     #[test]
     fn clip_limits() {
-        let mut c = ClipCfg { enabled: true, images: false, max_text_kb: 1, max_image_mb: 1 };
+        let mut c = ClipCfg { enabled: true, images: false, max_text_kb: 1, max_image_mb: 1, notify: true };
         assert_eq!(clip_limit(&c, 13), Some(2050));
         assert_eq!(clip_limit(&c, 8), None);
         c.images = true;

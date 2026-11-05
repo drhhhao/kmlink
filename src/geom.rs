@@ -155,6 +155,20 @@ impl Desk {
         at_edge && !self.contains(beyond)
     }
 
+    /// p 所在的显示器在 `side` 方向是否顶到整个桌面外接矩形的那一边（多屏时，朝向对方的那一侧）。
+    pub fn edge_on_bounds(&self, side: Side, p: Point) -> bool {
+        let Some(m) = self.monitors.iter().find(|m| m.contains(p)) else {
+            return false;
+        };
+        let b = self.bounds();
+        match side {
+            Side::Left => m.l == b.l,
+            Side::Right => m.r == b.r,
+            Side::Top => m.t == b.t,
+            Side::Bottom => m.b == b.b,
+        }
+    }
+
     /// 主显示器（包含原点的那块）中心，用作驱动对方时本机光标的停放点。
     pub fn park_point(&self) -> Point {
         self.monitors
@@ -210,7 +224,9 @@ impl Layout {
     }
 
     /// 本机光标在外边缘 p 处越界：算出它在对方桌面上的入口点。
-    /// 不在两边接触的区段内（对方那一段没有屏幕）时返回 None。
+    /// 两边屏幕高矮不同、错开时，超出相接区段的那部分边也能过去：进到对方那条边上最近的一点
+    /// （不然顶着那段边怎么推都过不去，像是“失灵”）。但只限朝向对方的那一侧（p 所在显示器顶到桌面外接矩形那一边）——
+    /// 多屏时别的显示器在同方向的外边缘不跨。不在外边缘时返回 None。
     pub fn exit_to_peer(&self, mine: &Desk, peer: &Desk, p: Point) -> Option<Point> {
         if mine.is_empty() || peer.is_empty() || !mine.on_outer_edge(self.side, p) {
             return None;
@@ -221,11 +237,16 @@ impl Layout {
         let o = self.offset as f64;
         // 沿边坐标：本机像素 → 对方像素
         let (along_mine, start_mine) = if self.side.horizontal() { (p.y as f64, me.t as f64 + o) } else { (p.x as f64, me.l as f64 + o) };
-        let along_peer_rel = (along_mine - start_mine) / s;
         let (len_peer, base) = if self.side.horizontal() { (pb.h(), pb.t) } else { (pb.w(), pb.l) };
-        if along_peer_rel < 0.0 || along_peer_rel >= len_peer as f64 {
+        if len_peer <= 0 {
             return None;
         }
+        let raw = (along_mine - start_mine) / s;
+        if (raw < 0.0 || raw >= len_peer as f64) && !mine.edge_on_bounds(self.side, p) {
+            return None;
+        }
+        // 超出相接区段：钳到对方那条边上最近的一点
+        let along_peer_rel = raw.clamp(0.0, (len_peer - 1) as f64);
         let a = base.saturating_add(along_peer_rel.floor() as i32);
         // 进入对方桌面：贴着对方朝向本机的那条边
         let probe = match self.side {
@@ -240,7 +261,7 @@ impl Layout {
     }
 
     /// 对方桌面上的虚拟光标想从 p 继续往本机方向移动（已在对方朝向本机的外边缘）：算出回到本机的落点。
-    /// 本机那一段没有屏幕时返回 None（挡住，不回来）。
+    /// 超出相接区段时同样钳到本机那条边上最近的一点；那一行/列本机没有屏幕（多屏有缺口）时返回 None。
     pub fn return_to_me(&self, mine: &Desk, peer: &Desk, p: Point) -> Option<Point> {
         if mine.is_empty() || peer.is_empty() || !peer.on_outer_edge(self.side.opposite(), p) {
             return None;
@@ -251,7 +272,15 @@ impl Layout {
         let o = self.offset as f64;
         let along_peer = if self.side.horizontal() { (p.y - pb.t) as f64 } else { (p.x - pb.l) as f64 };
         let along_mine = along_peer * s + o + if self.side.horizontal() { me.t as f64 } else { me.l as f64 };
-        let a = along_mine.floor() as i32;
+        let (lo, hi) = if self.side.horizontal() { (me.t, me.b) } else { (me.l, me.r) };
+        if hi <= lo {
+            return None;
+        }
+        let raw = along_mine.floor() as i32;
+        if (raw < lo || raw >= hi) && !peer.edge_on_bounds(self.side.opposite(), p) {
+            return None;
+        }
+        let a = raw.clamp(lo, hi - 1);
         let probe = match self.side {
             Side::Right => Point::new(me.r.saturating_sub(1), a),
             Side::Left => Point::new(me.l, a),
@@ -368,12 +397,12 @@ mod tests {
     fn offset_limits_zone() {
         let a = one(1920, 1080);
         let b = one(1920, 1080);
-        // 对方往下错开 500：本机 y<500 的那段边没有对方屏幕
+        // 对方往下错开 500：本机 y<500 的那段边没有对方屏幕 → 进到对方边上最近的一点（顶上）
         let l = Layout { side: Side::Right, offset: 500, scale: 1.0 };
-        assert_eq!(l.exit_to_peer(&a, &b, Point::new(1919, 100)), None);
+        assert_eq!(l.exit_to_peer(&a, &b, Point::new(1919, 100)), Some(Point::new(0, 0)));
         assert_eq!(l.exit_to_peer(&a, &b, Point::new(1919, 600)), Some(Point::new(0, 100)));
-        // 对方 y=700 回来 → 本机 y=1200 超出本机屏幕：挡住
-        assert_eq!(l.return_to_me(&a, &b, Point::new(0, 700)), None);
+        // 对方 y=700 回来 → 本机 y=1200 超出本机屏幕：落到本机边上最近的一点（底下）
+        assert_eq!(l.return_to_me(&a, &b, Point::new(0, 700)), Some(Point::new(1919, 1079)));
         assert_eq!(l.return_to_me(&a, &b, Point::new(0, 300)), Some(Point::new(1919, 800)));
     }
 
@@ -470,14 +499,33 @@ mod tests {
     }
 
     #[test]
-    fn virtual_cursor_blocked_outside_zone() {
+    fn clamp_only_on_side_facing_peer() {
+        // 本机：外接显示器 0..2560（高 1440）在左，笔记本 2560..4480（y 360..1440）在右；对方在右侧
+        let mine = Desk::new(vec![Rect::new(0, 0, 2560, 1440), Rect::new(2560, 360, 4480, 1440)]);
+        let peer = one(1920, 1080);
+        let l = Layout { side: Side::Right, offset: 360, scale: 1.0 };
+        // 外接显示器右缘 y=100 旁边没有屏（外边缘），但它不朝向对方：不跨
+        assert_eq!(l.exit_to_peer(&mine, &peer, Point::new(2559, 100)), None);
+        // 笔记本右缘（朝向对方）：照常跨
+        assert_eq!(l.exit_to_peer(&mine, &peer, Point::new(4479, 400)), Some(Point::new(0, 40)));
+    }
+
+    #[test]
+    fn virtual_cursor_returns_outside_zone() {
         let a = one(1920, 1080);
         let b = one(1920, 2160);
         let l = Layout { side: Side::Right, offset: 0, scale: 1.0 };
-        // 对方 y=1500 处往左推：本机没有 y=1500，挡住
+        // 对方 y=1500 处往左推：本机没有 y=1500，落到本机边上最近的一点
         let mut vc = VirtualCursor::new(Point::new(0, 1500));
         match vc.step(-10, 0, 1.0, &l, &a, &b) {
-            Step::Moved(p) => assert_eq!(p, Point::new(0, 1500)),
+            Step::Return(p) => assert_eq!(p, Point::new(1919, 1079)),
+            _ => panic!("should return"),
+        }
+        // 本机那一行有缺口（两块屏中间没有屏幕）：挡住
+        let gap = Desk::new(vec![Rect::new(0, 0, 1920, 500), Rect::new(0, 600, 1920, 1080)]);
+        let mut vc = VirtualCursor::new(Point::new(0, 550));
+        match vc.step(-10, 0, 1.0, &l, &gap, &b) {
+            Step::Moved(p) => assert_eq!(p, Point::new(0, 550)),
             _ => panic!("should be blocked"),
         }
     }

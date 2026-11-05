@@ -39,6 +39,26 @@ pub fn monitors() -> Desk {
     Desk::new(v)
 }
 
+/// 进程优先级提到“高于正常”。计划任务启动的进程默认是“低于正常”，对方电脑一忙，
+/// 收包、注入鼠标的线程就排在普通程序后面（实测“在另一台上操作时卡”）。
+pub fn raise_process_priority() {
+    use windows::Win32::System::Threading::{ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass};
+    if let Err(e) = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) } {
+        crate::log!("提高进程优先级失败：{e}");
+    }
+}
+
+/// 当前线程的优先级：critical = 最高（只给几乎总在等、一来活就要立刻处理的线程），否则 HIGHEST。
+pub fn boost_thread(critical: bool) {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    let p = if critical { THREAD_PRIORITY_TIME_CRITICAL } else { THREAD_PRIORITY_HIGHEST };
+    if let Err(e) = unsafe { SetThreadPriority(GetCurrentThread(), p) } {
+        crate::log!("设置线程优先级失败：{e}");
+    }
+}
+
 /// UTF-16 + 结尾 0。
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
