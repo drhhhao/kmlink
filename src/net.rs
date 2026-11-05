@@ -56,7 +56,7 @@
 //! 内存：没有常驻的大缓冲。读帧按帧长分配、用完即还；发送端只排着 ≤ 1 MiB 的压缩分片；UDP 接收缓冲 128 字节。
 
 use crate::config::{self, ClipCfg, Config};
-use crate::crypto::{self, Opener, Sealer, UdpOpener, UdpSealer};
+use crate::crypto::{self, AudioOpener, AudioSealer, Opener, Sealer, UdpOpener, UdpSealer};
 use crate::geom::{Desk, Layout};
 use crate::hub::{Hub, Out, Piece, StreamRx, ToDesktop, ToInput};
 use crate::inject::Injector;
@@ -120,8 +120,11 @@ const UDP_STALE: Duration = Duration::from_millis(2500);
 /// 合法 UDP 包长度：8 字节计数器 + 明文（Hi 1 字节 / Move 21 字节，旧版 17）+ 16 字节 tag。
 const UDP_MIN_PKT: usize = 8 + 1 + 16;
 const UDP_MAX_PKT: usize = 64;
+/// 声音包（计数器最高位为 1）：8 字节计数器 + 明文（至少 10 字节头）+ 16 字节 tag；上限按 IPv6 最小 MTU 留余量。
+const AUDIO_MIN_PKT: usize = 8 + 10 + 16;
+const AUDIO_MAX_PKT: usize = 1232;
 /// UDP 接收缓冲：比合法包大就行（更大的包 recv_from 报 WSAEMSGSIZE，按单包错误跳过）。
-const UDP_BUF: usize = 128;
+const UDP_BUF: usize = 2048;
 /// UDP 套接字的内核接收缓冲（WiFi 停顿后一下子涌来的包不至于被丢）。
 const UDP_RCVBUF: i32 = 256 * 1024;
 /// 发现连到自己后多久内不再拨同一个地址。
@@ -142,8 +145,14 @@ pub const ERR_SELF: &str = "对方地址指向本机";
 pub const ERR_OLD: &str = "对方版本太旧，请两台都更新";
 pub const ERR_UDP_DOWN: &str = "UDP 不可用，已改走 TCP";
 
-pub fn spawn(hub: Arc<Hub>, rx: Receiver<Out>, injector: Arc<Injector>) {
-    let opts = Opts { bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED), persist: true, dial_every: Duration::from_secs(2), id: proto::instance_id() };
+pub fn spawn(hub: Arc<Hub>, rx: Receiver<Out>, injector: Arc<Injector>, audio: Arc<crate::audio::Port>) {
+    let opts = Opts {
+        bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        persist: true,
+        dial_every: Duration::from_secs(2),
+        id: proto::instance_id(),
+        audio: Some(audio),
+    };
     start(hub, rx, injector, opts);
 }
 
@@ -154,6 +163,8 @@ struct Opts {
     dial_every: Duration,
     /// Hello 里的 instance id（正式运行 = proto::instance_id()；测试里每个节点不同）。
     id: u64,
+    /// 声音（测试里没有）。
+    audio: Option<Arc<crate::audio::Port>>,
 }
 
 type SessionHandle = Arc<Session>;
@@ -234,6 +245,9 @@ struct Session {
     udp_tx: Mutex<UdpSealer>,
     udp_rx: Mutex<UdpOpener>,
     udp_peer: Mutex<UdpPeer>,
+    /// 声音：audio-cap 线程加密发送 / net-udp 解密（各自只有一个线程用，锁不争用）。
+    audio_tx: Mutex<AudioSealer>,
+    audio_rx: Mutex<AudioOpener>,
 }
 
 struct RxClock {
@@ -366,6 +380,10 @@ fn start(hub: Arc<Hub>, rx: Receiver<Out>, injector: Arc<Injector>, opts: Opts) 
     spawn_named("net-dialer", move || n.run_dialer());
     let n = net.clone();
     spawn_named("net-udp", move || n.run_udp(port));
+    if let Some(a) = &net.opts.audio {
+        let w = Arc::downgrade(&net);
+        a.set_sender(Box::new(move |sid, plain| w.upgrade().is_some_and(|n| n.send_audio(sid, plain))));
+    }
     net
 }
 
@@ -377,6 +395,8 @@ struct Chans {
     rx: Opener,
     utx: UdpSealer,
     urx: UdpOpener,
+    atx: AudioSealer,
+    arx: AudioOpener,
 }
 
 /// 握手期的绝对截止时间：每次读写前把超时设为剩余时间（防止慢速连接一直占着握手名额）。
@@ -482,9 +502,25 @@ fn handshake<S: Read + Write>(s: &mut S, psk: &[u8; 32], role: Role) -> io::Resu
     let k = crypto::derive(psk, &dh, &nc, &ns);
     crypto::wipe(&mut dh);
     Ok(if client {
-        Chans { nonce_c: nc, tx: Sealer::new(&k.c2s), rx: Opener::new(&k.s2c), utx: UdpSealer::new(&k.udp_c2s), urx: UdpOpener::new(&k.udp_s2c) }
+        Chans {
+            nonce_c: nc,
+            tx: Sealer::new(&k.c2s),
+            rx: Opener::new(&k.s2c),
+            utx: UdpSealer::new(&k.udp_c2s),
+            urx: UdpOpener::new(&k.udp_s2c),
+            atx: AudioSealer::new(&k.audio_c2s),
+            arx: AudioOpener::new(&k.audio_s2c),
+        }
     } else {
-        Chans { nonce_c: nc, tx: Sealer::new(&k.s2c), rx: Opener::new(&k.c2s), utx: UdpSealer::new(&k.udp_s2c), urx: UdpOpener::new(&k.udp_c2s) }
+        Chans {
+            nonce_c: nc,
+            tx: Sealer::new(&k.s2c),
+            rx: Opener::new(&k.c2s),
+            utx: UdpSealer::new(&k.udp_s2c),
+            urx: UdpOpener::new(&k.udp_c2s),
+            atx: AudioSealer::new(&k.audio_s2c),
+            arx: AudioOpener::new(&k.audio_c2s),
+        }
     })
 }
 
@@ -865,7 +901,7 @@ impl Net {
     fn hello(&self, cfg: &Config) -> Msg {
         let udp_port = self.udp.get().and_then(|u| u.local_addr().ok()).map(|a| a.port()).unwrap_or(cfg.port);
         let (desk, dpis) = crate::sys::monitors_dpi();
-        Msg::Hello { ver: PROTO_VERSION, name: cfg.name.clone(), monitors: desk.monitors, udp_port, id: self.opts.id, dpis }
+        Msg::Hello { ver: PROTO_VERSION, name: cfg.name.clone(), monitors: desk.monitors, udp_port, id: self.opts.id, dpis, caps: proto::CAPS }
     }
 
     fn send_hello<W: Write>(&self, w: &mut W, tx: &mut Sealer, cfg: &Config) -> io::Result<()> {
@@ -936,7 +972,7 @@ impl Net {
                 return None;
             }
         };
-        let Chans { nonce_c, mut tx, mut rx, utx, urx } = ch;
+        let Chans { nonce_c, mut tx, mut rx, utx, urx, atx, arx } = ch;
         if client {
             if let Err(e) = self.send_hello(&mut dl, &mut tx, &cfg) {
                 self.note_err(format!("向 {peer} 发送 Hello 失败：{e}"));
@@ -1002,6 +1038,8 @@ impl Net {
             udp_tx: Mutex::new(utx),
             udp_rx: Mutex::new(urx),
             udp_peer: Mutex::new(UdpPeer { addr: Some(SocketAddr::new(ip, *udp_port)), ..Default::default() }),
+            audio_tx: Mutex::new(atx),
+            audio_rx: Mutex::new(arx),
         });
         if let Err(why) = self.install(&sess) {
             self.log_ip(ip, "yield", format!("与 {ip} 的新连接被拒：{why}"), false);
@@ -1027,6 +1065,9 @@ impl Net {
                 }
                 old.close();
             }
+            if let (Some(a), Some(old)) = (&self.opts.audio, cur.as_ref()) {
+                a.session_down(old.id);
+            }
             let replaced = cur.replace(new.clone()).is_some();
             self.hub.to_desktop(ToDesktop::ClipForget);
             self.injector.begin_session(new.id);
@@ -1049,6 +1090,9 @@ impl Net {
         *cur = None;
         // 同 install：在锁内通知，和并发登记的新会话顺序一致
         crate::log!("与 {} 的连接断开：{why}", sess.peer);
+        if let Some(a) = &self.opts.audio {
+            a.session_down(sess.id);
+        }
         self.injector.end_session(sess.id);
         self.hub.to_input(ToInput::PeerDown);
         self.hub.set_status(|s| {
@@ -1112,7 +1156,7 @@ impl Net {
     /// 处理一条消息。只在 reader 线程调用：绝不直接写 socket（回复走可靠队列 → net-tcp）。
     fn handle(&self, sess: &Session, m: Msg, st: &mut RxState) {
         match m {
-            Msg::Hello { ver, name, monitors, udp_port, dpis, .. } => {
+            Msg::Hello { ver, name, monitors, udp_port, dpis, caps, .. } => {
                 if ver != PROTO_VERSION {
                     crate::log!("对方协议版本 {ver} 与本机 {PROTO_VERSION} 不同");
                 }
@@ -1145,10 +1189,17 @@ impl Net {
                         s.last_error.clear();
                     }
                 });
-                self.hub.to_input(ToInput::PeerUp { name, desk });
+                if let Some(a) = &self.opts.audio {
+                    // 和 install / end_session 同一把锁：已被替换/已结束的会话迟到的 Hello 不会把声音挂到死会话上
+                    let cur = lock(&self.holder);
+                    if cur.as_ref().is_some_and(|c| c.id == sess.id) {
+                        a.session_up(sess.id, caps, sess.peer_id, &name);
+                    }
+                }
+                self.hub.to_input(ToInput::PeerUp { name, desk, caps });
             }
             Msg::Layout { side, offset, scale, rev } => self.apply_layout(sess, Layout { side, offset, scale }, rev, st),
-            Msg::Enter { epoch, x, y } => self.injector.enter(sess.id, epoch, x, y),
+            Msg::Enter { epoch, x, y, prev } => self.injector.enter_from(sess.id, epoch, x, y, prev),
             Msg::Leave { epoch } => self.injector.leave(sess.id, epoch),
             Msg::Button { epoch, x, y, button, down } => self.injector.button(sess.id, epoch, x, y, button, down),
             Msg::Wheel { epoch, x, y, delta, horizontal } => self.injector.wheel(sess.id, epoch, x, y, delta, horizontal),
@@ -1160,6 +1211,9 @@ impl Net {
                 self.injector.moved(sess.id, epoch, seq, x, y, 0)
             }
             Msg::Yield { epoch } => self.hub.to_input(ToInput::Yield(epoch)),
+            Msg::Active { epoch } => self.hub.to_input(ToInput::PeerActive(epoch)),
+            Msg::KbdEnter { epoch, prev } => self.injector.kbd_enter_from(sess.id, epoch, prev),
+            Msg::KbdLeave { epoch } => self.injector.kbd_leave(sess.id, epoch),
             Msg::ClipForget => self.hub.to_desktop(ToDesktop::PeerForget),
             Msg::ClipNote { kind, detail } => {
                 // 对方复制的内容没同步：本机也弹“未同步”（本机关了同步或暂停时不弹，和不接收对方内容一致）
@@ -1192,6 +1246,17 @@ impl Net {
             },
             Msg::Ping { t } => self.enqueue(Out::Msg(Msg::Pong { t })),
             Msg::Rename { name } => self.hub.to_desktop(ToDesktop::Rename(name)),
+            Msg::KbdTip => self.hub.to_desktop(ToDesktop::KbdTipGone),
+            Msg::Audio { mode, rev } => {
+                if let Some(a) = &self.opts.audio {
+                    a.peer_mode(sess.id, sess.peer_id, mode, rev);
+                }
+            }
+            Msg::AudioAck { playing } => {
+                if let Some(a) = &self.opts.audio {
+                    a.peer_ack(playing);
+                }
+            }
             Msg::Pong { .. } => {}
         }
     }
@@ -1375,11 +1440,26 @@ impl Net {
                 }
             };
             // 先过滤再解密：长度不对的、不是会话对端 IP 发来的（端口可以变）直接丢
-            if !(UDP_MIN_PKT..=UDP_MAX_PKT).contains(&n) {
+            // 计数器最高位为 1 的是声音包（另一套密钥），解密后只交给声音模块的无锁环，不在这里多做事。
+            let audio = crypto::is_audio(&buf[..n]);
+            let ok_len = if audio {
+                (AUDIO_MIN_PKT..=AUDIO_MAX_PKT).contains(&n)
+            } else {
+                (UDP_MIN_PKT..=UDP_MAX_PKT).contains(&n)
+            };
+            if !ok_len {
                 continue;
             }
             let Some(sess) = self.current() else { continue };
             if src.ip() != sess.peer.ip() {
+                continue;
+            }
+            if audio {
+                let Some(a) = &self.opts.audio else { continue };
+                let arrive = crate::smooth::now_us() as u32;
+                let Some(plain) = lock(&sess.audio_rx).open(&buf[..n]) else { continue };
+                lock(&sess.udp_peer).heard(src, Instant::now());
+                a.packet(sess.id, &plain, arrive);
                 continue;
             }
             let Some(plain) = lock(&sess.udp_rx).open(&buf[..n]) else { continue };
@@ -1391,6 +1471,18 @@ impl Net {
                 self.injector.moved(sess.id, epoch, seq, x, y, t);
             }
         }
+    }
+
+    /// audio-cap 线程：加密发一包声音。会话已换 / UDP 不通（声音不走 TCP）→ false。
+    fn send_audio(&self, sid: u64, plain: &[u8]) -> bool {
+        let Some(sess) = self.current() else { return false };
+        if sess.id != sid || !sess.udp_live() {
+            return false;
+        }
+        let Some(sock) = self.udp.get() else { return false };
+        let Some(addr) = lock(&sess.udp_peer).addr else { return false };
+        let Some(pkt) = lock(&sess.audio_tx).seal(plain) else { return false };
+        sock.send_to(&pkt, addr).is_ok()
     }
 
     fn send_udp(&self, s: &Session, m: &UdpMsg) {
@@ -1458,6 +1550,8 @@ impl Net {
             #[cfg(test)]
             self.stats.stales.fetch_add(1, Ordering::Relaxed);
             self.injector.stale(s.id);
+            // 只转发键盘时字会打进黑洞（看不出来）：本机这边也立刻收回键盘
+            self.hub.to_input(ToInput::PeerStale);
         }
         if !c.homed && now.saturating_duration_since(c.at) >= GOHOME_AFTER {
             c.homed = true;
@@ -2552,7 +2646,7 @@ mod tests {
         let (hub, HubRx { input, desktop, net }) = Hub::new(cfg);
         let hub = Arc::new(hub);
         let injector = Arc::new(Injector::new(hub.clone()));
-        let opts = Opts { bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST), persist: false, dial_every: Duration::from_millis(100), id };
+        let opts = Opts { bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST), persist: false, dial_every: Duration::from_millis(100), id, audio: None };
         let net = start(hub.clone(), net, injector, opts);
         Node { net, hub, input, desktop }
     }

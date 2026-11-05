@@ -9,6 +9,10 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio;
+mod audio_cap;
+mod audio_play;
+mod audio_probe;
 mod clip;
 mod config;
 mod crypto;
@@ -19,6 +23,7 @@ mod geom;
 mod hub;
 mod inject;
 mod input;
+mod jitter;
 mod island;
 mod log;
 mod net;
@@ -44,6 +49,23 @@ fn main() {
             sys::dpi_aware();
             log::init("settings");
             settings::run();
+        }
+        Some("audio-probe") => {
+            console();
+            audio_probe::run();
+        }
+        // 测试工具：kmlink audio-rec <pid> <秒> <输出.csv> / kmlink audio-tone <秒> [频率] [幅度]
+        Some("audio-rec") => {
+            console();
+            audio_probe::rec(&args[2..]);
+        }
+        Some("audio-sim") => {
+            console();
+            audio_probe::sim(&args[2..]);
+        }
+        Some("audio-tone") => {
+            console();
+            audio_probe::tone(&args[2..]);
         }
         Some("keygen") => {
             console();
@@ -93,10 +115,14 @@ fn daemon(with_console: bool) {
     let injector = Arc::new(inject::Injector::new(hub.clone()));
     injector.start();
     desktop::spawn(hub.clone(), rx.desktop, first_run);
-    net::spawn(hub.clone(), rx.net, injector.clone());
+    let audio = audio::Port::new(hub.clone());
+    audio::spawn(audio.clone());
+    net::spawn(hub.clone(), rx.net, injector.clone(), audio.clone());
     input::run(hub.clone(), rx.input); // 阻塞到“退出”
 
     injector.release_all();
+    audio.shutdown();
+
     cursor::show();
     desktop::save_exit_status(&hub);
     log!("退出");

@@ -27,6 +27,7 @@ pub struct Config {
     pub layout: LayoutCfg,
     pub input: InputCfg,
     pub clipboard: ClipCfg,
+    pub audio: AudioCfg,
     /// 开机自启（写 HKCU\...\Run）。
     pub autostart: bool,
 }
@@ -47,6 +48,8 @@ pub struct InputCfg {
     pub speed: f64,
     /// 强制回到本机 / 在本机时切换“锁定不跨屏”的热键（虚拟键码，默认 Scroll Lock = 0x91）。
     pub hotkey_vk: u32,
+    /// 键盘跟随鼠标：本机键盘打到最后真正在用的那只鼠标所在的那台。
+    pub kbd_follow: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,16 +63,173 @@ pub struct ClipCfg {
     pub notify: bool,
 }
 
+/// 声音模式（本机视角）。两台同步：对方的“本机听”= 本机的“对方听”。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum AudioMode {
+    /// 关
+    #[default]
+    Off,
+    /// 本机听：对方的声音也在本机放（本机的声音不发过去）
+    Here,
+    /// 对方听：本机的声音发到对方放，本机静音
+    There,
+    /// 两台放：两台的声音混在一起，两台都放
+    Both,
+}
+
+impl AudioMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AudioMode::Off => "off",
+            AudioMode::Here => "here",
+            AudioMode::There => "there",
+            AudioMode::Both => "both",
+        }
+    }
+    /// 不认识的当“关”（新版本的模式名不至于让旧版本读不了配置）。
+    pub fn parse(s: &str) -> AudioMode {
+        match s.trim() {
+            "here" => AudioMode::Here,
+            "there" => AudioMode::There,
+            "both" => AudioMode::Both,
+            _ => AudioMode::Off,
+        }
+    }
+    /// 把本机的声音发给对方。
+    pub fn send(self) -> bool {
+        matches!(self, AudioMode::There | AudioMode::Both)
+    }
+    /// 放对方发来的声音。
+    pub fn play(self) -> bool {
+        matches!(self, AudioMode::Here | AudioMode::Both)
+    }
+    /// 换到对方视角。
+    pub fn mirrored(self) -> AudioMode {
+        match self {
+            AudioMode::Here => AudioMode::There,
+            AudioMode::There => AudioMode::Here,
+            m => m,
+        }
+    }
+}
+
+impl From<String> for AudioMode {
+    fn from(s: String) -> Self {
+        AudioMode::parse(&s)
+    }
+}
+
+impl From<AudioMode> for String {
+    fn from(m: AudioMode) -> Self {
+        m.as_str().into()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioCfg {
+    pub mode: AudioMode,
+    /// 修改时间（毫秒，同排布的 rev）：两台同步模式，较新的覆盖较旧的。
+    pub rev: u64,
+    /// rev 是给哪个模式发的：和 mode 不一样 = 有人手改了 config.toml（哪怕 kmlink 当时没在跑），要发新 rev。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rev_mode: Option<AudioMode>,
+    /// 对方声音在本机的音量（0～1）。
+    pub volume: f32,
+    /// 抗抖动缓冲调参（排查用；不写 = 程序默认值，也不会被写回文件，默认值以后改了能生效）：
+    /// 迟到分位（1 = 窗口里最晚的那包）、上下限（毫秒）、统计窗口（秒）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_q: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_min_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_max_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_window_s: Option<u32>,
+}
+
+impl Default for AudioCfg {
+    fn default() -> Self {
+        Self { mode: AudioMode::Off, rev: 0, rev_mode: None, volume: 1.0, buffer_q: None, buffer_min_ms: None, buffer_max_ms: None, buffer_window_s: None }
+    }
+}
+
+impl AudioCfg {
+    /// 发现手改：rev_mode 和 mode 不一致 → rev 变新；旧配置没有 rev_mode → 只补记，不变 rev。改了返回 true（要存盘）。
+    pub fn claim_hand_edit(&mut self) -> bool {
+        match self.rev_mode {
+            Some(m) if m == self.mode => false,
+            Some(_) => {
+                self.rev = next_rev(self.rev);
+                self.rev_mode = Some(self.mode);
+                true
+            }
+            None => {
+                self.rev_mode = Some(self.mode);
+                true
+            }
+        }
+    }
+
+    pub fn tune(&self) -> crate::jitter::Tune {
+        let d = crate::jitter::Tune::default();
+        crate::jitter::Tune {
+            q: self.buffer_q.filter(|q| (0.5..=1.0).contains(q)).unwrap_or(d.q),
+            min_ms: self.buffer_min_ms.unwrap_or(d.min_ms).clamp(10, 500),
+            max_ms: self.buffer_max_ms.unwrap_or(d.max_ms).clamp(10, 500),
+            window_s: self.buffer_window_s.unwrap_or(d.window_s).clamp(6, 3600),
+            ..d
+        }
+    }
+}
+
+#[cfg(test)]
+mod audio_cfg_tests {
+    use super::*;
+
+    #[test]
+    fn tuning_defaults_not_written_and_old_values_read() {
+        let mut c = Config::default();
+        c.audio.mode = AudioMode::Both;
+        let s = toml::to_string(&c).unwrap();
+        assert!(s.contains("mode = \"both\""));
+        assert!(!s.contains("buffer_"), "{s}");
+        let old: Config = toml::from_str("[audio]
+mode = \"here\"
+buffer_q = 0.99
+buffer_min_ms = 60
+").unwrap();
+        assert_eq!(old.audio.mode, AudioMode::Here);
+        let t = old.audio.tune();
+        assert_eq!((t.q, t.min_ms), (0.99, 60));
+        assert_eq!(t.window_s, crate::jitter::Tune::default().window_s);
+        let mut a = AudioCfg { mode: AudioMode::Both, rev: 5, ..Default::default() };
+        assert!(a.claim_hand_edit(), "旧配置：补记");
+        assert_eq!((a.rev, a.rev_mode), (5, Some(AudioMode::Both)));
+        assert!(!a.claim_hand_edit());
+        a.mode = AudioMode::Off; // 关着 kmlink 时手改
+        assert!(a.claim_hand_edit());
+        assert!(a.rev > 5);
+        assert_eq!(a.rev_mode, Some(AudioMode::Off));
+        let bad: Config = toml::from_str("[audio]
+mode = \"party\"
+").unwrap();
+        assert_eq!(bad.audio.mode, AudioMode::Off, "不认识的模式当关，不让整个配置读不了");
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
-            name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "PC".into()),
+            name: computer_name(),
             port: DEFAULT_PORT,
             peer: String::new(),
             key: String::new(),
             layout: LayoutCfg::default(),
             input: InputCfg::default(),
             clipboard: ClipCfg::default(),
+            audio: AudioCfg::default(),
             autostart: false,
         }
     }
@@ -83,7 +243,7 @@ impl Default for LayoutCfg {
 
 impl Default for InputCfg {
     fn default() -> Self {
-        Self { speed: 1.0, hotkey_vk: 0x91 }
+        Self { speed: 1.0, hotkey_vk: 0x91, kbd_follow: false }
     }
 }
 
@@ -159,7 +319,15 @@ impl Config {
     /// 只读不写；解析失败返回 None。
     pub fn load() -> Option<Config> {
         let s = std::fs::read_to_string(path()).ok()?;
-        toml::from_str(&s).ok()
+        toml::from_str::<Config>(&s).ok().map(Config::fill_name)
+    }
+
+    /// 没自定义名字（空的）：用 Windows 的计算机名。
+    fn fill_name(mut self) -> Config {
+        if self.name.trim().is_empty() {
+            self.name = computer_name();
+        }
+        self
     }
 
     /// 整个保存（拿跨进程锁）。多数情况应该用 `update`，只改自己关心的字段。
@@ -340,6 +508,11 @@ pub const NAME_MAX: usize = 16;
 /// rename_peer.json 的有效期（毫秒）：更旧的（比如当时主程序没在运行）不发。
 pub const RENAME_TTL_MS: u64 = 10_000;
 
+/// Windows 的计算机名（没自定义名字时用它）。
+pub fn computer_name() -> String {
+    std::env::var("COMPUTERNAME").ok().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "PC".into())
+}
+
 /// 清理名字：去掉首尾空白，截到 NAME_MAX 个字符；空的返回 None。
 pub fn clean_name(s: &str) -> Option<String> {
     let s: String = s.trim().chars().take(NAME_MAX).collect();
@@ -414,6 +587,18 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_name_falls_back_to_computer_name() {
+        let c: Config = toml::from_str("name = \"  \"").unwrap();
+        assert_eq!(c.fill_name().name, computer_name());
+        let c: Config = toml::from_str("name = \"工位电脑\"").unwrap();
+        assert_eq!(c.fill_name().name, "工位电脑");
+        // 没写名字：默认就是计算机名
+        let c: Config = toml::from_str("port = 1").unwrap();
+        assert_eq!(c.name, computer_name());
+        assert!(!computer_name().trim().is_empty());
+    }
+
     #[test]
     fn roundtrip_toml() {
         let c = Config { key: new_key_hex(), peer: "10.0.0.2".into(), ..Default::default() };

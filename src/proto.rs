@@ -22,6 +22,12 @@ use crate::geom::{Rect, Side};
 use serde::{Deserialize, Serialize};
 
 pub const PROTO_VERSION: u32 = 2;
+/// Hello.caps：支持键盘跟随（Active / KbdEnter / KbdLeave）。
+pub const CAP_KBD: u32 = 1;
+/// Hello.caps：支持声音（Audio / AudioAck 消息，UDP 声音包）。
+pub const CAP_AUDIO: u32 = 2;
+/// 本机支持的能力。
+pub const CAPS: u32 = CAP_KBD | CAP_AUDIO;
 /// TCP 握手魔数（KML2：握手带 X25519 临时公钥）。
 pub const MAGIC: &[u8; 4] = b"KML2";
 /// 旧版魔数：收到它说明对方版本太旧。
@@ -65,11 +71,22 @@ pub enum Msg {
         id: u64,
         #[serde(default)]
         dpis: Vec<u32>,
+        /// 能力位（CAP_*）；旧版本不带 = 0。
+        #[serde(default)]
+        caps: u32,
     },
     /// 排布（从发送方的角度）。接收方若 rev 更新，则镜像后保存。
     Layout { side: Side, offset: i32, scale: f64, rev: u64 },
     /// 控制端接管：把光标放到 (x, y)（接收方坐标）。epoch 每次接管 +1。
-    Enter { epoch: u32, x: i32, y: i32 },
+    /// prev：从只转发键盘直接转成驱动时 = 那一轮的轮次（接收方正处在那一轮就把按着的键原样接过来，不先抬起，
+    /// 组合键不拆开）；0 = 没有。旧版本不带。
+    Enter {
+        epoch: u32,
+        x: i32,
+        y: i32,
+        #[serde(default)]
+        prev: u32,
+    },
     /// 控制端放手：接收方松开所有按着的键和按钮。
     Leave { epoch: u32 },
     Button { epoch: u32, x: i32, y: i32, button: Button, down: bool },
@@ -98,9 +115,32 @@ pub enum Msg {
     ClipNote { kind: u8, detail: String },
     Ping { t: u64 },
     Pong { t: u64 },
+    /// 本机物理鼠标真的在用（键盘跟随）。epoch = 本机正被对方接管的轮次（对方据此回到它本机），没被接管为 0。
+    /// 只发给 caps 带 CAP_KBD 的对方。
+    Active {
+        #[serde(default)]
+        epoch: u32,
+    },
+    /// 只转发键盘开始：之后这一轮的 Key 带这个 epoch。接收方不移动光标、不进入被控状态。
+    /// prev：从驱动直接转成只转发键盘时 = 那一轮驱动的轮次（同 Enter.prev，按着的键原样接过来）；0 = 没有。
+    KbdEnter {
+        epoch: u32,
+        #[serde(default)]
+        prev: u32,
+    },
+    /// 只转发键盘结束：接收方抬起这一轮按着的键。
+    KbdLeave { epoch: u32 },
+    /// 声音模式（发送方视角，"off"/"here"/"there"/"both"）+ 修改时间：较新的覆盖较旧的（接收方换成自己视角）。
+    /// 只发给 caps 带 CAP_AUDIO 的对方。
+    Audio { mode: String, rev: u64 },
+    /// 本机正在放对方的声音（每秒一次）：对方据此才把自己静音（“对方听”），收不到就恢复。
+    AudioAck { playing: bool },
     /// 设置窗口里给对方改名：接收方把它写进自己 config.toml 的 name（重新加载后重发 Hello）。
     /// 旧版本收到会当成无法解析的帧忽略。
     Rename { name: String },
+    /// 本机刚弹了“键盘 <本机名>”（用户在本机干活了）：对方收起它正显示的“键盘”提示——两台同时只留一颗。
+    /// 旧版本收到会当成无法解析的帧忽略。
+    KbdTip,
 }
 
 /// UDP 明文。
@@ -553,14 +593,21 @@ pub(crate) mod tests {
             udp_port: 47900,
             id: 5,
             dpis: vec![144],
+            caps: CAPS,
         };
         assert_eq!(rt(&h), h);
+        // 键盘跟随的消息往返
+        for m in [Msg::Active { epoch: 7 }, Msg::KbdEnter { epoch: 8, prev: 3 }, Msg::KbdLeave { epoch: 8 }, Msg::KbdTip] {
+            assert_eq!(rt(&m), m);
+        }
         // 旧版本的 Hello（没有 dpis）照样能解，dpis 为空
         let old = br#"{"type":"Hello","ver":2,"name":"A","monitors":[{"l":0,"t":0,"r":10,"b":10}],"udp_port":1,"id":3}"#;
         let mut f = vec![FRAME_MSG];
         f.extend_from_slice(old);
         match decode_frame(&f) {
-            Some(Frame::Msg(Msg::Hello { dpis, monitors, .. })) => assert!(dpis.is_empty() && monitors.len() == 1),
+            Some(Frame::Msg(Msg::Hello { dpis, monitors, caps, .. })) => {
+                assert!(dpis.is_empty() && monitors.len() == 1 && caps == 0)
+            }
             _ => panic!(),
         }
         // 旧版本按自己的定义解新 Hello：多出的 dpis 字段被忽略（serde 默认不拒未知字段）
@@ -576,5 +623,9 @@ pub(crate) mod tests {
         let rn = Msg::Rename { name: "客厅".into() };
         assert_eq!(rt(&rn), rn);
         assert!(serde_json::from_str::<OldMsg>(&serde_json::to_string(&rn).unwrap()).is_err());
+        for m in [Msg::Audio { mode: "both".into(), rev: 9 }, Msg::AudioAck { playing: true }] {
+            assert_eq!(rt(&m), m);
+            assert!(serde_json::from_str::<OldMsg>(&serde_json::to_string(&m).unwrap()).is_err());
+        }
     }
 }

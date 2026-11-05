@@ -31,6 +31,8 @@ pub enum ToInput {
         #[allow(dead_code)]
         name: String,
         desk: Desk,
+        /// 对方 Hello 里的能力位（proto::CAP_*）
+        caps: u32,
     },
     /// 会话断开：若正在驱动对方，立刻回到本机。
     PeerDown,
@@ -40,6 +42,12 @@ pub enum ToInput {
     Config(Box<Config>),
     /// 对方请求放手（对方本地有人动了键鼠）。参数 = 对方报告的接管轮次（0 = 不确定）。
     Yield(u32),
+    /// 对方的鼠标真的在用（键盘跟随）。参数 = 对方被本机接管的轮次（0 = 对方没被接管）。
+    PeerActive(u32),
+    /// 对方的键盘开始（true）/ 结束（false）注入本机（injector 在持锁时通知）。
+    KbdIn(bool),
+    /// 对方 1.5 秒没有任何帧：只转发键盘时立刻收回（驱动中照旧等 GoHome）。
+    PeerStale,
     /// 立刻回到本机（系统即将睡眠/注销等）。不在驱动时什么都不做。
     GoHome,
     /// 本机正在被对方控制（true）/ 控制结束（false）。被控期间本机的物理输入会发 Yield。
@@ -70,8 +78,13 @@ pub enum ToDesktop {
     PeerForget,
     /// 弹剪贴板同步提示（灵动岛）。
     Note(crate::island::Note),
+    /// 键盘跟随提示：true = 键盘刚换到本机，不等打字（对方键盘新打进来：injector 在 kbd_enter 时发；
+    /// 本机鼠标在用/热键把本机键盘收回：input 的 KbdHere 发）；false = 本机键盘被意外收回（断线、管理员窗口等）。
+    KbdNote(bool),
     /// 对方在它的设置窗口里给本机改了名（未清理）：写进本机 config.toml。
     Rename(String),
+    /// 收起正显示的“键盘 <本机名>”提示（用户到对方那台干活了：对方弹了提示 / 本机鼠标跨过去了）。
+    KbdTipGone,
     Quit,
 }
 
@@ -280,6 +293,8 @@ pub struct Status {
     pub driving: bool,
     pub driven: bool,
     pub paused: bool,
+    /// 本机键盘正打到对方（键盘跟随，只转发键盘）
+    pub kbd_out: bool,
     pub last_error: String,
 }
 

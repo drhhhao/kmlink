@@ -708,6 +708,7 @@ dependencies = [
  "toml 1.2.0+spec-1.1.0",
  "tray-icon",
  "windows",
+ "windows-core",
  "x25519-dalek",
 ]
 

@@ -4,7 +4,7 @@
 //! （注册表 AppsUseLightTheme；收到 WM_SETTINGCHANGE "ImmersiveColorSet" 重画），标题栏用 DWMWA_CAPTION_COLOR 涂成舞台顶色。
 //! 改了就生效，没有“保存 / 取消”。
 //!
-//! 1. 舞台（上方 820 x 316，柔和渐变）：两台的显示器缩放到 740 x 212 的区域里居中。每块屏幕是圆角矩形 + “壁纸”渐变
+//! 1. 舞台（上方 820 x 292，柔和渐变）：两台的显示器缩放到 740 x 188 的区域里居中。每块屏幕是圆角矩形 + “壁纸”渐变
 //!    （本机偏蓝、对方偏绿）+ 柔和投影；主显示器底部一颗玻璃胶囊：名字（本机带“本机”标签）+ “3840×2160 · 150%”，
 //!    其它显示器只写尺寸。两台相接的区段画一条绿色细条（鼠标从这里过去）。左上“已连接 / 未连接”，右上“拖动摆放”，
 //!    左下“WiFi电脑 在本机左侧 · 下移 416 像素”，右下“尺寸比例 − 1.00 +”（0.25 ~ 4，步进 0.05，点了立即生效）。
@@ -14,9 +14,11 @@
 //!      改好后名字旁绿勾 1.2 秒后淡出。本机名写 config.toml 的 name（主程序重新加载后会重发 Hello，对方就知道了）；
 //!      对方名写 rename_peer.json（主程序约每秒取走，连着时发给对方，对方改它自己的 name）。未连接时对方名字灰色、不能改，悬停提示“连上后可改”。
 //!    - 对方屏幕来自 peer.json（主程序写，含每块屏的 DPI，没有就只写分辨率）；从没连上过：名字“对方”、尺寸“—”、1920×1080 灰色虚线占位。
-//! 2. 卡片（下方）：左“连接”——对方 IP（填一台即可）、配对密钥（两台须相同；只显示首尾，旁边复制 / 换新密钥，换之前弹小确认框）、
-//!    本机 IP（只列真实局域网 IPv4：去掉回环、169.254、Clash 的 198.18/15；有网关的优先）+ 复制。
-//!    右“通用”——剪贴板同步 / 复制提示 / 开机自启三个开关，点了立即写配置。
+//! 2. 卡片（下方，两栏各 4 行，行高 50）：左“连接”——对方 IP（填一台即可）、配对密钥（两台须相同；只显示首尾，旁边复制 / 换新密钥，
+//!    换之前弹小确认框）、本机 IP（只列真实局域网 IPv4：去掉回环、169.254、Clash 的 198.18/15；有网关的优先）+ 复制、开机自启。
+//!    右“共用”——声音（四段分段控件 关 / 本机 / 对方 / 两台 = config audio.mode off/here/there/both，灰字随档位变，
+//!    未连接时灰字“连上后生效”；改了写 mode + 新 rev，主程序同步给对方）、键盘跟随、剪贴板同步、复制提示。点了立即写配置。
+//!    设计稿：设计\设置窗口\声音\（方案 A）。
 //!    输入框（对方 IP、密钥、名字）按回车或失焦时校验：对就写入；不对则该行提示变红、输入框红圈。输入框用真的 EDIT 控件
 //!    （光标、选择、中文输入法、粘贴都靠它），平时隐藏，点到哪个框才盖上去。
 //! 3. 状态：每 500ms 读 status.json（主程序写；connected 为真、主程序互斥量在且 pid 还活着才算已连接）、peer.json、config.toml（改了就重新读入）。
@@ -25,7 +27,7 @@
 //! 所有窗口坐标是物理像素（进程已 PerMonitorV2）；布局常量是 96 DPI 下的逻辑像素，乘 s = dpi/96。
 //! 调试截图用：KMLINK_THEME=dark|light 强制主题；KMLINK_UI=hover|edit|drag|offhover|popover 直接呈现某个状态。
 
-use crate::config::{self, Config};
+use crate::config::{self, AudioMode, Config};
 use crate::geom::{Desk, Layout, Rect, Side};
 use crate::sys;
 use crate::ui::{self, Font, Painter, Rgba, Seg, Surface, hex, hexa};
@@ -367,6 +369,9 @@ struct Theme {
     hov: Rgba,
     red: Rgba,
     redring: Rgba,
+    /// 分段控件的槽和滑块
+    seg_track: Rgba,
+    seg_thumb: Rgba,
     wa: Wall,
     wb: Wall,
 }
@@ -402,6 +407,8 @@ const LIGHT: Theme = Theme {
     hov: hexa(0x7F7F87, 0.16),
     red: hex(0xFF3B30),
     redring: hexa(0xFF3B30, 0.22),
+    seg_track: hex(0xECECEF),
+    seg_thumb: hex(0xFFFFFF),
     wa: Wall { glow: hex(0xE3EEFF), gx: 0.2, stops: [hex(0xC7DBFF), hex(0xA6C4FB), hex(0xD3CBFB)], mid: 0.48 },
     wb: Wall { glow: hex(0xE9FBEF), gx: 0.8, stops: [hex(0xCDF2DB), hex(0x9FDFBB), hex(0xC9E9F7)], mid: 0.5 },
 };
@@ -437,6 +444,8 @@ const DARK: Theme = Theme {
     hov: hexa(0x7F7F87, 0.22),
     red: hex(0xFF453A),
     redring: hexa(0xFF453A, 0.28),
+    seg_track: hex(0x383838),
+    seg_thumb: hex(0x5C5C60),
     wa: Wall { glow: hex(0x3A4F7A), gx: 0.2, stops: [hex(0x25365A), hex(0x1D2B4A), hex(0x2E2850)], mid: 0.5 },
     wb: Wall { glow: hex(0x2C5A41), gx: 0.8, stops: [hex(0x1F3D2E), hex(0x183528), hex(0x1B3040)], mid: 0.5 },
 };
@@ -474,27 +483,47 @@ fn system_dark() -> bool {
 
 const CLIENT_W: f32 = 820.0;
 const CLIENT_H: f32 = 568.0;
-const STAGE_H: f32 = 316.0;
+const STAGE_H: f32 = 292.0;
 /// 舞台里画屏幕的区域
-const AREA: R = R::new(40.0, 50.0, 740.0, 212.0);
+const AREA: R = R::new(40.0, 46.0, 740.0, 188.0);
 /// 两组屏幕之间各让开 3（中间放接缝绿条）
 const GAP: f32 = 3.0;
-const CARD: R = R::new(16.0, 332.0, 788.0, 220.0);
+const CARD: R = R::new(16.0, 308.0, 788.0, 244.0);
 /// 卡片第一行顶
-const ROW0: f32 = 366.0;
-const ROW_H: f32 = 56.0;
-const IP_BOX: R = R::new(204.0, 378.0, 186.0, 32.0);
-const KEY_BOX: R = R::new(166.0, 434.0, 148.0, 32.0);
-const COPY_KEY: R = R::new(320.0, 434.0, 32.0, 32.0);
-const NEW_KEY: R = R::new(358.0, 434.0, 32.0, 32.0);
-const COPY_IP: R = R::new(362.0, 492.0, 28.0, 28.0);
-const STEPPER: R = R::new(706.0, 274.0, 94.0, 28.0);
-const MINUS: R = R::new(710.0, 277.0, 24.0, 22.0);
-const PLUS: R = R::new(772.0, 277.0, 24.0, 22.0);
-const POP: R = R::new(150.0, 346.0, 240.0, 80.0);
-const POP_OK: R = R::new(318.0, 386.0, 60.0, 28.0);
-const POP_CANCEL: R = R::new(250.0, 386.0, 60.0, 28.0);
-const SWITCH_LABELS: [&str; 3] = ["剪贴板同步", "复制提示", "开机自启"];
+const ROW0: f32 = 342.0;
+const ROW_H: f32 = 50.0;
+const IP_BOX: R = R::new(204.0, 351.0, 186.0, 32.0);
+const KEY_BOX: R = R::new(166.0, 401.0, 148.0, 32.0);
+const COPY_KEY: R = R::new(320.0, 401.0, 32.0, 32.0);
+const NEW_KEY: R = R::new(358.0, 401.0, 32.0, 32.0);
+const COPY_IP: R = R::new(362.0, 453.0, 28.0, 28.0);
+const STEPPER: R = R::new(706.0, 250.0, 94.0, 28.0);
+const MINUS: R = R::new(710.0, 253.0, 24.0, 22.0);
+const PLUS: R = R::new(772.0, 253.0, 24.0, 22.0);
+const POP: R = R::new(150.0, 313.0, 240.0, 80.0);
+const POP_OK: R = R::new(318.0, 353.0, 60.0, 28.0);
+const POP_CANCEL: R = R::new(250.0, 353.0, 60.0, 28.0);
+/// 开关：0～2 在右栏第 2～4 行，3（开机自启）在左栏第 4 行。
+const SWITCH_LABELS: [&str; 4] = ["键盘跟随", "剪贴板同步", "复制提示", "开机自启"];
+const SW_N: usize = 4;
+/// 声音分段控件（右栏第 1 行，右边和开关对齐），每段 44，槽里留 2。
+const AUDIO_SEG: R = R::new(604.0, 353.0, 180.0, 28.0);
+const AUDIO_LABELS: [&str; 4] = ["关", "本机", "对方", "两台"];
+const AUDIO_HINTS: [&str; 4] = ["各放各的", "全在本机放", "全在对方放", "混在一起都放"];
+const AUDIO_MODES: [AudioMode; 4] = [AudioMode::Off, AudioMode::Here, AudioMode::There, AudioMode::Both];
+
+fn audio_index(m: AudioMode) -> usize {
+    AUDIO_MODES.iter().position(|&x| x == m).unwrap_or(0)
+}
+
+/// 分段控件里 x 落在第几段（两端的 2 像素边算进最近的段）。
+fn audio_hit(x: f32) -> usize {
+    (((x - AUDIO_SEG.x - 2.0) / 44.0).floor().max(0.0) as usize).min(3)
+}
+
+fn audio_seg(k: usize) -> R {
+    R::new(AUDIO_SEG.x + 2.0 + 44.0 * k as f32, AUDIO_SEG.y + 2.0, 44.0, AUDIO_SEG.h - 4.0)
+}
 
 /// 逻辑像素矩形。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -520,12 +549,17 @@ impl R {
     }
 }
 
-fn switch_rect(i: usize) -> R {
-    R::new(744.0, ROW0 + ROW_H * i as f32 + 16.0, 40.0, 24.0)
+fn switch_row(i: usize) -> R {
+    if i == 3 {
+        R::new(36.0, ROW0 + ROW_H * 3.0, 354.0, ROW_H)
+    } else {
+        R::new(430.0, ROW0 + ROW_H * (i + 1) as f32, 354.0, ROW_H)
+    }
 }
 
-fn switch_row(i: usize) -> R {
-    R::new(430.0, ROW0 + ROW_H * i as f32, 354.0, ROW_H)
+fn switch_rect(i: usize) -> R {
+    let r = switch_row(i);
+    R::new(r.x + r.w - 40.0, r.y + (ROW_H - 24.0) / 2.0, 40.0, 24.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +582,8 @@ enum Hot {
     NewKey,
     CopyIp,
     Switch(usize),
+    /// 声音分段控件的第几段
+    Audio(usize),
     PopCancel,
     PopOk,
     Pop,
@@ -628,6 +664,7 @@ struct Fonts {
     input: Font,
     mono: Font,
     btn: Font,
+    seg_on: Font,
 }
 
 const YAHEI: &[&str] = &["Microsoft YaHei UI"];
@@ -650,6 +687,7 @@ impl Fonts {
             input: Font::new(SEGOE, 13.0, 400, s),
             mono: Font::new(&["Cascadia Mono", "Consolas"], 12.0, 400, s),
             btn: Font::new(YAHEI, 12.5, 400, s),
+            seg_on: Font::new(YAHEI, 12.5, 700, s),
         }
     }
 }
@@ -698,8 +736,12 @@ struct App {
     err_ip: Option<&'static str>,
     err_key: Option<&'static str>,
     err_name: bool,
-    sw: [bool; 3],
-    sw_t: [Option<Instant>; 3],
+    sw: [bool; SW_N],
+    sw_t: [Option<Instant>; SW_N],
+    /// 声音选中的段、滑块动画（起点位置，以段为单位）
+    audio: usize,
+    audio_from: f32,
+    audio_t: Option<Instant>,
     flash: Option<(Field, Instant)>,
     copied: Option<(Hot, Instant)>,
     popover: bool,
@@ -790,6 +832,28 @@ impl App {
         View { k, ox: AREA.x as f64 + (aw - uw * k) / 2.0 - ul * k, oy: AREA.y as f64 + (ah - uh * k) / 2.0 - ut * k }
     }
 
+    /// 声音滑块当前位置（段，带动画）。
+    fn audio_pos(&self) -> f32 {
+        let to = self.audio as f32;
+        match self.audio_t {
+            Some(t0) => {
+                let p = (ms_since(t0) / SWITCH_MS).min(1.0);
+                let e = ui::cubic_bezier(0.25, 0.1, 0.25, 1.0, p);
+                self.audio_from + (to - self.audio_from) * e
+            }
+            None => to,
+        }
+    }
+
+    /// 选中声音第 k 段（带滑动动画）。
+    fn set_audio(&mut self, k: usize) {
+        if k != self.audio {
+            self.audio_from = self.audio_pos();
+            self.audio = k;
+            self.audio_t = Some(Instant::now());
+        }
+    }
+
     fn drop_t(&self) -> Option<f32> {
         self.drop.as_ref().map(|d| ui::cubic_bezier(0.2, 0.8, 0.2, 1.0, ms_since(d.t0) / DROP_MS))
     }
@@ -824,6 +888,7 @@ impl App {
     fn animating(&self) -> bool {
         self.drop.is_some()
             || self.sw_t.iter().flatten().any(|t| ms_since(*t) < SWITCH_MS + 20.0)
+            || self.audio_t.is_some_and(|t| ms_since(t) < SWITCH_MS + 20.0)
             || self.flash.is_some_and(|(_, t)| ms_since(t) < FLASH_MS + FADE_MS + 20.0)
             || self.copied.is_some_and(|(_, t)| ms_since(t) < FLASH_MS + 20.0)
     }
@@ -1109,7 +1174,10 @@ fn hit(a: &App, sc: &Scene, x: f32, y: f32) -> Hot {
     if !a.ips.is_empty() && COPY_IP.contains(x, y) {
         return Hot::CopyIp;
     }
-    for i in 0..3 {
+    if AUDIO_SEG.contains(x, y) {
+        return Hot::Audio(audio_hit(x));
+    }
+    for i in 0..SW_N {
         if switch_row(i).contains(x, y) {
             return Hot::Switch(i);
         }
@@ -1374,16 +1442,17 @@ fn render(p: &mut Painter, a: &App, sc: &Scene) {
     p.ring(c.x, c.y, c.w, c.h, 14.0, 0.0, 1.0, th.cardline);
     p.rrect(410.0, c.y + 16.0, 1.0, c.h - 32.0, 0.0, th.hair);
     p.text_mid(36.0, c.y + 22.0, "连接", &f.group, th.mutd);
-    p.text_mid(430.0, c.y + 22.0, "通用", &f.group, th.mutd);
+    p.text_mid(430.0, c.y + 22.0, "共用", &f.group, th.mutd);
     for x in [36.0, 430.0] {
-        for i in 1..3 {
+        for i in 1..4 {
             p.rrect(x, ROW0 + ROW_H * i as f32, 354.0, 1.0, 0.0, th.hair);
         }
     }
-    let two_line = |p: &mut Painter, top: f32, a1: &str, b1: &str, bc: Rgba| {
-        p.text_mid(36.0, top + 19.5, a1, &f.label, th.fg);
-        p.text_mid(36.0, top + 37.5, b1, &f.hint, bc);
+    let two_line_at = |p: &mut Painter, x: f32, top: f32, a1: &str, b1: &str, bc: Rgba| {
+        p.text_mid(x, top + 16.5, a1, &f.label, th.fg);
+        p.text_mid(x, top + 34.0, b1, &f.hint, bc);
     };
+    let two_line = |p: &mut Painter, top: f32, a1: &str, b1: &str, bc: Rgba| two_line_at(p, 36.0, top, a1, b1, bc);
 
     // 对方 IP
     two_line(p, ROW0, "对方 IP", a.err_ip.unwrap_or("填一台即可"), if a.err_ip.is_some() { th.red } else { th.mutd });
@@ -1419,10 +1488,10 @@ fn render(p: &mut Painter, a: &App, sc: &Scene) {
 
     // 本机 IP
     let r2 = ROW0 + ROW_H * 2.0;
-    p.text_mid(36.0, r2 + 28.0, "本机 IP", &f.label, th.fg);
+    p.text_mid(36.0, r2 + ROW_H / 2.0, "本机 IP", &f.label, th.fg);
     match a.ips.first() {
         Some(ip) => {
-            text_r(p, COPY_IP.x - 6.0, r2 + 28.0, ip, &f.input, th.fg2);
+            text_r(p, COPY_IP.x - 6.0, r2 + ROW_H / 2.0, ip, &f.input, th.fg2);
             if a.hover == Hot::CopyIp {
                 p.rrect(COPY_IP.x, COPY_IP.y, COPY_IP.w, COPY_IP.h, 8.0, th.fill);
             }
@@ -1432,13 +1501,33 @@ fn render(p: &mut Painter, a: &App, sc: &Scene) {
                 icon(p, Icon::Copy, COPY_IP.cx(), COPY_IP.cy(), 15.0, 1.9, th.mutd);
             }
         }
-        None => text_r(p, 390.0, r2 + 28.0, "无", &f.label, th.mutd),
+        None => text_r(p, 390.0, r2 + ROW_H / 2.0, "无", &f.label, th.mutd),
+    }
+
+    // 声音：分段控件
+    let hint = if a.connected { AUDIO_HINTS[a.audio] } else { "连上后生效" };
+    two_line_at(p, 430.0, ROW0, "声音", hint, th.mutd);
+    let g = AUDIO_SEG;
+    p.rrect(g.x, g.y, g.w, g.h, 8.0, th.seg_track);
+    let th_r = audio_seg(0);
+    let tx = th_r.x + 44.0 * a.audio_pos();
+    p.shadow(tx, th_r.y, th_r.w, th_r.h, 6.0, 0.0, 1.0, 2.0, 0.0, hexa(0, if th.dark { 0.35 } else { 0.12 }));
+    p.rrect(tx, th_r.y, th_r.w, th_r.h, 6.0, th.seg_thumb);
+    for (k, label) in AUDIO_LABELS.iter().enumerate() {
+        let r = audio_seg(k);
+        let on = k == a.audio;
+        let col = if on || a.hover == Hot::Audio(k) { th.fg } else { th.fg2 };
+        text_c(p, r.cx(), r.cy(), label, if on { &f.seg_on } else { &f.btn }, col);
     }
 
     // 开关
     for (i, label) in SWITCH_LABELS.iter().enumerate() {
         let row = switch_row(i);
-        p.text_mid(430.0, row.cy(), label, &f.label, th.fg);
+        if i == 0 {
+            two_line_at(p, row.x, row.y, label, "跟最后用的鼠标", th.mutd);
+        } else {
+            p.text_mid(row.x, row.cy(), label, &f.label, th.fg);
+        }
         let r = switch_rect(i);
         let t = a.switch_t(i);
         p.rrect(r.x, r.y, r.w, r.h, 12.0, th.swoff.lerp(th.green, t));
@@ -1940,7 +2029,8 @@ pub fn run() {
         }
         let mine = local_monitors();
         // 开机自启以注册表为准（主程序没在跑时 config 里的值可能没生效）
-        let sw = [cfg.clipboard.enabled, cfg.clipboard.notify, sys::autostart_get().is_some()];
+        let sw = [cfg.input.kbd_follow, cfg.clipboard.enabled, cfg.clipboard.notify, sys::autostart_get().is_some()];
+        let audio = audio_index(cfg.audio.mode);
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
                 hwnd,
@@ -1978,7 +2068,10 @@ pub fn run() {
                 err_key: None,
                 err_name: false,
                 sw,
-                sw_t: [None; 3],
+                sw_t: [None; SW_N],
+                audio,
+                audio_from: audio as f32,
+                audio_t: None,
                 flash: None,
                 copied: None,
                 popover: false,
@@ -2347,8 +2440,9 @@ fn poll() {
         if reload {
             a.cfg_mtime = mt;
             if let Some(c) = new_cfg {
-                let sw = [c.clipboard.enabled, c.clipboard.notify, c.autostart];
-                for i in 0..3 {
+                let sw = [c.input.kbd_follow, c.clipboard.enabled, c.clipboard.notify, c.autostart];
+                a.set_audio(audio_index(c.audio.mode));
+                for i in 0..SW_N {
                     if sw[i] != a.sw[i] {
                         a.sw[i] = sw[i];
                         a.sw_t[i] = Some(Instant::now());
@@ -2468,9 +2562,12 @@ fn on_click(hot: Hot) {
             if let Some(v) = v {
                 match i {
                     0 => {
-                        write_cfg(|c| c.clipboard.enabled = v);
+                        write_cfg(|c| c.input.kbd_follow = v);
                     }
                     1 => {
+                        write_cfg(|c| c.clipboard.enabled = v);
+                    }
+                    2 => {
                         write_cfg(|c| c.clipboard.notify = v);
                     }
                     _ => {
@@ -2479,13 +2576,29 @@ fn on_click(hot: Hot) {
                         let actual = sys::autostart_get().is_some();
                         if actual != v {
                             with_app(|a| {
-                                a.sw[2] = actual;
-                                a.sw_t[2] = Some(Instant::now());
+                                a.sw[3] = actual;
+                                a.sw_t[3] = Some(Instant::now());
                             });
                         }
                         write_cfg(|c| c.autostart = actual);
                     }
                 }
+            }
+        }
+        Hot::Audio(k) => {
+            let changed = with_app(|a| {
+                let c = a.audio != k;
+                a.set_audio(k);
+                c
+            });
+            if changed == Some(true) {
+                // 新 rev（rev_mode 跟着记）：主程序重新读配置后发给对方，对方换成它的视角
+                let m = AUDIO_MODES[k];
+                write_cfg(|c| {
+                    c.audio.mode = m;
+                    c.audio.rev = config::next_rev(c.audio.rev);
+                    c.audio.rev_mode = Some(m);
+                });
             }
         }
         Hot::Minus => on_scale(-1),
@@ -2960,6 +3073,33 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn audio_segments_hit_and_layout() {
+        for k in 0..4 {
+            let r = audio_seg(k);
+            assert_eq!(audio_hit(r.cx()), k);
+            assert_eq!(audio_hit(r.x + 0.5), k);
+            assert_eq!(audio_hit(r.x + r.w - 0.5), k);
+            assert!(AUDIO_SEG.contains(r.cx(), r.cy()));
+        }
+        assert_eq!(audio_hit(AUDIO_SEG.x), 0);
+        assert_eq!(audio_hit(AUDIO_SEG.x + AUDIO_SEG.w - 0.1), 3);
+        // 右边和开关对齐、在卡片第一行里
+        assert_eq!(AUDIO_SEG.x + AUDIO_SEG.w, switch_rect(0).x + switch_rect(0).w);
+        assert!(AUDIO_SEG.y > ROW0 && AUDIO_SEG.y + AUDIO_SEG.h < ROW0 + ROW_H);
+        // 四个开关各在自己那一行，卡片装得下
+        for i in 0..SW_N {
+            let r = switch_rect(i);
+            assert!(switch_row(i).contains(r.cx(), r.cy()));
+            assert!(r.y + r.h < CARD.y + CARD.h);
+        }
+        assert_eq!(switch_row(3).x, 36.0, "开机自启在左栏");
+        assert!(CARD.y > STAGE_H && CARD.y + CARD.h < CLIENT_H);
+        for (k, m) in AUDIO_MODES.iter().enumerate() {
+            assert_eq!(audio_index(*m), k);
+        }
+    }
+
     use super::*;
     use crate::geom::Point;
 

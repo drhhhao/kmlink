@@ -49,7 +49,7 @@
 //! 发一张图片时的峰值 ≈ 读出的一份原始数据 + 压缩器（约 0.3 MiB）+ 未发出的压缩数据（≤ 1 MiB）。
 
 use crate::clip::{hash_image, hash_text};
-use crate::config::{Config, StatusFile};
+use crate::config::{AudioMode, Config, StatusFile};
 use crate::geom::Desk;
 use crate::hub::{self, Hub, Out, Status, StreamTx, ToDesktop, ToInput, WM_APP_WAKE};
 use crate::proto::{self, Msg, PROTO_VERSION};
@@ -60,7 +60,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener};
@@ -427,6 +427,8 @@ fn tip_text(st: &Status) -> String {
     };
     if st.paused {
         s.push_str("（已暂停）");
+    } else if st.kbd_out {
+        s.push_str(" · 键盘在对方");
     }
     s
 }
@@ -496,9 +498,25 @@ struct Items {
     status: MenuItem,
     settings: MenuItem,
     pause: CheckMenuItem,
+    follow: CheckMenuItem,
+    /// “声音”子菜单：四个勾选项当单选用（muda 没有单选项），名字和设置窗口一致。
+    audio: Submenu,
+    audio_items: [CheckMenuItem; 4],
     autostart: CheckMenuItem,
     folder: MenuItem,
     quit: MenuItem,
+}
+
+const AUDIO_MENU: [(&str, AudioMode); 4] =
+    [("关", AudioMode::Off), ("本机", AudioMode::Here), ("对方", AudioMode::There), ("两台", AudioMode::Both)];
+
+impl Items {
+    /// 只勾当前模式那一项。
+    fn check_audio(&self, m: AudioMode) {
+        for (it, (_, mode)) in self.audio_items.iter().zip(AUDIO_MENU) {
+            it.set_checked(mode == m);
+        }
+    }
 }
 
 /// 对方发来、要写入本机剪贴板的内容。
@@ -573,6 +591,8 @@ struct State {
     quitting: bool,
     tray: Option<TrayIcon>,
     items: Items,
+    /// 托盘“声音”子菜单当前勾的模式。
+    audio_shown: Option<AudioMode>,
     /// 上次处理过的剪贴板序号（同一序号不重复处理）。
     last_seq: Option<u32>,
     /// 剪贴板打不开时的重试：(序号, 已重试次数)。
@@ -762,10 +782,23 @@ impl State {
                 }
             }
             ToDesktop::Note(n) => self.note(&n),
+            ToDesktop::KbdNote(ok) => self.kbd_note(ok),
             ToDesktop::Rename(name) => self.renamed_by_peer(&name),
+            ToDesktop::KbdTipGone => island::keyboard_gone(),
             ToDesktop::Quit => return false,
         }
         true
+    }
+
+    /// 键盘跟随提示：键盘换到了这台（“键盘 <本机名>”）/ 被意外收回（“键盘 已收回”，两台都弹）。
+    /// 两台同时只留一颗“键盘 <名字>”：本机弹了，就请对方收起它那颗（Msg::KbdTip）。
+    fn kbd_note(&self, ok: bool) {
+        if ok {
+            self.hub.send(Msg::KbdTip);
+        } else {
+            log!("键盘跟随：键盘被意外收回");
+        }
+        island::keyboard(ok, &self.hub.cfg().name);
     }
 
     /// 弹剪贴板同步提示（设置里关了就不弹）。
@@ -871,6 +904,13 @@ impl State {
             let on = it.pause.is_checked();
             self.hub.to_input(ToInput::Pause(on));
             self.hub.set_status(|s| s.paused = on);
+        } else if id == it.follow.id() {
+            let on = it.follow.is_checked();
+            self.save_follow(on);
+        } else if let Some(k) = it.audio_items.iter().position(|x| x.id() == id) {
+            let m = AUDIO_MENU[k].1;
+            it.check_audio(m);
+            self.save_audio(m);
         } else if id == it.autostart.id() {
             let want = it.autostart.is_checked();
             sys::autostart_set(want);
@@ -887,6 +927,51 @@ impl State {
             return false;
         }
         true
+    }
+
+    /// 托盘“键盘跟随”：内存里先改好并立刻通知 input（不等重新加载），再存进配置文件（只动这一项）。
+    fn save_follow(&mut self, on: bool) {
+        log!("托盘：键盘跟随{}", if on { "开" } else { "关" });
+        if let Ok(mut g) = self.hub.cfg.write() {
+            g.input.kbd_follow = on;
+        }
+        let c = self.hub.cfg();
+        self.hub.to_input(ToInput::Config(Box::new(c.clone())));
+        if let Err(e) = config::update(&c, |c| c.input.kbd_follow = on) {
+            log!("保存配置失败：{e}");
+        }
+    }
+
+    /// 托盘“声音”：内存里先改（新 rev，声音控制线程马上同步给对方），再存进配置文件（只动声音模式）。
+    fn save_audio(&mut self, m: AudioMode) {
+        let cur = self.hub.cfg().audio;
+        if cur.mode == m {
+            return;
+        }
+        log!("托盘：声音 {}", m.as_str());
+        let rev = config::next_rev(cur.rev);
+        if let Ok(mut g) = self.hub.cfg.write() {
+            g.audio.mode = m;
+            g.audio.rev = rev;
+            g.audio.rev_mode = Some(m);
+        }
+        let c = self.hub.cfg();
+        if let Err(e) = config::update(&c, |d| {
+            d.audio.mode = m;
+            d.audio.rev = d.audio.rev.max(rev);
+            d.audio.rev_mode = Some(m);
+        }) {
+            log!("保存配置失败：{e}");
+        }
+    }
+
+    /// 托盘勾选和当前声音模式对齐（设置窗口改的、对方同步过来的都在这里跟上）。
+    fn sync_audio_menu(&mut self) {
+        let m = self.hub.cfg().audio.mode;
+        if self.audio_shown != Some(m) {
+            self.audio_shown = Some(m);
+            self.items.check_audio(m);
+        }
     }
 
     /// 把 autostart 存进配置文件（读-改-写，只动这一项）。不更新 cfg_mtime：让 check_config 照常重新加载，
@@ -916,6 +1001,7 @@ impl State {
             }
             TIMER_CONFIG => {
                 self.check_config();
+                self.sync_audio_menu();
                 self.check_rename_peer();
                 // status.json 上次没写成就重试（内容没变时是空操作）
                 let st = self.hub.status();
@@ -1058,6 +1144,19 @@ impl State {
         self.cfg_bad = None;
         log!("配置文件已变化，重新加载");
         let old = self.hub.cfg();
+        let mut c = c;
+        if c.audio.claim_hand_edit() {
+            // 手改的声音模式：rev 变新，才能同步给对方（对方的 rev 不比它新）
+            let a = c.audio.clone();
+            if let Err(e) = config::update(&c, |d| {
+                if d.audio.mode == a.mode {
+                    d.audio.rev = d.audio.rev.max(a.rev);
+                    d.audio.rev_mode = a.rev_mode;
+                }
+            }) {
+                log!("保存配置失败：{e}");
+            }
+        }
         if let Ok(mut g) = self.hub.cfg.write() {
             *g = c.clone();
         }
@@ -1070,6 +1169,9 @@ impl State {
         if c.name != old.name || c.port != old.port {
             self.hub.send(hello(&c, self.desk.clone(), self.dpis.clone()));
         }
+        if c.input.kbd_follow != old.input.kbd_follow {
+            self.items.follow.set_checked(c.input.kbd_follow);
+        }
         if c.autostart != old.autostart {
             sys::autostart_set(c.autostart);
             self.items.autostart.set_checked(sys::autostart_get().is_some());
@@ -1078,7 +1180,7 @@ impl State {
 }
 
 fn hello(c: &Config, d: Desk, dpis: Vec<u32>) -> Msg {
-    Msg::Hello { ver: PROTO_VERSION, name: c.name.clone(), monitors: d.monitors, udp_port: c.port, id: crate::proto::instance_id(), dpis }
+    Msg::Hello { ver: PROTO_VERSION, name: c.name.clone(), monitors: d.monitors, udp_port: c.port, id: crate::proto::instance_id(), dpis, caps: crate::proto::CAPS }
 }
 
 /// status.json 的内容（t = 写入时间）。
@@ -1221,6 +1323,8 @@ fn build_tray(items: &Items, st: &Status) -> Option<TrayIcon> {
         &sep1,
         &items.settings,
         &items.pause,
+        &items.follow,
+        &items.audio,
         &items.autostart,
         &items.folder,
         &sep2,
@@ -1282,10 +1386,20 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
     let cfg = hub.cfg();
     let autostart_on = autostart_sync(cfg.autostart);
     let st = hub.status();
+    let audio_items = AUDIO_MENU.map(|(name, m)| CheckMenuItem::new(name, true, cfg.audio.mode == m, None));
+    let audio = Submenu::new("声音", true);
+    for it in &audio_items {
+        if let Err(e) = audio.append(it) {
+            log!("托盘菜单创建失败：{e}");
+        }
+    }
     let items = Items {
         status: MenuItem::new(status_line(&st), false, None),
         settings: MenuItem::new("屏幕排布与连接设置…", true, None),
         pause: CheckMenuItem::new("暂停共享", true, st.paused, None),
+        follow: CheckMenuItem::new("键盘跟随", true, cfg.input.kbd_follow, None),
+        audio,
+        audio_items,
         autostart: CheckMenuItem::new("开机自启", true, autostart_on, None),
         folder: MenuItem::new("打开配置文件夹", true, None),
         quit: MenuItem::new("退出", true, None),
@@ -1301,6 +1415,7 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
         quitting: false,
         tray,
         items,
+        audio_shown: None,
         last_seq: Some(clip::seq()), // 启动前已有的剪贴板内容不发
         retry: None,
         pending: None,
