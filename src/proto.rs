@@ -109,20 +109,22 @@ pub enum UdpMsg {
     /// 双方每秒互发，用来打通/学习对方 UDP 地址。
     Hi,
     /// 被控端把光标放到 (x, y)。同一 epoch 内只接受 seq 更大的。
-    Move { epoch: u32, seq: u32, x: i32, y: i32 },
+    /// t = 主控端单调时钟（微秒，回绕；0 = 没有，旧版本发的 17 字节包），被控端据此平滑播放（smooth.rs）。
+    Move { epoch: u32, seq: u32, x: i32, y: i32, t: u32 },
 }
 
 impl UdpMsg {
     pub fn encode(&self) -> Vec<u8> {
         match *self {
             UdpMsg::Hi => vec![0],
-            UdpMsg::Move { epoch, seq, x, y } => {
-                let mut v = Vec::with_capacity(17);
+            UdpMsg::Move { epoch, seq, x, y, t } => {
+                let mut v = Vec::with_capacity(21);
                 v.push(1);
                 v.extend_from_slice(&epoch.to_le_bytes());
                 v.extend_from_slice(&seq.to_le_bytes());
                 v.extend_from_slice(&x.to_le_bytes());
                 v.extend_from_slice(&y.to_le_bytes());
+                v.extend_from_slice(&t.to_le_bytes());
                 v
             }
         }
@@ -133,7 +135,8 @@ impl UdpMsg {
             0 => Some(UdpMsg::Hi),
             1 if b.len() >= 17 => {
                 let u = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
-                Some(UdpMsg::Move { epoch: u(1), seq: u(5), x: u(9) as i32, y: u(13) as i32 })
+                let t = if b.len() >= 21 { u(17) } else { 0 };
+                Some(UdpMsg::Move { epoch: u(1), seq: u(5), x: u(9) as i32, y: u(13) as i32, t })
             }
             _ => None,
         }
@@ -350,7 +353,11 @@ pub(crate) mod tests {
     use super::*;
     #[test]
     fn udp_roundtrip() {
-        let m = UdpMsg::Move { epoch: 7, seq: 99, x: -5, y: 2160 };
+        let m = UdpMsg::Move { epoch: 7, seq: 99, x: -5, y: 2160, t: 123_456 };
+        // 旧版本的 17 字节包：t = 0
+        let mut old = m.encode();
+        old.truncate(17);
+        assert_eq!(UdpMsg::decode(&old), Some(UdpMsg::Move { epoch: 7, seq: 99, x: -5, y: 2160, t: 0 }));
         assert_eq!(UdpMsg::decode(&m.encode()), Some(m));
         assert_eq!(UdpMsg::decode(&UdpMsg::Hi.encode()), Some(UdpMsg::Hi));
         assert_eq!(UdpMsg::decode(&[1, 2]), None);

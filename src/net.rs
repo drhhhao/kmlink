@@ -117,7 +117,7 @@ const UDP_GRACE: Duration = Duration::from_secs(3);
 const UDP_RETRY: Duration = Duration::from_secs(5);
 /// 这么久没收到认证通过的 UDP 包（对方每秒发 Hi）：鼠标位置回落到 TCP。
 const UDP_STALE: Duration = Duration::from_millis(2500);
-/// 合法 UDP 包长度：8 字节计数器 + 明文（Hi 1 字节 / Move 17 字节）+ 16 字节 tag。
+/// 合法 UDP 包长度：8 字节计数器 + 明文（Hi 1 字节 / Move 21 字节，旧版 17）+ 16 字节 tag。
 const UDP_MIN_PKT: usize = 8 + 1 + 16;
 const UDP_MAX_PKT: usize = 64;
 /// UDP 接收缓冲：比合法包大就行（更大的包 recv_from 报 WSAEMSGSIZE，按单包错误跳过）。
@@ -1157,7 +1157,7 @@ impl Net {
                 self.mark_mouse();
                 #[cfg(test)]
                 self.stats.tcp_moves.fetch_add(1, Ordering::Relaxed);
-                self.injector.moved(sess.id, epoch, seq, x, y)
+                self.injector.moved(sess.id, epoch, seq, x, y, 0)
             }
             Msg::Yield { epoch } => self.hub.to_input(ToInput::Yield(epoch)),
             Msg::ClipForget => self.hub.to_desktop(ToDesktop::PeerForget),
@@ -1384,11 +1384,11 @@ impl Net {
             }
             let Some(plain) = lock(&sess.udp_rx).open(&buf[..n]) else { continue };
             lock(&sess.udp_peer).heard(src, Instant::now());
-            if let Some(UdpMsg::Move { epoch, seq, x, y }) = UdpMsg::decode(&plain) {
+            if let Some(UdpMsg::Move { epoch, seq, x, y, t }) = UdpMsg::decode(&plain) {
                 self.mark_mouse();
                 #[cfg(test)]
                 self.stats.udp_moves.fetch_add(1, Ordering::Relaxed);
-                self.injector.moved(sess.id, epoch, seq, x, y);
+                self.injector.moved(sess.id, epoch, seq, x, y, t);
             }
         }
     }
@@ -1422,7 +1422,7 @@ impl Net {
 
     /// 发鼠标位置：UDP；UDP 不可用或不通时也走 TCP（进可靠队列，接收方按 seq 去重）。
     fn send_move(&self, s: &Session, m: &UdpMsg) {
-        let UdpMsg::Move { epoch, seq, x, y } = *m else { return };
+        let UdpMsg::Move { epoch, seq, x, y, .. } = *m else { return };
         let (udp, tcp) = move_route(self.udp.get().is_some(), s.udp_live());
         if udp {
             self.send_udp(s, m);
@@ -1481,7 +1481,7 @@ impl Net {
         match o {
             Out::Move { epoch, seq, x, y } => {
                 self.mark_mouse();
-                mover.push(UdpMsg::Move { epoch, seq, x, y })
+                mover.push(UdpMsg::Move { epoch, seq, x, y, t: crate::smooth::stamp() })
             }
             Out::CancelClip => {
                 self.clip_gen.fetch_add(1, Ordering::Relaxed);
@@ -2104,7 +2104,7 @@ mod tests {
         let a = UdpSocket::bind("127.0.0.1:0").unwrap();
         let b = UdpSocket::bind("127.0.0.1:0").unwrap();
         b.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let mv = UdpMsg::Move { epoch: 1, seq: 5, x: 100, y: -20 };
+        let mv = UdpMsg::Move { epoch: 1, seq: 5, x: 100, y: -20, t: 7 };
         let p1 = utx.seal(&mv.encode()).unwrap();
         let p2 = utx.seal(&UdpMsg::Hi.encode()).unwrap();
         // 合法包的长度都在过滤范围内
@@ -2276,7 +2276,7 @@ mod tests {
     #[test]
     fn mover_throttles_but_keeps_latest() {
         let ms = Duration::from_millis;
-        let m_ = |s: u32| UdpMsg::Move { epoch: 1, seq: s, x: s as i32, y: 0 };
+        let m_ = |s: u32| UdpMsg::Move { epoch: 1, seq: s, x: s as i32, y: 0, t: s };
         let t = Instant::now();
         let mut m = Mover::default();
         assert!(m.wake().is_none());
