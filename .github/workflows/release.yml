@@ -1,0 +1,66 @@
+name: Release
+
+# 推版本标签（v0.1.1 这样，要和 Cargo.toml 的 version 一致）→ 测试、编译、发 GitHub Release。
+# 手动运行（Actions 页 Run workflow）只编译打包、上传构建产物，不发 Release，用来试流程。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            Write-Error "标签 $env:GITHUB_REF_NAME 和 Cargo.toml 的版本 $v 对不上"; exit 1
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        id: pkg
+        shell: pwsh
+        run: |
+          $name = "kmlink-v${{ steps.ver.outputs.version }}-windows-x64"
+          New-Item -ItemType Directory -Force dist/$name | Out-Null
+          Copy-Item target/release/kmlink.exe, README.md, LICENSE dist/$name/
+          Compress-Archive -Path dist/$name/* -DestinationPath dist/$name.zip -Force
+          Get-ChildItem dist/$name.zip, target/release/kmlink.exe | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+          Get-Content dist/SHA256SUMS.txt
+          "name=$name" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+
+      - name: GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            "dist/${{ steps.pkg.outputs.name }}.zip" dist/SHA256SUMS.txt `
+            --title "kmlink $env:GITHUB_REF_NAME" --generate-notes
