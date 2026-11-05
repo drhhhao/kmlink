@@ -12,6 +12,8 @@
 //! - 记录本机被按下还没抬起的键（(scan, ext, vk)）和鼠标按钮；leave / stale / release_all / 会话断开时全部抬起，
 //!   防止卡键。抬起的键里有 Alt/Win 时，先注入掩码键 vk 0xE8 按下抬起，免得弹出菜单栏/开始菜单。
 //! - epoch 不等于当前 epoch 的消息丢弃；Move 只接受同一 epoch 内 seq 更大的。
+//! - 带时间戳的 Move 进平滑播放（smooth::Playout）：到点的当场在调用线程注入，没到点的由 inject-play 线程
+//!   按时注入。Button/Wheel 带着最新位置，先清掉排着的旧位置；enter/leave/会话变化时整个重来。
 //! - enter 时通知 input 线程 ToInput::Driven(true)，leave/release_all 时 Driven(false)，并更新 hub.status.driven。
 //!   这两个通知在持锁时发出（都不阻塞），并发的 enter/leave 不会把顺序弄反。
 //!   当前被接管的轮次记在 DRIVEN_EPOCH，input 线程发 Yield 时带上（`driven_epoch()`）。
@@ -24,7 +26,9 @@
 use crate::hub::{Hub, ToInput};
 use crate::proto::{Button, INJECT_MARK, Msg};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use crate::smooth::{self, Item, Playout};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::Duration;
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
@@ -73,6 +77,8 @@ struct Inner {
     buttons: [bool; 5],
     /// 上次因注入失败回 Yield 的时间
     fail_yield: Option<u32>,
+    /// 鼠标位置平滑播放
+    play: Playout,
 }
 
 impl Inner {
@@ -163,6 +169,8 @@ const REAL: Sys = Sys { send, last_input: crate::input::last_physical_input, now
 pub struct Injector {
     hub: Arc<Hub>,
     inner: Mutex<Inner>,
+    /// 叫醒 inject-play（有排着的位置了）
+    play_cv: Condvar,
     sys: Sys,
 }
 
@@ -173,7 +181,58 @@ impl Injector {
         let sys = Sys { send: |i| i.len() as u32, last_input: || None, now: tick };
         #[cfg(not(test))]
         let sys = REAL;
-        Self { hub, inner: Mutex::new(Inner::default()), sys }
+        Self { hub, inner: Mutex::new(Inner::default()), play_cv: Condvar::new(), sys }
+    }
+
+    /// 起 inject-play 线程：按时注入平滑缓冲里没到点的位置。
+    pub fn start(self: &Arc<Self>) {
+        let me = self.clone();
+        let _ = std::thread::Builder::new().name("inject-play".into()).spawn(move || me.run_play());
+    }
+
+    fn run_play(&self) {
+        crate::sys::boost_thread(true);
+        let mut g = self.lock();
+        loop {
+            let now = smooth::now_us();
+            g = match self.play(&mut g, now) {
+                None => self.play_cv.wait(g).unwrap_or_else(|e| e.into_inner()),
+                Some(w) => {
+                    let d = Duration::from_micros((w - now).max(0) as u64);
+                    self.play_cv.wait_timeout(g, d).unwrap_or_else(|e| e.into_inner()).0
+                }
+            };
+        }
+    }
+
+    /// 推进平滑播放，注入到点的位置（持锁）。返回下次该醒的时刻。
+    fn play(&self, g: &mut Inner, now: i64) -> Option<i64> {
+        let (it, wake) = g.play.poll(now);
+        if let Some(it) = it {
+            if g.active && g.current(it.epoch) && it.seq > g.seq {
+                g.seq = it.seq;
+                if (self.sys.send)(&[move_input(it.x, it.y)]) != 1 {
+                    self.failed(g);
+                }
+            }
+        }
+        wake
+    }
+
+    /// 平滑播放整个重来（持锁）。有统计就记一行日志。
+    fn reset_play(&self, g: &mut Inner) {
+        let st = g.play.stats;
+        if st.pushed > 0 {
+            crate::log!(
+                "鼠标平滑：收 {} 个，注入 {} 次，大断流跳过 {} 次，最大缓冲 {:.1}ms",
+                st.pushed,
+                st.injected,
+                st.snapped,
+                st.max_delay as f64 / 1000.0
+            );
+        }
+        g.play.reset();
+        g.play.stats = Default::default();
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -238,6 +297,7 @@ impl Injector {
         if (g.active && g.epoch != epoch) || g.holds_any() {
             self.release(&mut g);
         }
+        self.reset_play(&mut g);
         g.epoch = epoch;
         g.active = true;
         g.seq = 0;
@@ -258,18 +318,30 @@ impl Injector {
         }
         self.release(&mut g);
         g.active = false;
+        self.reset_play(&mut g);
         self.set_driven(&g, false);
     }
 
-    /// UDP 来的绝对位置。
-    pub fn moved(&self, sid: u64, epoch: u32, seq: u32, x: i32, y: i32) {
+    /// 对方发来的绝对位置。t = 对方发送时刻（微秒，0 = 没有）：有就进平滑播放，没有就当场注入。
+    pub fn moved(&self, sid: u64, epoch: u32, seq: u32, x: i32, y: i32, t: u32) {
         let mut g = self.lock();
         if !g.session(sid) || !g.current(epoch) || seq <= g.seq {
             return;
         }
-        g.seq = seq;
-        if (self.sys.send)(&[move_input(x, y)]) != 1 {
-            self.failed(&mut g);
+        if t == 0 {
+            g.seq = seq;
+            if (self.sys.send)(&[move_input(x, y)]) != 1 {
+                self.failed(&mut g);
+            }
+            return;
+        }
+        let now = smooth::now_us();
+        #[cfg(not(test))]
+        smooth::trace(now, t, x, y);
+        g.play.push(now, t, Item { epoch, seq, x, y });
+        self.play(&mut g, now);
+        if g.play.pending() {
+            self.play_cv.notify_one();
         }
     }
 
@@ -278,6 +350,7 @@ impl Injector {
         if !g.session(sid) || !g.current(epoch) {
             return;
         }
+        g.play.flush();
         let ok = (self.sys.send)(&[move_input(x, y), button_input(b, down)]) == 2;
         // 按下总记下；抬起没注入成功就留着，放手时再抬
         if down || ok {
@@ -293,6 +366,7 @@ impl Injector {
         if !g.session(sid) || !g.current(epoch) || delta == 0 {
             return;
         }
+        g.play.flush();
         let flags = if horizontal { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL };
         if (self.sys.send)(&[move_input(x, y), mouse(0, 0, delta as u32, flags)]) != 2 {
             self.failed(&mut g);
@@ -341,6 +415,7 @@ impl Injector {
         if g.session(sid) {
             self.release(&mut g);
             g.active = false;
+            self.reset_play(&mut g);
             self.set_driven(&g, false);
         }
     }
@@ -350,6 +425,7 @@ impl Injector {
         let mut g = self.lock();
         self.release(&mut g);
         g.active = false;
+        self.reset_play(&mut g);
         self.set_driven(&g, false);
     }
 }
@@ -605,7 +681,7 @@ mod tests {
 
     fn injector() -> (Injector, HubRx) {
         let (hub, rx) = Hub::new(crate::config::Config::default());
-        let inj = Injector { hub: Arc::new(hub), inner: Mutex::new(Inner::default()), sys: FAKE };
+        let inj = Injector { hub: Arc::new(hub), inner: Mutex::new(Inner::default()), play_cv: Condvar::new(), sys: FAKE };
         inj.begin_session(1);
         (inj, rx)
     }
@@ -674,8 +750,8 @@ mod tests {
         let (inj, rx) = injector();
         inj.enter(1, 9, 10, 10);
         FAIL.with(|f| f.set(true));
-        inj.moved(1, 9, 1, 20, 20);
-        inj.moved(1, 9, 2, 21, 20);
+        inj.moved(1, 9, 1, 20, 20, 0);
+        inj.moved(1, 9, 2, 21, 20, 0);
         inj.key(1, 9, 0x1e, false, 0x41, true);
         assert_eq!(yields(&rx), vec![9]);
         NOW.with(|c| c.set(c.get() + 1_100));
@@ -685,6 +761,29 @@ mod tests {
         FAIL.with(|f| f.set(false));
         inj.leave(1, 9);
         assert_eq!(sent(), vec![(0x1e, true)]);
+    }
+
+    #[test]
+    fn timestamped_moves_play_and_clicks_drop_queued_positions() {
+        let (inj, _rx) = injector();
+        inj.enter(1, 4, 0, 0);
+        // 第一个带时间戳的位置：还没有晚到统计，到了就播
+        inj.moved(1, 4, 1, 5, 5, 1_000);
+        assert_eq!(inj.lock().seq, 1);
+        // 排进去一个还没到点的位置（发送时刻在很久以后），点击带着最新位置：排着的必须扔掉
+        {
+            let mut g = inj.lock();
+            let now = smooth::now_us();
+            g.play.push(now, 1_000 + 50_000, Item { epoch: 4, seq: 2, x: 6, y: 6 });
+            g.play.push(now, 1_000 + 52_000, Item { epoch: 4, seq: 3, x: 7, y: 7 });
+        }
+        inj.button(1, 4, 9, 9, Button::Left, true);
+        assert!(!inj.lock().play.pending());
+        // 新的接管：平滑状态全部重来，seq 从头算
+        inj.leave(1, 4);
+        inj.enter(1, 5, 0, 0);
+        inj.moved(1, 5, 1, 1, 1, 77);
+        assert_eq!(inj.lock().seq, 1);
     }
 
     #[test]

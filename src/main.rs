@@ -24,6 +24,7 @@ mod log;
 mod net;
 mod proto;
 mod settings;
+mod smooth;
 mod sys;
 mod ui;
 
@@ -90,6 +91,7 @@ fn daemon(with_console: bool) {
     let (hub, rx) = hub::Hub::new(cfg);
     let hub = Arc::new(hub);
     let injector = Arc::new(inject::Injector::new(hub.clone()));
+    injector.start();
     desktop::spawn(hub.clone(), rx.desktop, first_run);
     net::spawn(hub.clone(), rx.net, injector.clone());
     input::run(hub.clone(), rx.input); // 阻塞到“退出”
