@@ -70,6 +70,8 @@ pub enum ToDesktop {
     PeerForget,
     /// 弹剪贴板同步提示（灵动岛）。
     Note(crate::island::Note),
+    /// 对方在它的设置窗口里给本机改了名（未清理）：写进本机 config.toml。
+    Rename(String),
     Quit,
 }
 

@@ -8,7 +8,9 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
+};
 use windows::core::{BOOL, PCWSTR};
 
 /// 必须在创建任何窗口之前调用：之后所有坐标都是物理像素。
@@ -18,25 +20,36 @@ pub fn dpi_aware() {
     }
 }
 
-/// 本机所有显示器（物理像素，虚拟桌面坐标）。
+/// 本机所有显示器（物理像素，虚拟桌面坐标），按 (左, 上) 排序。
 pub fn monitors() -> Desk {
+    monitors_dpi().0
+}
+
+/// 本机显示器 + 每块的有效 DPI（96 = 100%，和 monitors 一一对应，顺序同 `monitors()`）。取不到 DPI 的按 96。
+pub fn monitors_dpi() -> (Desk, Vec<u32>) {
     unsafe extern "system" fn cb(h: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
         unsafe {
-            let v = &mut *(data.0 as *mut Vec<Rect>);
+            let v = &mut *(data.0 as *mut Vec<(Rect, u32)>);
             let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
             if GetMonitorInfoW(h, &mut mi).as_bool() {
                 let r = mi.rcMonitor;
-                v.push(Rect::new(r.left, r.top, r.right, r.bottom));
+                let (mut dx, mut dy) = (0u32, 0u32);
+                let dpi = match GetDpiForMonitor(h, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) {
+                    Ok(()) if dx > 0 => dx,
+                    _ => 96,
+                };
+                v.push((Rect::new(r.left, r.top, r.right, r.bottom), dpi));
             }
         }
         BOOL(1)
     }
-    let mut v: Vec<Rect> = Vec::new();
+    let mut v: Vec<(Rect, u32)> = Vec::new();
     unsafe {
         let _ = EnumDisplayMonitors(None, None, Some(cb), LPARAM(&mut v as *mut _ as isize));
     }
-    v.sort_by_key(|r| (r.l, r.t));
-    Desk::new(v)
+    v.sort_by_key(|(r, _)| (r.l, r.t));
+    let (rects, dpis) = v.into_iter().unzip();
+    (Desk::new(rects), dpis)
 }
 
 /// 进程优先级提到“高于正常”。计划任务启动的进程默认是“低于正常”，对方电脑一忙，
@@ -100,5 +113,13 @@ mod tests {
         let name = wide(&format!("Local\\kmlink-test-{}", std::process::id()));
         assert!(!already_running(PCWSTR(name.as_ptr()), false));
         assert!(already_running(PCWSTR(name.as_ptr()), false));
+    }
+
+    #[test]
+    fn monitors_with_dpi() {
+        let (d, dpis) = monitors_dpi();
+        assert_eq!(d, monitors());
+        assert_eq!(dpis.len(), d.monitors.len());
+        assert!(dpis.iter().all(|&x| x > 0));
     }
 }

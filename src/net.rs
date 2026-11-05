@@ -13,7 +13,7 @@
 //!
 //! 握手见 crypto.rs（KML2：预共享密钥 + X25519 临时密钥，前向保密）。握手 + 第一帧有 2 秒绝对期限，第一帧（认证前）≤ 64 KiB。
 //! 认证前的入站连接：每个源 IP 同时至多 2 个，总共至多 8 个（cfg.peer 的 IP 和上次连上的 IP 总数满了也放进来）。
-//! 握手后客户端先发 Hello（sys::monitors()、cfg.name、udp_port、id = proto::instance_id()）+ Layout；
+//! 握手后客户端先发 Hello（sys::monitors_dpi()、cfg.name、udp_port、id = proto::instance_id()）+ Layout；
 //! 服务端验证这第一帧（= 对方有密钥）之后才发自己的 Hello + Layout —— 认证前服务端只发随机数和临时公钥。
 //! 收到旧版魔数 KML1：报“对方版本太旧，请两台都更新”。
 //! 连到自己：dialer 记住最近 10 秒发出的 nonce_c，listener 收到相同的 nonce_c 立即拒绝（认证前就识别，也挡住反射）；
@@ -27,7 +27,7 @@
 //! “密钥不一致”“版本太旧”这类认证前的错误：只有当前没有会话、且来自 cfg.peer / 上次连上的 IP（或没填 cfg.peer）时才显示在状态里。
 //!
 //! 收到的消息：
-//!   Hello → 清洗显示器（proto::sanitize_monitors，清洗后为空 = 没有显示器）；config::save_peer_desk；
+//!   Hello → 清洗显示器和 DPI（proto::sanitize_desk，清洗后为空 = 没有显示器）；config::save_peer_desk（带 dpis）；
 //!     hub.to_input(PeerUp{name, desk})；hub.set_status(connected=true, peer_name, peer_addr)
 //!   Layout{rev 比本机新} → 镜像后只改 hub.cfg 的排布，config::update 只写排布字段，再 hub.to_input(Config(..))
 //!     rev 相同但排布不一致：instance id 较小的一方采用对方的（确定性，不回发）。rev 超前本机时间 1 天以上、数值离谱的不要。
@@ -42,6 +42,7 @@
 //!     解压出错、超长、分片错位、头不对、对方作废（FRAME_ABORT）、30 秒没进展：立刻释放。
 //!     Out::CancelClip 时丢掉正在接收的（之后这个 id 的分片都忽略）；新的 ClipStart 顶掉旧的。
 //!   Ping → 经可靠队列回 Pong
+//!   Rename{name} → hub.to_desktop(Rename)（desktop 清理名字后写进 config.toml）
 //! 会话结束：injector.end_session；hub.to_input(PeerDown)；hub.set_status(connected=false)。
 //! UDP：对方地址 = TCP 对端 IP + Hello 里的 udp_port；之后以最近一个认证通过的 UDP 包源地址为准。每秒发 UdpMsg::Hi。
 //!   收包先过滤再解密：长度不在 25..=64、源 IP 不是当前会话 TCP 对端的 IP，直接丢。没有会话时丢弃所有 UDP。
@@ -781,7 +782,7 @@ struct RxState {
     /// 已处理到的 Net::clip_gen。
     clip_seen: u64,
     /// 等着写盘的 peer.json / 排布，及上次写的时间（每秒至多一次）。
-    desk: Option<(String, Desk)>,
+    desk: Option<(String, Desk, Vec<u32>)>,
     desk_at: Option<Instant>,
     layout: Option<(Layout, u64)>,
     layout_at: Option<Instant>,
@@ -863,7 +864,8 @@ impl Net {
 
     fn hello(&self, cfg: &Config) -> Msg {
         let udp_port = self.udp.get().and_then(|u| u.local_addr().ok()).map(|a| a.port()).unwrap_or(cfg.port);
-        Msg::Hello { ver: PROTO_VERSION, name: cfg.name.clone(), monitors: crate::sys::monitors().monitors, udp_port, id: self.opts.id }
+        let (desk, dpis) = crate::sys::monitors_dpi();
+        Msg::Hello { ver: PROTO_VERSION, name: cfg.name.clone(), monitors: desk.monitors, udp_port, id: self.opts.id, dpis }
     }
 
     fn send_hello<W: Write>(&self, w: &mut W, tx: &mut Sealer, cfg: &Config) -> io::Result<()> {
@@ -1110,19 +1112,19 @@ impl Net {
     /// 处理一条消息。只在 reader 线程调用：绝不直接写 socket（回复走可靠队列 → net-tcp）。
     fn handle(&self, sess: &Session, m: Msg, st: &mut RxState) {
         match m {
-            Msg::Hello { ver, name, monitors, udp_port, .. } => {
+            Msg::Hello { ver, name, monitors, udp_port, dpis, .. } => {
                 if ver != PROTO_VERSION {
                     crate::log!("对方协议版本 {ver} 与本机 {PROTO_VERSION} 不同");
                 }
                 let name = proto::sanitize_name(name);
                 let n_in = monitors.len();
-                let monitors = proto::sanitize_monitors(monitors);
+                let (monitors, dpis) = proto::sanitize_desk(monitors, dpis);
                 if monitors.len() != n_in {
                     crate::log!("对方报来 {n_in} 块显示器，有效的 {} 块", monitors.len());
                 }
                 let desk = Desk::new(monitors);
                 if self.opts.persist {
-                    st.desk = Some((name.clone(), desk.clone()));
+                    st.desk = Some((name.clone(), desk.clone(), dpis));
                 }
                 {
                     let mut u = lock(&sess.udp_peer);
@@ -1189,6 +1191,7 @@ impl Net {
                 }
             },
             Msg::Ping { t } => self.enqueue(Out::Msg(Msg::Pong { t })),
+            Msg::Rename { name } => self.hub.to_desktop(ToDesktop::Rename(name)),
             Msg::Pong { .. } => {}
         }
     }
@@ -1221,8 +1224,8 @@ impl Net {
         let now = Instant::now();
         let due = |at: Option<Instant>| force || at.is_none_or(|t| now.saturating_duration_since(t) >= PERSIST_EVERY);
         if st.desk.is_some() && due(st.desk_at) {
-            if let Some((name, desk)) = st.desk.take() {
-                config::save_peer_desk(&name, &desk);
+            if let Some((name, desk, dpis)) = st.desk.take() {
+                config::save_peer_desk(&name, &desk, &dpis);
                 st.desk_at = Some(now);
             }
         }

@@ -26,12 +26,18 @@
 //!      “开机自启”（勾选项，写/删 HKCU\Software\Microsoft\Windows\CurrentVersion\Run 的 "kmlink" 值，并存 cfg.autostart）、
 //!      “打开配置文件夹”（ShellExecuteW explorer config::dir()）、“退出”（hub.to_input(Quit)，然后结束本线程）。
 //!    菜单事件用 tray_icon::menu::MenuEvent::set_event_handler 转成本线程消息处理。
-//! 3. 显示器变化：WM_DISPLAYCHANGE（和 WM_SETTINGCHANGE 的 SPI_SETWORKAREA）→ 500ms 防抖后 sys::monitors()，
-//!    hub.to_input(LocalDesk) 并 hub.send(Msg::Hello{..}) 让对方更新。
+//! 3. 显示器变化：WM_DISPLAYCHANGE（和 WM_SETTINGCHANGE 的 SPI_SETWORKAREA）→ 500ms 防抖后 sys::monitors_dpi()，
+//!    显示器变了 hub.to_input(LocalDesk)；显示器或 DPI 变了 hub.send(Msg::Hello{..}) 让对方更新。
 //! 4. 配置文件变化：每 1 秒看 config.toml 的修改时间；变了且连续两次看到同一个值（防读到写了一半的文件）才 Config::load()；
 //!    成功才记下这个修改时间（失败下一秒重试），写回 hub.cfg，hub.to_input(Config(..))；
-//!    若 layout.rev 变了 → hub.send(Msg::Layout{.., rev})。这里从不写配置（托盘“开机自启”除外）。
-//! 5. ToDesktop::HideCursor / ShowCursor → cursor::hide / show。Status → 刷新托盘提示与图标。Quit → 退出循环。
+//!    若 layout.rev 变了 → hub.send(Msg::Layout{.., rev})；名字/端口变了 → 重发 Hello。
+//!    这里从不写配置（托盘“开机自启”、对方给本机改名除外）。
+//!    同一个定时器里看 rename_peer.json（设置窗口要给对方改名）：读了就删，连着且没过期 → hub.send(Msg::Rename)。
+//! 5. ToDesktop::HideCursor / ShowCursor → cursor::hide / show。Quit → 退出循环。
+//!    Status → 刷新托盘提示与图标；连接状态（连着、对方名字/地址、暂停）变了就重写 status.json（启动时也写一次，
+//!    退出时主线程写 connected = false，见 `save_exit_status`）。
+//!    Rename（对方给本机改名）→ config::clean_name 后 config::update 只写 name，不改内存里的 hub.cfg：
+//!    让上面的重新加载照常发现名字变了、重发 Hello，对方随之更新。
 //! 6. 睡眠/注销：WM_POWERBROADCAST(PBT_APMSUSPEND)、WM_QUERYENDSESSION → hub.to_input(GoHome)；
 //!    WM_ENDSESSION（真要结束）→ 发 Quit 让主线程走正常退出（release_all、恢复光标、写完日志），在窗口过程里等它。
 //!
@@ -43,7 +49,7 @@
 //! 发一张图片时的峰值 ≈ 读出的一份原始数据 + 压缩器（约 0.3 MiB）+ 未发出的压缩数据（≤ 1 MiB）。
 
 use crate::clip::{hash_image, hash_text};
-use crate::config::Config;
+use crate::config::{Config, StatusFile};
 use crate::geom::Desk;
 use crate::hub::{self, Hub, Out, Status, StreamTx, ToDesktop, ToInput, WM_APP_WAKE};
 use crate::proto::{self, Msg, PROTO_VERSION};
@@ -650,6 +656,10 @@ struct State {
     cfg_seen: Option<SystemTime>,
     cfg_bad: Option<SystemTime>,
     desk: Desk,
+    /// 本机各显示器的有效 DPI（和 desk.monitors 一一对应），随 Hello 发给对方。
+    dpis: Vec<u32>,
+    /// 上次写进 status.json 的内容（t = 0；变了才写）。
+    status_file: Option<StatusFile>,
     /// 托盘上次显示的内容（变了才刷新）。
     shown: Option<(bool, String)>,
     connected: bool,
@@ -727,6 +737,7 @@ impl State {
 
     fn refresh_tray(&mut self) {
         let st = self.hub.status();
+        self.write_status(&st);
         if st.connected != self.connected {
             self.connected = st.connected;
             // 连接变化：对方剪贴板可能已变，不再认为两边一致
@@ -758,6 +769,43 @@ impl State {
         }
     }
 
+    /// 连接状态变了才重写 status.json（设置窗口读）。
+    fn write_status(&mut self, st: &Status) {
+        let f = status_file(st, 0);
+        if self.status_file.as_ref() == Some(&f) {
+            return;
+        }
+        if let Err(e) = config::save_status(&status_file(st, config::now_ms())) {
+            log!("写 status.json 失败：{e}");
+        }
+        self.status_file = Some(f);
+    }
+
+    /// 对方给本机改名：只写配置文件里的 name，由重新加载去更新 hub.cfg 并重发 Hello。
+    fn renamed_by_peer(&self, name: &str) {
+        let Some(name) = config::clean_name(name) else {
+            log!("对方发来的新名字无效，忽略");
+            return;
+        };
+        log!("对方把本机改名为 {name}");
+        if let Err(e) = config::update(&self.hub.cfg(), |c| c.name = name) {
+            log!("保存配置失败：{e}");
+        }
+    }
+
+    /// 设置窗口要给对方改名（rename_peer.json）：连着且没过期才发。
+    fn check_rename_peer(&self) {
+        let Some(r) = config::take_rename_peer(config::now_ms()) else { return };
+        match r {
+            Some(name) if self.hub.status().connected => {
+                log!("把对方改名为 {name}");
+                self.hub.send(Msg::Rename { name });
+            }
+            Some(name) => log!("没连上对方，不改名（{name}）"),
+            None => log!("rename_peer.json 无效或已过期，忽略"),
+        }
+    }
+
     /// 处理一条 ToDesktop；返回 false 表示退出。
     fn handle(&mut self, m: ToDesktop) -> bool {
         match m {
@@ -773,6 +821,7 @@ impl State {
                 }
             }
             ToDesktop::Note(n) => self.note(&n),
+            ToDesktop::Rename(name) => self.renamed_by_peer(&name),
             ToDesktop::Quit => return false,
         }
         true
@@ -926,6 +975,7 @@ impl State {
             }
             TIMER_CONFIG => {
                 self.check_config();
+                self.check_rename_peer();
                 // 兜底：万一叫醒消息丢了
                 self.pump();
             }
@@ -1030,15 +1080,20 @@ impl State {
     }
 
     fn display_changed(&mut self) {
-        let d = sys::monitors();
-        if d.is_empty() || d == self.desk {
+        let (d, dpis) = sys::monitors_dpi();
+        if d.is_empty() || (d == self.desk && dpis == self.dpis) {
             return;
         }
-        log!("显示器变化：{:?}", d.monitors);
-        self.desk = d.clone();
-        self.hub.to_input(ToInput::LocalDesk(d.clone()));
+        if d != self.desk {
+            log!("显示器变化：{:?}", d.monitors);
+            self.desk = d.clone();
+            self.hub.to_input(ToInput::LocalDesk(d.clone()));
+        } else {
+            log!("显示器缩放变化：{dpis:?}");
+        }
+        self.dpis = dpis.clone();
         let c = self.hub.cfg();
-        self.hub.send(Msg::Hello { ver: PROTO_VERSION, name: c.name, monitors: d.monitors, udp_port: c.port, id: crate::proto::instance_id() });
+        self.hub.send(hello(&c, d, dpis));
     }
 
     fn check_config(&mut self) {
@@ -1069,13 +1124,36 @@ impl State {
             self.hub.send(Msg::Layout { side: l.side, offset: l.offset, scale: l.scale, rev: c.layout.rev });
         }
         if c.name != old.name || c.port != old.port {
-            let d = self.desk.clone();
-            self.hub.send(Msg::Hello { ver: PROTO_VERSION, name: c.name.clone(), monitors: d.monitors, udp_port: c.port, id: crate::proto::instance_id() });
+            self.hub.send(hello(&c, self.desk.clone(), self.dpis.clone()));
         }
         if c.autostart != old.autostart {
             autostart_set(c.autostart);
             self.items.autostart.set_checked(autostart_get().is_some());
         }
+    }
+}
+
+fn hello(c: &Config, d: Desk, dpis: Vec<u32>) -> Msg {
+    Msg::Hello { ver: PROTO_VERSION, name: c.name.clone(), monitors: d.monitors, udp_port: c.port, id: crate::proto::instance_id(), dpis }
+}
+
+/// status.json 的内容（t = 写入时间）。
+fn status_file(st: &Status, t: u64) -> StatusFile {
+    StatusFile {
+        pid: std::process::id(),
+        connected: st.connected,
+        peer_name: st.peer_name.clone(),
+        peer_addr: st.peer_addr.clone(),
+        paused: st.paused,
+        t,
+    }
+}
+
+/// 正常退出时（主线程）：status.json 写成没连着。
+pub fn save_exit_status(hub: &Hub) {
+    let st = Status { connected: false, ..hub.status() };
+    if let Err(e) = config::save_status(&status_file(&st, config::now_ms())) {
+        log!("写 status.json 失败：{e}");
     }
 }
 
@@ -1270,6 +1348,7 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
     };
     let tray = build_tray(&items, &st);
 
+    let (desk, dpis) = sys::monitors_dpi();
     let state = State {
         hub: hub.clone(),
         hwnd,
@@ -1285,7 +1364,9 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
         cfg_mtime: cfg_mtime(&hub.cfg_path),
         cfg_seen: None,
         cfg_bad: None,
-        desk: sys::monitors(),
+        desk,
+        dpis,
+        status_file: None,
         shown: Some((st.connected, tip_text(&st))),
         connected: st.connected,
     };
@@ -1296,7 +1377,7 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
     }
     hub.set_desktop_tid(tid);
     hub.set_desktop_hwnd(hwnd.0 as isize);
-    // 登记前可能已有 Status 等消息：先刷新一次
+    // 登记前可能已有 Status 等消息：先刷新一次（也写启动时的 status.json）
     let _ = with_state(|s| s.refresh_tray());
 
     if first_run {
@@ -1341,6 +1422,16 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
 mod tests {
     use super::*;
     use crate::clip::tests::make_dib;
+
+    #[test]
+    fn status_file_fields() {
+        let st = Status { connected: true, peer_name: "客厅".into(), peer_addr: "10.0.0.2:47900".into(), paused: true, driving: true, ..Default::default() };
+        let f = status_file(&st, 9);
+        assert_eq!((f.pid, f.connected, f.paused, f.t), (std::process::id(), true, true, 9));
+        assert_eq!((f.peer_name.as_str(), f.peer_addr.as_str()), ("客厅", "10.0.0.2:47900"));
+        // 只是驱动状态变了：内容不变，不重写
+        assert_eq!(status_file(&Status { driving: false, ..st.clone() }, 0), status_file(&st, 0));
+    }
 
     #[test]
     fn aborted_send_is_not_synced() {

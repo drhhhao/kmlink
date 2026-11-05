@@ -96,6 +96,7 @@ fn daemon(with_console: bool) {
 
     injector.release_all();
     cursor::show();
+    desktop::save_exit_status(&hub);
     log!("退出");
     log::flush(500);
     std::process::exit(0);

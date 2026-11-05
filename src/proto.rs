@@ -55,6 +55,7 @@ pub enum Button {
 pub enum Msg {
     /// 连接建立后双方各发一次；显示器变化时重发。
     /// id：本进程启动时随机生成（`instance_id()`），用来发现“连到了自己”。
+    /// dpis：每块显示器的有效 DPI（96 = 100%，和 monitors 一一对应）；旧版本不带（空 = 不知道）。
     Hello {
         ver: u32,
         name: String,
@@ -62,6 +63,8 @@ pub enum Msg {
         udp_port: u16,
         #[serde(default)]
         id: u64,
+        #[serde(default)]
+        dpis: Vec<u32>,
     },
     /// 排布（从发送方的角度）。接收方若 rev 更新，则镜像后保存。
     Layout { side: Side, offset: i32, scale: f64, rev: u64 },
@@ -95,6 +98,9 @@ pub enum Msg {
     ClipNote { kind: u8, detail: String },
     Ping { t: u64 },
     Pong { t: u64 },
+    /// 设置窗口里给对方改名：接收方把它写进自己 config.toml 的 name（重新加载后重发 Hello）。
+    /// 旧版本收到会当成无法解析的帧忽略。
+    Rename { name: String },
 }
 
 /// UDP 明文。
@@ -299,15 +305,36 @@ impl Inflater {
     }
 }
 
-/// 清洗对方 Hello 里的显示器：坐标限制在 ±MAX_COORD 内，丢掉空/反向矩形，最多 MAX_MONITORS 块。
-/// （下游 geom 里有 clamp(min, max)，min > max 会 panic；release 是 panic=abort。）结果可能为空 = 当没有显示器。
-pub fn sanitize_monitors(v: Vec<Rect>) -> Vec<Rect> {
+/// 对方显示器的 DPI 范围（50% ~ 1000%）。
+pub const MIN_DPI: u32 = 48;
+pub const MAX_DPI: u32 = 960;
+
+/// 清洗对方 Hello 里的显示器和对应的 DPI：
+/// - 显示器：坐标限制在 ±MAX_COORD 内，丢掉空/反向矩形，最多 MAX_MONITORS 块。
+///   （下游 geom 里有 clamp(min, max)，min > max 会 panic；release 是 panic=abort。）结果可能为空 = 当没有显示器。
+/// - DPI：跟着各自的显示器留或丢（保持一一对应），限制在 MIN_DPI..=MAX_DPI；
+///   比显示器少（旧版本 / 不完整）= 后面那些不知道，多出来的丢掉。
+pub fn sanitize_desk(monitors: Vec<Rect>, dpis: Vec<u32>) -> (Vec<Rect>, Vec<u32>) {
     let c = |x: i32| x.clamp(-MAX_COORD, MAX_COORD);
-    v.into_iter()
-        .map(|r| Rect::new(c(r.l), c(r.t), c(r.r), c(r.b)))
-        .filter(|r| r.r > r.l && r.b > r.t)
-        .take(MAX_MONITORS)
-        .collect()
+    let mut ms = Vec::new();
+    let mut ds = Vec::new();
+    for (i, r) in monitors.into_iter().enumerate() {
+        let r = Rect::new(c(r.l), c(r.t), c(r.r), c(r.b));
+        if r.r <= r.l || r.b <= r.t {
+            continue;
+        }
+        if ms.len() == MAX_MONITORS {
+            break;
+        }
+        ms.push(r);
+        // 前面有显示器缺 DPI 时后面的也不要（只允许“截短”，不能错位）
+        if let Some(&d) = dpis.get(i)
+            && ds.len() + 1 == ms.len()
+        {
+            ds.push(d.clamp(MIN_DPI, MAX_DPI));
+        }
+    }
+    (ms, ds)
 }
 
 /// 名字截到 MAX_NAME 个字符（按字符截，不会切坏 UTF-8）。
@@ -476,12 +503,71 @@ pub(crate) mod tests {
             Rect::new(-big, -big, big, big), // 超大：限制到 ±2^20
             Rect::new(big - 5, 0, big, 100), // 整块在范围外：限制后宽 0，丢掉
         ];
-        let s = sanitize_monitors(v);
+        let s = sanitize_desk(v, vec![]).0;
         assert_eq!(s, vec![Rect::new(0, 0, 1920, 1080), Rect::new(-MAX_COORD, -MAX_COORD, MAX_COORD, MAX_COORD)]);
         let many: Vec<Rect> = (0..100).map(|i| Rect::new(i, 0, i + 1, 1)).collect();
-        assert_eq!(sanitize_monitors(many).len(), MAX_MONITORS);
-        assert!(sanitize_monitors(vec![Rect::new(5, 5, 1, 1)]).is_empty());
+        assert_eq!(sanitize_desk(many, vec![]).0.len(), MAX_MONITORS);
+        assert!(sanitize_desk(vec![Rect::new(5, 5, 1, 1)], vec![96]).0.is_empty());
         assert_eq!(sanitize_name("中".repeat(100)).chars().count(), MAX_NAME);
         assert_eq!(sanitize_name("PC".into()), "PC");
+    }
+
+    #[test]
+    fn hello_dpis_sanitized() {
+        let r = |l: i32| Rect::new(l, 0, l + 100, 100);
+        // 一一对应，限制范围
+        assert_eq!(sanitize_desk(vec![r(0), r(100)], vec![0, 5000]), (vec![r(0), r(100)], vec![MIN_DPI, MAX_DPI]));
+        // 旧版本：没有 DPI
+        assert_eq!(sanitize_desk(vec![r(0), r(100)], vec![]).1, Vec::<u32>::new());
+        // 比显示器少：截短；比显示器多：丢掉多余的
+        assert_eq!(sanitize_desk(vec![r(0), r(100)], vec![144]).1, vec![144]);
+        assert_eq!(sanitize_desk(vec![r(0)], vec![120, 144, 192]).1, vec![120]);
+        // 中间一块无效：它的 DPI 跟着丢，后面的不错位
+        let bad = Rect::new(5, 5, 1, 1);
+        assert_eq!(sanitize_desk(vec![r(0), bad, r(100)], vec![96, 120, 144]), (vec![r(0), r(100)], vec![96, 144]));
+        // 无效那块后面缺 DPI：留下的显示器只有第一块知道 DPI
+        assert_eq!(sanitize_desk(vec![bad, r(0), r(100)], vec![96, 120]), (vec![r(0), r(100)], vec![120]));
+        // 显示器上限
+        let many: Vec<Rect> = (0..100).map(r).collect();
+        let (m, d) = sanitize_desk(many, vec![96; 100]);
+        assert_eq!((m.len(), d.len()), (MAX_MONITORS, MAX_MONITORS));
+    }
+
+    #[test]
+    fn hello_and_rename_roundtrip() {
+        let rt = |m: &Msg| match decode_frame(&encode_msg(m)) {
+            Some(Frame::Msg(d)) => d,
+            _ => panic!(),
+        };
+        let h = Msg::Hello {
+            ver: PROTO_VERSION,
+            name: "书房".into(),
+            monitors: vec![Rect::new(0, 0, 3840, 2160)],
+            udp_port: 47900,
+            id: 5,
+            dpis: vec![144],
+        };
+        assert_eq!(rt(&h), h);
+        // 旧版本的 Hello（没有 dpis）照样能解，dpis 为空
+        let old = br#"{"type":"Hello","ver":2,"name":"A","monitors":[{"l":0,"t":0,"r":10,"b":10}],"udp_port":1,"id":3}"#;
+        let mut f = vec![FRAME_MSG];
+        f.extend_from_slice(old);
+        match decode_frame(&f) {
+            Some(Frame::Msg(Msg::Hello { dpis, monitors, .. })) => assert!(dpis.is_empty() && monitors.len() == 1),
+            _ => panic!(),
+        }
+        // 旧版本按自己的定义解新 Hello：多出的 dpis 字段被忽略（serde 默认不拒未知字段）
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        #[serde(tag = "type")]
+        enum OldMsg {
+            Hello { ver: u32, name: String, monitors: Vec<Rect>, udp_port: u16, #[serde(default)] id: u64 },
+        }
+        let s = serde_json::to_string(&h).unwrap();
+        assert!(matches!(serde_json::from_str::<OldMsg>(&s), Ok(OldMsg::Hello { id: 5, .. })));
+        // 旧版本不认识 Rename：解析失败（net 记一行日志后忽略）
+        let rn = Msg::Rename { name: "客厅".into() };
+        assert_eq!(rt(&rn), rn);
+        assert!(serde_json::from_str::<OldMsg>(&serde_json::to_string(&rn).unwrap()).is_err());
     }
 }
