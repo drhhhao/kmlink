@@ -3,11 +3,14 @@
 //! 握手（明文）：客户端发 MAGIC + 32 字节随机 nonce_c + 32 字节 X25519 临时公钥；
 //! 服务端回 MAGIC + 32 字节随机 nonce_s + 32 字节 X25519 临时公钥。
 //! 会话密钥 = HKDF-SHA256(ikm = psk ‖ DH 共享密钥, salt = nonce_c ‖ nonce_s)，info 分别为
-//!   "kmlink c2s" / "kmlink s2c" / "kmlink udp c2s" / "kmlink udp s2c"，各 32 字节。
+//!   "kmlink c2s" / "kmlink s2c" / "kmlink udp c2s" / "kmlink udp s2c" / "kmlink audio c2s" / "kmlink audio s2c"，
+//!   各 32 字节。
 //! 临时私钥用完即清零：日后密钥泄露也解不开录下来的旧会话（前向保密）。
 //! 之后每个方向一个 ChaCha20-Poly1305：
 //!   TCP：nonce = 4 字节 0 ‖ u64 LE 计数器（从 0 开始，每帧 +1，接收方要求严格递增 —— 防重放/乱序）。
 //!   UDP：包 = u64 LE 计数器 ‖ 密文；nonce = 4 字节 0 ‖ 计数器；接收方只接受比见过的最大值更大的计数器。
+//!   声音：和鼠标同一个 UDP 端口，但密钥另算，计数器从 2^63 开始（最高位 = 1，收包时据此分流）；
+//!   接收方用 64 包滑动窗口：允许乱序，同一计数器只收一次（防重放）。
 //! 第一帧（Hello）能解开即证明对方有同一个密钥。计数器用 checked_add，溢出就失败（会话断开），绝不复用 nonce。
 
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -20,6 +23,8 @@ pub struct SessionKeys {
     pub s2c: [u8; 32],
     pub udp_c2s: [u8; 32],
     pub udp_s2c: [u8; 32],
+    pub audio_c2s: [u8; 32],
+    pub audio_s2c: [u8; 32],
 }
 
 pub fn derive(psk: &[u8; 32], dh: &[u8; 32], nonce_c: &[u8; 32], nonce_s: &[u8; 32]) -> SessionKeys {
@@ -42,6 +47,8 @@ pub fn derive(psk: &[u8; 32], dh: &[u8; 32], nonce_c: &[u8; 32], nonce_s: &[u8; 
         s2c: k(b"kmlink s2c"),
         udp_c2s: k(b"kmlink udp c2s"),
         udp_s2c: k(b"kmlink udp s2c"),
+        audio_c2s: k(b"kmlink audio c2s"),
+        audio_s2c: k(b"kmlink audio s2c"),
     }
 }
 
@@ -169,6 +176,79 @@ impl UdpOpener {
     }
 }
 
+/// 声音包计数器的起点：最高位为 1，和鼠标包（从 0 开始）一眼分开。
+pub const AUDIO_COUNTER0: u64 = 1 << 63;
+
+/// 是不是声音包（看计数器最高位，不用解密）。
+pub fn is_audio(packet: &[u8]) -> bool {
+    packet.len() >= 8 && packet[7] & 0x80 != 0
+}
+
+/// 声音发送：包 = 计数器 ‖ 密文，计数器从 2^63 开始。
+pub struct AudioSealer {
+    aead: ChaCha20Poly1305,
+    counter: u64,
+}
+impl AudioSealer {
+    pub fn new(key: &[u8; 32]) -> Self {
+        Self { aead: cipher(key), counter: AUDIO_COUNTER0 }
+    }
+    /// 计数器用尽返回 None（不发）。
+    pub fn seal(&mut self, plaintext: &[u8]) -> Option<Vec<u8>> {
+        let c = self.counter;
+        self.counter = c.checked_add(1)?;
+        let ct = self.aead.encrypt(&nonce(c), plaintext).ok()?;
+        let mut p = Vec::with_capacity(8 + ct.len());
+        p.extend_from_slice(&c.to_le_bytes());
+        p.extend_from_slice(&ct);
+        Some(p)
+    }
+}
+
+/// 声音接收：64 包滑动窗口。比窗口还旧的、收过的都丢；解密成功才记账。
+pub struct AudioOpener {
+    aead: ChaCha20Poly1305,
+    max_seen: Option<u64>,
+    /// 第 i 位 = 计数器 max_seen - i 收过了
+    seen: u64,
+}
+impl AudioOpener {
+    pub fn new(key: &[u8; 32]) -> Self {
+        Self { aead: cipher(key), max_seen: None, seen: 0 }
+    }
+    pub fn open(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
+        if packet.len() < 8 + 16 {
+            return None;
+        }
+        let c = u64::from_le_bytes(packet[..8].try_into().ok()?);
+        if c < AUDIO_COUNTER0 {
+            return None;
+        }
+        if let Some(m) = self.max_seen {
+            if c <= m {
+                let back = m - c;
+                if back >= 64 || self.seen >> back & 1 != 0 {
+                    return None;
+                }
+            }
+        }
+        let p = self.aead.decrypt(&nonce(c), &packet[8..]).ok()?;
+        match self.max_seen {
+            Some(m) if c <= m => self.seen |= 1 << (m - c),
+            Some(m) => {
+                let ahead = c - m;
+                self.seen = if ahead >= 64 { 1 } else { self.seen << ahead | 1 };
+                self.max_seen = Some(c);
+            }
+            None => {
+                self.seen = 1;
+                self.max_seen = Some(c);
+            }
+        }
+        Some(p)
+    }
+}
+
 pub fn random32() -> [u8; 32] {
     let mut b = [0u8; 32];
     getrandom::fill(&mut b).expect("getrandom");
@@ -186,9 +266,9 @@ mod tests {
     #[test]
     fn derive_distinct_and_deterministic() {
         let k = keys();
-        let all = [k.c2s, k.s2c, k.udp_c2s, k.udp_s2c];
-        for i in 0..4 {
-            for j in i + 1..4 {
+        let all = [k.c2s, k.s2c, k.udp_c2s, k.udp_s2c, k.audio_c2s, k.audio_s2c];
+        for i in 0..all.len() {
+            for j in i + 1..all.len() {
                 assert_ne!(all[i], all[j]);
             }
         }
@@ -319,5 +399,45 @@ mod tests {
         p[last] ^= 1;
         assert_eq!(o.open(&p).unwrap(), b"move");
         assert!(o.open(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn audio_window_reorder_and_replay() {
+        let k = keys();
+        let mut tx = AudioSealer::new(&k.audio_c2s);
+        let mut rx = AudioOpener::new(&k.audio_c2s);
+        let p: Vec<Vec<u8>> = (0..100u8).map(|i| tx.seal(&[i]).unwrap()).collect();
+        assert!(p.iter().all(|x| is_audio(x)));
+        assert_eq!(rx.open(&p[5]).unwrap(), [5]);
+        assert_eq!(rx.open(&p[3]).unwrap(), [3]); // 乱序：晚到的旧包也收
+        assert!(rx.open(&p[3]).is_none()); // 重放
+        assert!(rx.open(&p[5]).is_none());
+        assert_eq!(rx.open(&p[90]).unwrap(), [90]);
+        assert!(rx.open(&p[20]).is_none()); // 落出窗口（90-20 >= 64）
+        assert_eq!(rx.open(&p[40]).unwrap(), [40]);
+        assert!(rx.open(&p[40]).is_none());
+        assert_eq!(rx.open(&p[91]).unwrap(), [91]);
+        assert!(rx.open(&p[90]).is_none());
+        // 篡改的包不记账：原包随后还能收
+        let mut bad = p[95].clone();
+        bad[10] ^= 1;
+        assert!(rx.open(&bad).is_none());
+        assert_eq!(rx.open(&p[95]).unwrap(), [95]);
+    }
+
+    #[test]
+    fn audio_and_mouse_packets_dont_mix() {
+        let k = keys();
+        let mut m = UdpSealer::new(&k.udp_c2s);
+        let mut a = AudioSealer::new(&k.audio_c2s);
+        let mp = m.seal(b"move").unwrap();
+        let ap = a.seal(b"pcm").unwrap();
+        assert!(!is_audio(&mp));
+        assert!(is_audio(&ap));
+        // 声音包打不开鼠标通道（老版本收到也只是丢掉），反之亦然
+        assert!(UdpOpener::new(&k.udp_c2s).open(&ap).is_none());
+        assert!(AudioOpener::new(&k.audio_c2s).open(&mp).is_none());
+        let mut rx = UdpOpener::new(&k.udp_c2s);
+        assert_eq!(rx.open(&mp).unwrap(), b"move");
     }
 }

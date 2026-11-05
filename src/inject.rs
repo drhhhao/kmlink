@@ -22,6 +22,12 @@
 //! - SendInput 返回 0 / 少于请求数（锁屏/UAC 安全桌面、前台是管理员窗口被 UIPI 拦截）不要重试循环，直接放弃这一次，
 //!   并回 Msg::Yield{epoch} 让对方回去（最多每 FAIL_YIELD_MS 一次），免得两边光标脱节；
 //!   抬起没注入成功的键/按钮留在记录里，下次 enter/leave/release_all 再抬。
+//! - 键盘跟随（只收键盘）：kbd_enter 后接受这一轮（kbd epoch）的 Key，不移动光标、不进入被控状态（本机鼠标照常用、
+//!   照常能跨屏）。kbd_leave / enter / 会话变化 / release_all 结束它并抬起按着的键。开始/结束都在持锁时通知
+//!   input 线程 ToInput::KbdIn（set_kbd 统一出口，不会漏）。当前轮次记在 KBD_EPOCH（`kbd_epoch()`）。
+//!   本机暂停时 kbd_enter 直接回 Yield{epoch}。新的一轮一开始就弹“键盘”提示（ToDesktop::KbdNote），
+//!   不等打字；从驱动直接转过来的（prev 接上）键盘本来就在这台，不弹。
+//!   对方跨屏过来（enter_from 新的一轮）也弹；从只收键盘转过来的（prev 接上）不弹。
 
 use crate::hub::{Hub, ToInput};
 use crate::proto::{Button, INJECT_MARK, Msg};
@@ -56,6 +62,14 @@ const MENU_VKS: [u16; 5] = [0x12, 0xA4, 0xA5, 0x5B, 0x5C];
 /// 未分配的虚拟键，用来打断 Alt/Win 单按（同 AutoHotkey 的 vkE8）。
 const VK_MASK: u16 = 0xE8;
 
+/// 本机正在接收对方键盘的轮次（只收键盘；0 = 没有）。
+static KBD_EPOCH: AtomicU32 = AtomicU32::new(0);
+
+/// 本机正在接收对方键盘的轮次（0 = 没有）：本机要请对方收回键盘时 Yield 带上它。
+pub fn kbd_epoch() -> u32 {
+    KBD_EPOCH.load(Ordering::Relaxed)
+}
+
 /// 本机当前（或最近一次）被接管的轮次。
 static DRIVEN_EPOCH: AtomicU32 = AtomicU32::new(0);
 
@@ -79,12 +93,21 @@ struct Inner {
     fail_yield: Option<u32>,
     /// 鼠标位置平滑播放
     play: Playout,
+    /// 正在只收键盘的轮次（键盘跟随）
+    kbd: Option<u32>,
+    /// 这一轮只收键盘已经弹过“键盘 已收回”
+    kbd_lost: bool,
 }
 
 impl Inner {
     /// 本条消息属于当前接管吗？
     fn current(&self, epoch: u32) -> bool {
         self.active && epoch == self.epoch
+    }
+
+    /// 这个按键属于当前接管或当前只收键盘的轮次吗？
+    fn key_ok(&self, epoch: u32) -> bool {
+        self.current(epoch) || self.kbd == Some(epoch)
     }
 
     fn session(&self, sid: u64) -> bool {
@@ -245,6 +268,25 @@ impl Injector {
         self.hub.set_status(|s| s.driven = b);
     }
 
+    /// 持锁时调用：只收键盘开始/结束（统一出口，变化时通知 input 线程，顺序与锁内变化一致）。
+    fn set_kbd(&self, g: &mut Inner, kbd: Option<u32>) {
+        let was = g.kbd.is_some();
+        g.kbd = kbd;
+        g.kbd_lost = false;
+        KBD_EPOCH.store(kbd.unwrap_or(0), Ordering::Relaxed);
+        if was != kbd.is_some() {
+            self.hub.to_input(ToInput::KbdIn(kbd.is_some()));
+        }
+    }
+
+    /// 只收键盘时对方的键盘意外断了（对方没动静、注入失败）：本机也弹“键盘 已收回”，每轮一次。
+    fn kbd_lost_note(&self, g: &mut Inner) {
+        if g.kbd.is_some() && !g.kbd_lost {
+            g.kbd_lost = true;
+            self.hub.to_desktop(crate::hub::ToDesktop::KbdNote(false));
+        }
+    }
+
     /// 本机最近 LOCAL_BUSY_MS 内有物理输入。
     fn local_busy(&self) -> bool {
         match (self.sys.last_input)() {
@@ -255,13 +297,19 @@ impl Injector {
 
     /// 注入失败（安全桌面、UIPI）：请对方回去，最多每 FAIL_YIELD_MS 一次。
     fn failed(&self, g: &mut Inner) {
+        let e = g.epoch;
+        self.failed_at(g, e);
+    }
+
+    /// 同 failed，Yield 带指定轮次（只收键盘时是键盘轮次）。
+    fn failed_at(&self, g: &mut Inner, epoch: u32) {
         let now = (self.sys.now)();
         if g.fail_yield.is_some_and(|t| now.wrapping_sub(t) < FAIL_YIELD_MS) {
             return;
         }
         g.fail_yield = Some(now);
         crate::log!("注入失败（前台是管理员窗口、锁屏或 UAC？），请对方放手");
-        self.hub.send(Msg::Yield { epoch: g.epoch });
+        self.hub.send(Msg::Yield { epoch });
     }
 
     /// 抬起所有记录中按着的键和按钮（持锁调用）。没注入成功的放回记录。
@@ -276,8 +324,21 @@ impl Injector {
         g.put_back(rk, rb);
     }
 
-    /// 对方接管：光标放到 (x, y)。本机暂停共享、或本机有人正在用时不接管，回 Yield（不移动光标）。
+    #[cfg(test)]
     pub fn enter(&self, sid: u64, epoch: u32, x: i32, y: i32) {
+        self.enter_from(sid, epoch, x, y, 0)
+    }
+
+    /// 只抬起按着的鼠标按钮（键留着）。
+    fn release_buttons(&self, g: &mut Inner) {
+        let keys = std::mem::take(&mut g.keys);
+        self.release(g);
+        g.keys = keys;
+    }
+
+    /// 对方接管：光标放到 (x, y)。本机暂停共享、或本机有人正在用时不接管，回 Yield（不移动光标）。
+    /// prev = 对方刚结束的只转发键盘轮次：本机正处在那一轮就把按着的键原样接到这一轮（不先抬起）。
+    pub fn enter_from(&self, sid: u64, epoch: u32, x: i32, y: i32, prev: u32) {
         let paused = self.hub.status().paused;
         let mut g = self.lock();
         if !g.session(sid) {
@@ -289,13 +350,26 @@ impl Injector {
                 g.active = false;
                 self.set_driven(&g, false);
             }
+            // 对方转驱动时不再发 KbdLeave：不接管也要把只收键盘那一轮结束掉（抬起按着的键）
+            if g.kbd.is_some() {
+                self.release(&mut g);
+                self.set_kbd(&mut g, None);
+            }
             crate::log!("{}，不接管，请对方回去", if paused { "本机已暂停共享" } else { "本机刚有人在用键鼠" });
             self.hub.send(Msg::Yield { epoch });
             return;
         }
+        // 从只转发键盘直接转过来：按着的键原样接到这一轮
+        let carry = prev != 0 && g.kbd == Some(prev);
+        // 新的一轮（不是重复的 Enter）
+        let fresh = !(g.active && g.epoch == epoch);
         // 上一次接管没正常结束，或上次抬起没注入成功：先把残留的按键抬起来
-        if (g.active && g.epoch != epoch) || g.holds_any() {
+        if !carry && ((g.active && g.epoch != epoch) || g.holds_any()) {
             self.release(&mut g);
+        }
+        // 对方的鼠标过来了：只收键盘那一轮结束（按着的键上面已经抬起）
+        if g.kbd.is_some() {
+            self.set_kbd(&mut g, None);
         }
         self.reset_play(&mut g);
         g.epoch = epoch;
@@ -307,6 +381,9 @@ impl Injector {
         self.set_driven(&g, true);
         if !ok {
             self.failed(&mut g);
+        } else if fresh && !carry {
+            // 对方的鼠标跨过来了，键盘跟着到了这台：马上提示。从只收键盘转过来的键盘本来就在这台，不弹
+            self.hub.to_desktop(crate::hub::ToDesktop::KbdNote(true));
         }
     }
 
@@ -375,7 +452,7 @@ impl Injector {
 
     pub fn key(&self, sid: u64, epoch: u32, scan: u16, ext: bool, vk: u16, down: bool) {
         let mut g = self.lock();
-        if !g.session(sid) || !g.current(epoch) || (scan == 0 && vk == 0) || vk > MAX_VK || scan > MAX_SCAN {
+        if !g.session(sid) || !g.key_ok(epoch) || (scan == 0 && vk == 0) || vk > MAX_VK || scan > MAX_SCAN {
             return;
         }
         let k = (scan, ext, vk);
@@ -388,8 +465,74 @@ impl Injector {
             g.track_key(k, down);
         }
         if !ok {
-            self.failed(&mut g);
+            self.failed_at(&mut g, epoch);
+            if g.kbd == Some(epoch) {
+                self.kbd_lost_note(&mut g);
+            }
         }
+    }
+
+    #[cfg(test)]
+    pub fn kbd_enter(&self, sid: u64, epoch: u32) {
+        self.kbd_enter_from(sid, epoch, 0)
+    }
+
+    /// 对方开始把它的键盘打到本机（键盘跟随）：不移动光标、不进入被控状态。本机暂停时回 Yield。
+    /// prev = 对方刚结束的驱动轮次（对方不再单发 Leave）：本机正被那一轮接管就结束被控，按着的键原样接过来。
+    pub fn kbd_enter_from(&self, sid: u64, epoch: u32, prev: u32) {
+        let paused = self.hub.status().paused;
+        let mut g = self.lock();
+        if !g.session(sid) {
+            return;
+        }
+        let carry = prev != 0 && g.active && g.epoch == prev;
+        if paused {
+            crate::log!("本机已暂停共享，不接收对方键盘");
+            // 对方转只转发键盘时不再发 Leave：被控那一轮也在这里结束
+            if g.active {
+                self.release(&mut g);
+                g.active = false;
+                self.reset_play(&mut g);
+                self.set_driven(&g, false);
+            }
+            if g.kbd.is_some() {
+                self.release(&mut g);
+                self.set_kbd(&mut g, None);
+            }
+            self.hub.send(Msg::Yield { epoch });
+            return;
+        }
+        // 对方在只转发键盘，就不再驱动本机：接管结束（从驱动直接转过来时键留着，只抬鼠标按钮）
+        if g.active {
+            if carry {
+                self.release_buttons(&mut g);
+            } else {
+                self.release(&mut g);
+            }
+            g.active = false;
+            self.reset_play(&mut g);
+            self.set_driven(&g, false);
+        }
+        if !carry && g.holds_any() {
+            self.release(&mut g);
+        }
+        g.fail_yield = None;
+        let fresh = g.kbd != Some(epoch);
+        self.set_kbd(&mut g, Some(epoch));
+        // 对方的键盘刚换到这台（用户动了这台的鼠标）：马上提示，不等打字。从驱动转过来的本来就在这台，不弹
+        if fresh && !carry {
+            self.hub.to_desktop(crate::hub::ToDesktop::KbdNote(true));
+        }
+    }
+
+    /// 对方收回键盘：抬起这一轮按着的键。
+    pub fn kbd_leave(&self, sid: u64, epoch: u32) {
+        let mut g = self.lock();
+        if !g.session(sid) || g.kbd != Some(epoch) {
+            return;
+        }
+        self.release(&mut g);
+        self.set_kbd(&mut g, None);
     }
 
     /// 对方好一阵没有任何消息（net 判断）：会话不断、接管不结束，只把按着的键和按钮抬起来。
@@ -397,6 +540,7 @@ impl Injector {
         let mut g = self.lock();
         if g.session(sid) {
             self.release(&mut g);
+            self.kbd_lost_note(&mut g);
         }
     }
 
@@ -405,6 +549,7 @@ impl Injector {
         let mut g = self.lock();
         self.release(&mut g);
         g.active = false;
+        self.set_kbd(&mut g, None);
         g.sid = sid;
         self.set_driven(&g, false);
     }
@@ -415,6 +560,7 @@ impl Injector {
         if g.session(sid) {
             self.release(&mut g);
             g.active = false;
+            self.set_kbd(&mut g, None);
             self.reset_play(&mut g);
             self.set_driven(&g, false);
         }
@@ -425,6 +571,7 @@ impl Injector {
         let mut g = self.lock();
         self.release(&mut g);
         g.active = false;
+        self.set_kbd(&mut g, None);
         self.reset_play(&mut g);
         self.set_driven(&g, false);
     }
@@ -725,6 +872,188 @@ mod tests {
         inj.stale(1);
         assert_eq!(sent(), vec![(0x1e, true)]);
         assert!(yields(&rx).is_empty());
+    }
+
+    /// 收到的 input 通知里 KbdIn / Driven 的序列。
+    fn input_events(rx: &HubRx) -> Vec<String> {
+        rx.input
+            .try_iter()
+            .filter_map(|m| match m {
+                ToInput::KbdIn(b) => Some(format!("kbd:{b}")),
+                ToInput::Driven(b) => Some(format!("driven:{b}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn kbd_notes(rx: &HubRx) -> Vec<bool> {
+        rx.desktop
+            .try_iter()
+            .filter_map(|m| match m {
+                crate::hub::ToDesktop::KbdNote(ok) => Some(ok),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn kbd_enter_accepts_keys_without_being_driven() {
+        let (inj, rx) = injector();
+        input_events(&rx);
+        // 没开始：按键不注入
+        inj.key(1, 9, 0x1e, false, 0x41, true);
+        assert!(sent().is_empty());
+        inj.kbd_enter(1, 9);
+        assert_eq!(input_events(&rx), vec!["kbd:true"]);
+        assert_eq!(inj.lock().kbd, Some(9));
+        // 一开始就弹“键盘”（不等打字）；同一轮重复的 KbdEnter 不再弹
+        assert_eq!(kbd_notes(&rx), vec![true]);
+        inj.kbd_enter(1, 9);
+        assert!(kbd_notes(&rx).is_empty());
+        // 不移动光标、不进入被控
+        assert!(sent().is_empty());
+        assert!(!inj.hub.status().driven);
+        // 这一轮的键注入；别的轮次不注入；打字时不再弹
+        inj.key(1, 9, 0x1e, false, 0x41, true);
+        inj.key(1, 8, 0x30, false, 0x42, true);
+        inj.key(1, 9, 0x1e, false, 0x41, false);
+        inj.key(1, 9, 0x1f, false, 0x53, true);
+        assert_eq!(sent(), vec![(0x1e, false), (0x1e, true), (0x1f, false)]);
+        assert!(kbd_notes(&rx).is_empty());
+        // 只收键盘时鼠标消息不理
+        inj.button(1, 9, 1, 1, Button::Left, true);
+        assert!(sent().is_empty());
+        // 旧轮次的 KbdLeave 不理；本轮的抬起按着的键
+        inj.kbd_leave(1, 8);
+        assert!(sent().is_empty());
+        inj.kbd_leave(1, 9);
+        assert_eq!(sent(), vec![(0x1f, true)]);
+        assert_eq!(input_events(&rx), vec!["kbd:false"]);
+        assert_eq!(inj.lock().kbd, None);
+        inj.key(1, 9, 0x1e, false, 0x41, true);
+        assert!(sent().is_empty());
+        assert!(yields(&rx).is_empty());
+    }
+
+    #[test]
+    fn kbd_enter_refused_when_paused_and_cleared_by_enter_and_session() {
+        let (inj, rx) = injector();
+        inj.hub.set_status(|s| s.paused = true);
+        inj.kbd_enter(1, 4);
+        assert_eq!(yields(&rx), vec![4]);
+        inj.key(1, 4, 0x1e, false, 0x41, true);
+        assert!(sent().is_empty());
+        inj.hub.set_status(|s| s.paused = false);
+
+        // 对方的鼠标跨过来（enter）：只收键盘结束，按着的键先抬起
+        inj.kbd_enter(1, 5);
+        inj.key(1, 5, 0x1e, false, 0x41, true);
+        sent();
+        input_events(&rx);
+        inj.enter(1, 6, 10, 10);
+        let s = sent();
+        assert!(s.contains(&(0x1e, true)), "{s:?}");
+        assert_eq!(input_events(&rx), vec!["kbd:false", "driven:true"]);
+        inj.key(1, 5, 0x1e, false, 0x41, true);
+        assert!(sent().is_empty());
+
+        // 只收键盘时对方发来 KbdEnter 前还在“驱动”（残留）：结束被控
+        inj.kbd_enter(1, 7);
+        assert_eq!(input_events(&rx), vec!["driven:false", "kbd:true"]);
+        // 会话结束：清掉
+        inj.key(1, 7, 0x1e, false, 0x41, true);
+        sent();
+        inj.end_session(1);
+        assert_eq!(sent(), vec![(0x1e, true)]);
+        assert_eq!(input_events(&rx), vec!["kbd:false", "driven:false"]);
+    }
+
+    #[test]
+    fn crossing_in_shows_keyboard_tip_once() {
+        let (inj, rx) = injector();
+        inj.enter(1, 5, 10, 10);
+        assert_eq!(kbd_notes(&rx), vec![true]);
+        // 同一轮重复的 Enter 不再弹；新一轮再弹
+        inj.enter(1, 5, 10, 10);
+        assert!(kbd_notes(&rx).is_empty());
+        inj.leave(1, 5);
+        inj.enter(1, 6, 10, 10);
+        assert_eq!(kbd_notes(&rx), vec![true]);
+        // 注入失败（安全桌面）：不弹
+        inj.leave(1, 6);
+        FAIL.with(|f| f.set(true));
+        inj.enter(1, 7, 10, 10);
+        FAIL.with(|f| f.set(false));
+        assert!(kbd_notes(&rx).is_empty());
+    }
+
+    #[test]
+    fn switching_rounds_keeps_held_keys() {
+        // 驱动 → 只转发键盘（KbdEnter.prev = 驱动轮次）：键留着，鼠标按钮抬起，被控结束
+        let (inj, rx) = injector();
+        inj.enter(1, 5, 10, 10);
+        inj.key(1, 5, 0x2a, false, 0xA0, true); // LShift
+        inj.button(1, 5, 10, 10, Button::Left, true);
+        sent();
+        input_events(&rx);
+        // 对方跨屏过来：马上弹“键盘”
+        assert_eq!(kbd_notes(&rx), vec![true]);
+        inj.kbd_enter_from(1, 6, 5);
+        assert_eq!(sent(), vec![(0x1000 | MOUSEEVENTF_LEFTUP.0, true)]);
+        assert_eq!(input_events(&rx), vec!["driven:false", "kbd:true"]);
+        // 键盘本来就在这台（从驱动转过来）：不弹
+        assert!(kbd_notes(&rx).is_empty());
+        // 迟到的旧轮次 Leave 不理；新一轮的抬起照常
+        inj.leave(1, 5);
+        assert!(sent().is_empty());
+        inj.key(1, 6, 0x2a, false, 0xA0, false);
+        assert_eq!(sent(), vec![(0x2a, true)]);
+
+        // 只转发键盘 → 驱动（Enter.prev = 键盘轮次）：键留着
+        let (inj, rx) = injector();
+        inj.kbd_enter(1, 7);
+        inj.key(1, 7, 0x1d, false, 0xA2, true); // LCtrl
+        sent();
+        kbd_notes(&rx);
+        inj.enter_from(1, 8, 10, 10, 7);
+        assert!(sent().iter().all(|k| k.0 != 0x1d), "Ctrl 不该被抬起");
+        // 键盘本来就在这台（从只收键盘转过来）：不弹
+        assert!(kbd_notes(&rx).is_empty());
+        assert!(inj.lock().kbd.is_none());
+        inj.key(1, 8, 0x1d, false, 0xA2, false);
+        assert_eq!(sent(), vec![(0x1d, true)]);
+        // prev 对不上：照旧先抬起残留
+        inj.kbd_enter(1, 9);
+        inj.key(1, 9, 0x1d, false, 0xA2, true);
+        sent();
+        inj.enter_from(1, 10, 10, 10, 3);
+        assert!(sent().contains(&(0x1d, true)));
+        // 暂停时不接管：只收键盘那一轮也结束（对方不会再发 KbdLeave），按着的键抬起
+        inj.kbd_enter(1, 11);
+        inj.key(1, 11, 0x1d, false, 0xA2, true);
+        sent();
+        inj.hub.set_status(|s| s.paused = true);
+        inj.enter_from(1, 12, 10, 10, 11);
+        assert_eq!(sent(), vec![(0x1d, true)]);
+        assert!(inj.lock().kbd.is_none());
+        assert_eq!(yields(&rx), vec![12]);
+    }
+
+    #[test]
+    fn kbd_injection_failure_yields_with_kbd_epoch() {
+        let (inj, rx) = injector();
+        inj.kbd_enter(1, 11);
+        assert_eq!(kbd_notes(&rx), vec![true]);
+        FAIL.with(|f| f.set(true));
+        inj.key(1, 11, 0x1e, false, 0x41, true);
+        FAIL.with(|f| f.set(false));
+        assert_eq!(yields(&rx), vec![11]);
+        assert_eq!(kbd_notes(&rx), vec![false]);
+        // 对方没动静：抬起按着的键、提示一次（同一轮不重复）
+        inj.kbd_enter(1, 12);
+        inj.stale(1);
+        inj.stale(1);
+        assert_eq!(kbd_notes(&rx), vec![true, false]);
     }
 
     #[test]

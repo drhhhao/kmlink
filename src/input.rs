@@ -65,6 +65,27 @@
 //! - 跨屏时就按着的 Alt/Win，若驱动期间转发过东西，它在本机的抬起改为：注入 vk 0xE8 按下抬起 + 该键抬起，
 //!   免得本机弹出菜单栏/开始菜单（在消息循环里 SendInput，不在钩子回调里）。
 //! - 光标隐藏/恢复走 cursor::request_hide/request_show（专用线程）；状态更新和 SendInput 推迟到消息循环执行。
+//!
+//! 键盘跟随（cfg.input.kbd_follow；对方 Hello.caps 带 CAP_KBD 才生效）：本机键盘打到“最后真正在用的那只鼠标、
+//! 它的光标所在的那台”。
+//! - 在本机时本机鼠标真的在用（点击/滚轮，或移动累计 > ACTIVE_MOVE_PX）：发 Active{0}（最多每 ACTIVE_RESEND_MS 一次；
+//!   对方键盘已在打进本机时不发）；被管理员窗口/安全桌面挡住时记 act_pend，poll 里 1 秒内补发。
+//!   被控时本机鼠标在用（8px）改发 Active{driven_epoch}（对方回家，开了跟随还把键盘转过来）。
+//! - 收到 Active：在本机、没被控时记 peer_req，满足条件（开了跟随、没暂停、桌面/前台正常、本机打字和鼠标都空闲
+//!   ≥ 300ms、没在冷却、没有按着的键）就进入“只转发键盘”（Kvm.kbd）：epoch += 1，发 KbdEnter；光标留在本机照常用，
+//!   本机物理按键吞掉并以这一轮 epoch 发 Key。不满足的暂时条件 PEER_REQ_MS 内由 poll 重试。
+//!   驱动中收到当前轮次的 Active：光标回家，开了跟随就直接转成只转发键盘（不单发 Leave，KbdEnter.prev = 驱动轮次，
+//!   对方把按着的键接过去）。只转发键盘时跨屏：直接转成驱动（Enter.prev = 键盘轮次）。
+//! - 收回：本机鼠标真的在用（还有转发的键按着就等它抬起，最多 KBD_STOP_WAIT_MS）、热键（之后 KBD_COOL_MS 冷却）、
+//!   对方 Yield{键盘轮次}（冷却 + 提示“已收回”）、对方鼠标跨过来（Driven(true)）、对方 1.5 秒没帧（PeerStale）、
+//!   断线、暂停、跟随被关掉、本机锁屏/管理员窗口、钩子丢失。收回时转发出去没抬起的键本机吞掉抬起，Alt/Win 防菜单。
+//! - 被控 + 开了跟随：本机按键不再发 Yield（最后在用的鼠标就在本机屏幕上）；热键暂停时照样请对方放手。
+//! - 对方的键盘打到本机（kbd_in，injector 通知）：本机暂停、管理员窗口、对方没帧时请对方收回（YieldKbd）。
+//!   采样“本机按着的键”时，GetAsyncKeyState 会把注入的键也算上：这时键盘键再对一下钩子看到的 phys_down。
+//! - 提示：键盘一换到这台就马上弹“键盘”，不等打字——本机鼠标在用（或热键）把键盘收回本机时在本机弹；
+//!   对方的键盘新打到本机时由 injector 弹（inject.rs）。跨屏也弹：跨过去由对方的 injector 弹，跨回本机（推回边、热键）
+//!   在本机弹；被对方请回、出错回来不弹。键盘本来就在那台（只转发键盘 ↔ 驱动互转）不弹。意外收回弹“键盘 已收回”。
+//! - LAST_PHYSICAL 只记在本机生效（Pass）的按键：转发给对方的按键不算本机在用。
 
 use crate::config::Config;
 use crate::geom::{Desk, Layout, Point, Side, Step, VirtualCursor};
@@ -91,6 +112,16 @@ pub enum Action {
     ShowCursor,
     /// hub.send(Msg::Yield{epoch = inject::driven_epoch()})
     Yield,
+    /// hub.send(Msg::Yield{epoch = inject::kbd_epoch()})：请对方收回打到本机的键盘
+    YieldKbd,
+    /// hub.send(Msg::Active{epoch})：本机鼠标真的在用。true = 本机正被接管（epoch = inject::driven_epoch()），false = 0
+    Active(bool),
+    /// hub.set_status(kbd_out)
+    KbdOut(bool),
+    /// 键盘被意外收回：弹提示（hub.to_desktop(KbdNote(false))）
+    KbdLost,
+    /// 键盘刚回到本机（本机鼠标在用 / 热键收回 / 跨屏回来）：马上在本机弹“键盘”（hub.to_desktop(KbdNote(true))）
+    KbdHere,
     /// hub.set_status(driving)
     Driving(bool),
     /// hub.set_status(paused)
@@ -165,6 +196,22 @@ const YIELD_IDLE_MS: i32 = 500;
 const REARM_MS: i32 = 300;
 /// 回到本机后贴着边往外推的累计像素（原始位移）超过这么多，就放行（手抖一两个像素不会弹回去）。
 const REARM_PUSH_PX: i64 = 20;
+/// 键盘跟随：本机鼠标（在本机时）累计位移超过这么多像素才算“真的在用”（比 YIELD_MOVE_PX 高：键盘被抢走代价更大）。
+const ACTIVE_MOVE_PX: i64 = 24;
+/// 鼠标停这么久，“在用”的累计位移清零。
+const ACTIVE_IDLE_MS: i32 = 300;
+/// 本机鼠标在用时，最多每这么久发一次 Active。
+const ACTIVE_RESEND_MS: i32 = 300;
+/// 对方鼠标在用的请求暂时不能满足（本机在打字、按着键）：这么久内条件满足就补做。
+const PEER_REQ_MS: i32 = 1000;
+/// 本机打字（键在本机生效）后这么久内不把键盘交给对方。
+const KBD_TYPE_IDLE_MS: i32 = 300;
+/// 本机鼠标真的在用之后这么久内不把键盘交给对方（两边同时动时别来回抢）。
+const KBD_MOUSE_IDLE_MS: i32 = 300;
+/// 收回键盘时还有转发出去没抬起的键：等它抬起，最多等这么久。
+const KBD_STOP_WAIT_MS: i32 = 500;
+/// 对方拒绝 / 热键收回之后这么久内不再把键盘交给对方。
+const KBD_COOL_MS: i32 = 1500;
 /// 接受对方 Yield 回到本机后，这么久之内不跨屏。
 const YIELD_COOLDOWN_MS: i32 = 1500;
 /// 驱动中钩子这么久没被调用（而光标被挪走了、也有输入）：钩子丢了。
@@ -187,6 +234,11 @@ fn since(now: u32, then: u32) -> i32 {
     now.wrapping_sub(then) as i32
 }
 
+/// then 在 now 之前 ms 毫秒以内。
+fn recent(then: Option<u32>, now: u32, ms: i32) -> bool {
+    then.is_some_and(|t| (0..ms).contains(&since(now, t)))
+}
+
 fn button_index(b: Button) -> usize {
     match b {
         Button::Left => 0,
@@ -195,6 +247,66 @@ fn button_index(b: Button) -> usize {
         Button::X1 => 3,
         Button::X2 => 4,
     }
+}
+
+/// 本机键盘打到对方期间（驱动 / 只转发键盘）的按键记录。
+#[derive(Clone)]
+struct KbdFwd {
+    /// 开始时本机按着的键：抬起放行给本机，不转发
+    local_held: [bool; 256],
+    /// 已转发给对方、还没抬起的键
+    remote_keys: [bool; 256],
+    /// 这一轮转发过按键/按钮/滚轮（决定本机 Alt/Win 抬起要不要防菜单）
+    forwarded: bool,
+}
+
+impl KbdFwd {
+    fn new(local_held: [bool; 256], forwarded: bool) -> Self {
+        Self { local_held, remote_keys: [false; 256], forwarded }
+    }
+
+    fn remote_any(&self) -> bool {
+        self.remote_keys.iter().any(|b| *b)
+    }
+
+    /// 开始时就按着的键：抬起还给本机（Alt/Win 防菜单）、自动重复吞掉。不是这种键返回 None。
+    fn held(&mut self, ev: &KeyEv, out: &mut Vec<Action>) -> Option<Verdict> {
+        let vk = (ev.vk & 0xFF) as usize;
+        if !self.local_held[vk] {
+            return None;
+        }
+        if ev.down {
+            return Some(Verdict::Swallow);
+        }
+        self.local_held[vk] = false;
+        if self.forwarded && MASK_VKS.contains(&vk) {
+            // 本机只看到 Alt/Win 按下又抬起会弹菜单：改成先注入掩码键再抬起
+            out.push(mask(ev));
+            return Some(Verdict::Swallow);
+        }
+        Some(Verdict::Pass)
+    }
+
+    /// 转发一个按键（吞掉）。swallow_keys：本机不再需要吞它的抬起。
+    fn send(&mut self, swallow_keys: &mut [bool; 256], epoch: u32, ev: &KeyEv, out: &mut Vec<Action>) -> Verdict {
+        if ev.fake || ev.vk == VK_PACKET {
+            return Verdict::Swallow;
+        }
+        let vk = (ev.vk & 0xFF) as usize;
+        self.remote_keys[vk] = ev.down;
+        self.forwarded = true;
+        swallow_keys[vk] = false;
+        out.push(Action::Send(Msg::Key { epoch, scan: ev.scan, ext: ev.ext, vk: ev.vk as u16, down: ev.down }));
+        Verdict::Swallow
+    }
+}
+
+/// 只转发键盘（键盘跟随）：光标留在本机、照常用，本机物理键盘打到对方。
+struct Kbd {
+    epoch: u32,
+    keys: KbdFwd,
+    /// 要收回了，但还有转发出去没抬起的键：等它们抬起（最多 KBD_STOP_WAIT_MS）
+    stop_at: Option<u32>,
 }
 
 /// 驱动对方期间的状态。
@@ -210,13 +322,10 @@ struct Drive {
     before: Point,
     /// 还要做旧坐标过滤的事件数
     fresh: u8,
-    /// 跨屏时本机按着的键：抬起放行给本机，不转发
-    local_held: [bool; 256],
-    /// 已转发给对方、还没抬起的键/按钮
-    remote_keys: [bool; 256],
+    /// 按键记录（跨屏时本机按着的键、已转发没抬起的键）
+    keys: KbdFwd,
+    /// 已转发给对方、还没抬起的按钮
     remote_buttons: [bool; 5],
-    /// 这次驱动转发过按键/按钮/滚轮（决定本机 Alt/Win 抬起要不要防菜单）
-    forwarded: bool,
 }
 
 impl Drive {
@@ -276,6 +385,33 @@ pub struct Kvm {
     desk_ok: bool,
     /// 因切到安全桌面回到本机时的落点：切回 Default 后再停一次、补一次显示光标
     desk_restore: Option<Point>,
+    // ── 键盘跟随 ──
+    /// 本机开关（cfg.input.kbd_follow）：本机键盘跟随最后真正在用的鼠标
+    follow: bool,
+    /// 对方支持键盘跟随（Hello.caps 带 CAP_KBD）
+    peer_kbd: bool,
+    /// 只转发键盘中
+    kbd: Option<Kbd>,
+    /// 对方的键盘正打到本机（injector 通知）
+    kbd_in: bool,
+    /// 已为这次 kbd_in 请过对方收回（管理员窗口/安全桌面）
+    kbd_yielded: bool,
+    /// 本机鼠标（在本机时）“在用”的累计位移和最后一次移动的时间
+    act_acc: i64,
+    act_acc_at: Option<u32>,
+    /// 本机鼠标最近一次真的在用 / 最近一次发 Active 的时间
+    act_at: Option<u32>,
+    act_sent: Option<u32>,
+    /// 本机最近一次在本机生效的物理按键
+    key_at: Option<u32>,
+    /// 对方鼠标在用、还没满足的请求（收到的时间）
+    peer_req: Option<u32>,
+    /// 对方拒绝 / 热键收回的时间：之后 KBD_COOL_MS 内不交出键盘
+    kbd_cool: Option<u32>,
+    /// 本机鼠标真的在用、但当时被管理员窗口/安全桌面挡住没发 Active：条件恢复后（1 秒内）补发
+    act_pend: Option<u32>,
+    /// 钩子看到的按键状态（我们自己注入的不算）：接收对方键盘时，GetAsyncKeyState 会把注入的键也算成按着
+    phys_down: [bool; 256],
 }
 
 impl Kvm {
@@ -312,6 +448,20 @@ impl Kvm {
             mask_up: [false; 256],
             desk_ok: true,
             desk_restore: None,
+            follow: false,
+            peer_kbd: false,
+            kbd: None,
+            kbd_in: false,
+            kbd_yielded: false,
+            act_acc: 0,
+            act_acc_at: None,
+            act_at: None,
+            act_sent: None,
+            key_at: None,
+            peer_req: None,
+            kbd_cool: None,
+            act_pend: None,
+            phys_down: [false; 256],
         };
         k.apply_config(cfg);
         k
@@ -332,12 +482,19 @@ impl Kvm {
         let s = cfg.input.speed;
         self.speed = if s.is_finite() && s > 0.0 { s.min(20.0) } else { 1.0 };
         self.hotkey = cfg.input.hotkey_vk & 0xFF;
+        self.follow = cfg.input.kbd_follow;
+    }
+
+    #[cfg(test)]
+    pub fn kbd_out(&self) -> bool {
+        self.kbd.is_some()
     }
 
     // ── 被控时请对方放手 ──
 
-    /// 发 Yield（最多每 YIELD_MS 一次）。
-    fn yield_now(&mut self, time: u32, out: &mut Vec<Action>) {
+    /// 发 Yield（最多每 YIELD_MS 一次）。active = 是本机鼠标在用：对方支持键盘跟随时改发 Active
+    /// （对方回到它本机，它开了跟随还会把键盘转过来）。
+    fn yield_now(&mut self, time: u32, active: bool, out: &mut Vec<Action>) {
         let due = match self.last_yield {
             None => true,
             Some(t) => {
@@ -348,7 +505,7 @@ impl Kvm {
         if due {
             self.last_yield = Some(time);
             self.yield_acc = 0;
-            out.push(Action::Yield);
+            out.push(if active && self.peer_kbd { Action::Active(true) } else { Action::Yield });
         }
     }
 
@@ -360,7 +517,7 @@ impl Kvm {
         self.yield_acc_at = Some(time);
         self.yield_acc = self.yield_acc.saturating_add(dist);
         if self.yield_acc > YIELD_MOVE_PX {
-            self.yield_now(time, out);
+            self.yield_now(time, true, out);
         }
     }
 
@@ -377,18 +534,19 @@ impl Kvm {
                     let d = (ev.pt.x as i64 - c.x as i64).abs() + (ev.pt.y as i64 - c.y as i64).abs();
                     self.yield_move(ev.time, d, out);
                 }
-                _ => self.yield_now(ev.time, out),
+                _ => self.yield_now(ev.time, true, out),
             }
         }
-        match ev.kind {
+        let v = match ev.kind {
             MouseKind::Button(b, down) => {
                 let i = button_index(b);
                 if self.swallow_buttons[i] {
                     self.swallow_buttons[i] = false;
                     // 按下：本机重新看到了完整的一次按键，放行
-                    return if down { Verdict::Pass } else { Verdict::Swallow };
+                    if down { Verdict::Pass } else { Verdict::Swallow }
+                } else {
+                    Verdict::Pass
                 }
-                Verdict::Pass
             }
             MouseKind::Wheel { .. } => Verdict::Pass,
             MouseKind::Move => {
@@ -398,6 +556,152 @@ impl Kvm {
                     Verdict::Pass
                 }
             }
+        };
+        // 键盘跟随：本机鼠标在本机真的在用（这一下跨过去了就不算：键盘随驱动走，见 try_cross_at）
+        if !self.driven && !ev.injected && self.drive.is_none() {
+            self.local_active(&ev, out);
+        }
+        v
+    }
+
+    // ── 键盘跟随 ──
+
+    /// 在本机（没驱动、没被控）时本机物理鼠标事件：真的在用 → 收回打到对方的键盘、告诉对方（Active）。
+    fn local_active(&mut self, ev: &MouseEv, out: &mut Vec<Action>) {
+        let hit = match ev.kind {
+            MouseKind::Move => {
+                let c = ev.cur.unwrap_or(ev.pt);
+                let d = (ev.pt.x as i64 - c.x as i64).abs() + (ev.pt.y as i64 - c.y as i64).abs();
+                if self.act_acc_at.is_some_and(|t| !(0..=ACTIVE_IDLE_MS).contains(&since(ev.time, t))) {
+                    self.act_acc = 0;
+                }
+                self.act_acc_at = Some(ev.time);
+                self.act_acc = self.act_acc.saturating_add(d);
+                self.act_acc > ACTIVE_MOVE_PX
+            }
+            // 点击、滚轮：立刻算
+            _ => true,
+        };
+        if !hit {
+            self.kbd_stop_due(ev.time, out);
+            return;
+        }
+        self.act_at = Some(ev.time);
+        self.peer_req = None;
+        if let Some(k) = self.kbd.as_mut() {
+            if k.keys.remote_any() {
+                // 还有转发出去没抬起的键（组合键打到一半）：等它抬起再收回，别把组合键拆到两台上
+                k.stop_at.get_or_insert(ev.time);
+                self.kbd_stop_due(ev.time, out);
+            } else {
+                self.kbd_home(out);
+            }
+        }
+        self.maybe_active(ev.time, out);
+    }
+
+    /// 本机鼠标刚真的在用：条件满足就告诉对方（Active，限频）。只被管理员窗口/安全桌面挡住时记下，poll 里补发。
+    fn maybe_active(&mut self, now: u32, out: &mut Vec<Action>) {
+        if self.kbd.is_some() || self.kbd_in || !self.peer_kbd || self.peer.is_none() || self.paused {
+            self.act_pend = None;
+            return;
+        }
+        if !self.desk_ok || self.fg_blocked {
+            self.act_pend = Some(now);
+            return;
+        }
+        self.act_pend = None;
+        if !recent(self.act_sent, now, ACTIVE_RESEND_MS) {
+            self.act_sent = Some(now);
+            out.push(Action::Active(false));
+        }
+    }
+
+    /// 本机此刻按着这个键吗。接收对方键盘时注入的键也会让 GetAsyncKeyState 报“按着”：键盘键再对一下钩子看到的。
+    fn local_down(&self, v: usize) -> bool {
+        (self.probe)(v) && (MOUSE_VKS.contains(&v) || !self.kbd_in || self.phys_down[v])
+    }
+
+    /// 等转发的键抬起的收回超时了：直接收回。
+    fn kbd_stop_due(&mut self, now: u32, out: &mut Vec<Action>) {
+        if self.kbd.as_ref().is_some_and(|k| k.stop_at.is_some_and(|t| !(0..KBD_STOP_WAIT_MS).contains(&since(now, t)))) {
+            self.kbd_home(out);
+            // 是本机鼠标在用才要收回的：收回了，告诉对方（对方的键盘跟过来）
+            self.maybe_active(now, out);
+        }
+    }
+
+    /// 对方鼠标在用的请求：条件满足就开始把本机键盘转发过去。不满足的暂时条件（打字、按着键、冷却）留着请求，
+    /// PEER_REQ_MS 内再试（定时器、对方重发的 Active）。
+    fn kbd_try_start(&mut self, now: u32, out: &mut Vec<Action>) {
+        let Some(t) = self.peer_req else {
+            return;
+        };
+        // 冷却期间收到的请求，冷却结束后再留一会儿（定时器 250ms 一次，至少能再试一两回）
+        let expired =
+            !(0..PEER_REQ_MS).contains(&since(now, t)) && !recent(self.kbd_cool, now, KBD_COOL_MS + PEER_REQ_MS / 2);
+        if expired
+            || !self.follow
+            || !self.peer_kbd
+            || self.peer.is_none()
+            || self.driven
+            || self.drive.is_some()
+            || self.kbd.is_some()
+        {
+            self.peer_req = None;
+            return;
+        }
+        if self.paused
+            || !self.desk_ok
+            || self.fg_blocked
+            || recent(self.key_at, now, KBD_TYPE_IDLE_MS)
+            || recent(self.act_at, now, KBD_MOUSE_IDLE_MS)
+            || recent(self.kbd_cool, now, KBD_COOL_MS)
+        {
+            return;
+        }
+        // 按着键（含鼠标键）时不切换：组合键不拆到两台上
+        if (1..256).any(|v| self.local_down(v)) {
+            return;
+        }
+        self.peer_req = None;
+        self.kbd_begin(KbdFwd::new([false; 256], false), 0, out);
+    }
+
+    /// 开始只转发键盘（新一轮）。keys / prev：从驱动转过来时原样带上按键记录，prev = 那一轮驱动的轮次
+    /// （对方把按着的键接到新一轮，不先抬起；这时不单发 Leave）。
+    fn kbd_begin(&mut self, keys: KbdFwd, prev: u32, out: &mut Vec<Action>) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.kbd = Some(Kbd { epoch: self.epoch, keys, stop_at: None });
+        out.push(Action::Send(Msg::KbdEnter { epoch: self.epoch, prev }));
+        out.push(Action::KbdOut(true));
+    }
+
+    /// 结束只转发键盘：转发出去还没抬起的键，本机的抬起要吞掉；开始时就按着的 Alt/Win 抬起防菜单。
+    /// send = 告诉对方（KbdLeave，对方抬起这一轮按着的键）。返回之前是否在转发。
+    fn kbd_stop(&mut self, send: bool, out: &mut Vec<Action>) -> bool {
+        let Some(k) = self.kbd.take() else {
+            return false;
+        };
+        for (s, r) in self.swallow_keys.iter_mut().zip(k.keys.remote_keys.iter()) {
+            *s |= *r;
+        }
+        if k.keys.forwarded {
+            for v in MASK_VKS {
+                self.mask_up[v] |= k.keys.local_held[v];
+            }
+        }
+        if send {
+            out.push(Action::Send(Msg::KbdLeave { epoch: k.epoch }));
+        }
+        out.push(Action::KbdOut(false));
+        true
+    }
+
+    /// 用户要键盘回到本机（本机鼠标在用、热键）：收回，并马上在本机提示“键盘在这台”（不等打字）。
+    fn kbd_home(&mut self, out: &mut Vec<Action>) {
+        if self.kbd_stop(true, out) {
+            out.push(Action::KbdHere);
         }
     }
 
@@ -467,10 +771,19 @@ impl Kvm {
             self.refuse_why = "鼠标键按着（拖动中）";
             return false; // 拖动中不跨屏
         }
+        // 正在只转发键盘：直接转成驱动（Enter.prev = 那一轮，对方把按着的键原样接过来，不单发 KbdLeave），
+        // 还按着的转发键仍是“对方的”，抬起照旧发过去（不还给本机）
+        let (carried, prev) = match self.kbd.take() {
+            Some(k) => {
+                out.push(Action::KbdOut(false));
+                (Some(k.keys), k.epoch)
+            }
+            None => (None, 0),
+        };
         let mut held = [false; 256];
-        for (v, h) in held.iter_mut().enumerate().skip(1) {
-            if !MOUSE_VKS.contains(&v) {
-                *h = (self.probe)(v);
+        for v in 1..256 {
+            if !MOUSE_VKS.contains(&v) && !carried.as_ref().is_some_and(|c| c.remote_keys[v]) {
+                held[v] = self.local_down(v);
             }
         }
         self.epoch = self.epoch.wrapping_add(1);
@@ -478,8 +791,13 @@ impl Kvm {
         self.desk_restore = None;
         let park = self.mine.park_point();
         // 上次驱动留下的 Alt/Win 防菜单标记并入这次
-        let forwarded = MASK_VKS.iter().any(|&v| self.mask_up[v] && held[v]);
+        let forwarded =
+            MASK_VKS.iter().any(|&v| self.mask_up[v] && held[v]) || carried.as_ref().is_some_and(|c| c.forwarded);
         self.mask_up = [false; 256];
+        let mut keys = KbdFwd::new(held, forwarded);
+        if let Some(c) = carried {
+            keys.remote_keys = c.remote_keys;
+        }
         self.drive = Some(Drive {
             vc: VirtualCursor::new(entry),
             exit: p,
@@ -488,12 +806,10 @@ impl Kvm {
             park_time: time,
             before: p,
             fresh: 0,
-            local_held: held,
-            remote_keys: [false; 256],
+            keys,
             remote_buttons: [false; 5],
-            forwarded,
         });
-        out.push(Action::Send(Msg::Enter { epoch: self.epoch, x: entry.x, y: entry.y }));
+        out.push(Action::Send(Msg::Enter { epoch: self.epoch, x: entry.x, y: entry.y, prev }));
         // 先隐藏、隐藏完再停放（见 hidden）
         out.push(Action::HideCursor(self.epoch));
         self.trace_n = 0;
@@ -567,21 +883,23 @@ impl Kvm {
                         }
                     }
                     Step::Return(p) => {
+                        // 跨回本机：键盘跟着回来，马上提示
                         self.go_home(p, out);
+                        out.push(Action::KbdHere);
                     }
                 }
             }
             MouseKind::Button(b, down) => {
                 let i = button_index(b);
                 d.remote_buttons[i] = down;
-                d.forwarded = true;
+                d.keys.forwarded = true;
                 self.swallow_buttons[i] = false;
                 let p = d.vc.pos;
                 out.push(Action::Send(Msg::Button { epoch, x: p.x, y: p.y, button: b, down }));
             }
             MouseKind::Wheel { delta, horizontal } => {
                 if delta != 0 {
-                    d.forwarded = true;
+                    d.keys.forwarded = true;
                     let p = d.vc.pos;
                     out.push(Action::Send(Msg::Wheel { epoch, x: p.x, y: p.y, delta, horizontal }));
                 }
@@ -594,56 +912,77 @@ impl Kvm {
 
     pub fn key(&mut self, ev: KeyEv, out: &mut Vec<Action>) -> Verdict {
         let vk = (ev.vk & 0xFF) as usize;
+        self.phys_down[vk] = ev.down;
         let is_hotkey = self.hotkey != 0 && (ev.vk & 0xFF) == self.hotkey;
         let epoch = self.epoch;
         if let Some(d) = self.drive.as_mut() {
-            if d.local_held[vk] {
-                // 跨屏前就按着的键：抬起还给本机；自动重复吞掉
-                if ev.down {
-                    return Verdict::Swallow;
-                }
-                d.local_held[vk] = false;
-                if d.forwarded && MASK_VKS.contains(&vk) {
-                    // 本机只看到 Alt/Win 按下又抬起会弹菜单：改成先注入掩码键再抬起
-                    out.push(mask(&ev));
-                    return Verdict::Swallow;
-                }
-                return Verdict::Pass;
+            // 跨屏前就按着的键：抬起还给本机；自动重复吞掉
+            if let Some(v) = d.keys.held(&ev, out) {
+                return v;
             }
             if is_hotkey {
                 if ev.down {
                     self.hotkey_held = true;
                     let exit = d.exit;
                     self.go_home(exit, out);
+                    out.push(Action::KbdHere);
                 } else {
                     self.hotkey_held = false;
                 }
                 return Verdict::Swallow;
             }
-            if ev.fake || ev.vk == VK_PACKET {
-                return Verdict::Swallow;
+            return d.keys.send(&mut self.swallow_keys, epoch, &ev, out);
+        }
+        if let Some(k) = self.kbd.as_mut() {
+            let v = match k.keys.held(&ev, out) {
+                Some(v) => v,
+                None if is_hotkey => {
+                    // 只转发键盘时热键：收回键盘（之后 KBD_COOL_MS 内不再交出去）
+                    if ev.down {
+                        if !self.hotkey_held {
+                            self.kbd_home(out);
+                            self.kbd_cool = Some(ev.time);
+                        }
+                        self.hotkey_held = true;
+                    } else {
+                        self.hotkey_held = false;
+                    }
+                    return Verdict::Swallow;
+                }
+                None => k.keys.send(&mut self.swallow_keys, k.epoch, &ev, out),
+            };
+            // 等转发的键抬起再收回：最后一个抬起了
+            if !ev.down && self.kbd.as_ref().is_some_and(|k| k.stop_at.is_some() && !k.keys.remote_any()) {
+                self.kbd_home(out);
+                self.maybe_active(ev.time, out); // 是本机鼠标在用才收回的：告诉对方
             }
-            d.remote_keys[vk] = ev.down;
-            d.forwarded = true;
-            self.swallow_keys[vk] = false;
-            out.push(Action::Send(Msg::Key { epoch, scan: ev.scan, ext: ev.ext, vk: ev.vk as u16, down: ev.down }));
-            return Verdict::Swallow;
+            return v;
         }
 
-        if self.driven && !ev.injected {
-            self.yield_now(ev.time, out);
+        // 被控时本机有人按键：没开键盘跟随就请对方放手（开了：最后在用的鼠标就在本机屏幕上，键盘本来就该打在本机）
+        if self.driven && !ev.injected && !self.follow {
+            self.yield_now(ev.time, false, out);
         }
         if is_hotkey {
             if ev.down {
                 if !self.hotkey_held {
                     self.paused = !self.paused;
                     out.push(Action::Paused(self.paused));
+                    if self.paused && self.driven && self.follow {
+                        out.push(Action::Yield); // 开了跟随时被控端按键不发 Yield：暂停要请对方放手
+                    }
+                    if self.paused && self.kbd_in {
+                        out.push(Action::YieldKbd); // 对方的键盘正打到本机：请它收回
+                    }
                 }
                 self.hotkey_held = true;
             } else {
                 self.hotkey_held = false;
             }
             return Verdict::Swallow;
+        }
+        if !ev.injected {
+            self.key_at = Some(ev.time);
         }
         // 驱动结束时还按着的 Alt/Win：自动重复的按下照常放行，抬起时防菜单
         if self.mask_up[vk] && !ev.down {
@@ -671,27 +1010,38 @@ impl Kvm {
     /// 回到本机，返回实际落点（不在驱动时 None）。
     #[track_caller]
     fn go_home(&mut self, land: Point, out: &mut Vec<Action>) -> Option<Point> {
+        self.go_home_with(land, false, out).map(|(p, _)| p)
+    }
+
+    /// 回到本机。keep = 键盘留在对方（接着只转发键盘）：按键记录原样交回调用方，不并进本机的吞抬起/防菜单。
+    #[track_caller]
+    fn go_home_with(&mut self, land: Point, keep: bool, out: &mut Vec<Action>) -> Option<(Point, KbdFwd)> {
         let d = self.drive.take()?;
         self.home_note = Some((std::panic::Location::caller(), d.vc.pos));
-        for (s, r) in self.swallow_keys.iter_mut().zip(d.remote_keys.iter()) {
-            *s |= *r;
+        if !keep {
+            for (s, r) in self.swallow_keys.iter_mut().zip(d.keys.remote_keys.iter()) {
+                *s |= *r;
+            }
+            if d.keys.forwarded {
+                for v in MASK_VKS {
+                    self.mask_up[v] = d.keys.local_held[v];
+                }
+            }
         }
         for (s, r) in self.swallow_buttons.iter_mut().zip(d.remote_buttons.iter()) {
             *s |= *r;
         }
-        if d.forwarded {
-            for v in MASK_VKS {
-                self.mask_up[v] = d.local_held[v];
-            }
-        }
         // 先离开跨屏那条边才能再跨（防止立刻弹回去）
         self.disarm();
         let land = self.inward(land);
-        out.push(Action::Send(Msg::Leave { epoch: self.epoch }));
+        // keep：不单发 Leave，紧接着的 KbdEnter.prev 让对方结束被控、按着的键原样接过去
+        if !keep {
+            out.push(Action::Send(Msg::Leave { epoch: self.epoch }));
+        }
         out.push(Action::SetCursor(land));
         out.push(Action::ShowCursor);
         out.push(Action::Driving(false));
-        Some(land)
+        Some((land, d.keys))
     }
 
     /// 先离开跨屏那条边（或贴边推够了 / 过了 REARM_MS）才能再跨。
@@ -723,11 +1073,18 @@ impl Kvm {
         self.go_home(e, out)
     }
 
+    #[track_caller]
+    fn go_home_exit_with(&mut self, keep: bool, out: &mut Vec<Action>) -> Option<(Point, KbdFwd)> {
+        let e = self.exit_point()?;
+        self.go_home_with(e, keep, out)
+    }
+
     // ── 来自其他线程的消息 ──
 
     pub fn msg(&mut self, m: ToInput, now: u32, out: &mut Vec<Action>) {
         match m {
-            ToInput::PeerUp { name: _, desk } => {
+            ToInput::PeerUp { name: _, desk, caps } => {
+                self.peer_kbd = caps & crate::proto::CAP_KBD != 0;
                 if desk.is_empty() {
                     self.go_home_exit(out);
                 } else if let Some(d) = self.drive.as_mut() {
@@ -737,7 +1094,12 @@ impl Kvm {
             }
             ToInput::PeerDown => {
                 self.go_home_exit(out);
+                // 照样发 KbdLeave（会话替换的窗口里 KbdEnter 可能已漏到新会话；对方轮次对不上会忽略）
+                self.kbd_stop(true, out);
                 self.peer = None;
+                self.peer_kbd = false;
+                self.kbd_in = false;
+                self.peer_req = None;
             }
             ToInput::LocalDesk(desk) => {
                 self.mine = desk;
@@ -750,16 +1112,74 @@ impl Kvm {
                     d.park_now(before, now, true, out);
                 }
             }
-            ToInput::Config(cfg) => self.apply_config(&cfg),
+            ToInput::Config(cfg) => {
+                let was = self.follow;
+                self.apply_config(&cfg);
+                // 只在键盘跟随被关掉时收回（改排布、改名等重新加载不打断）
+                if was && !self.follow {
+                    self.kbd_stop(true, out);
+                    self.peer_req = None;
+                }
+            }
             ToInput::Yield(epoch) => {
                 // 只认当前这一轮（0 = 对方不确定，总是接受）；旧轮次晚到的 Yield 不能把新一轮踢回来
                 if self.drive.is_some() && (epoch == 0 || epoch == self.epoch) {
                     self.go_home_exit(out);
                     self.yielded_at = Some(now);
+                } else if self.kbd.as_ref().is_some_and(|k| epoch == 0 || epoch == k.epoch) {
+                    // 对方不收本机键盘了（暂停、管理员窗口、锁屏、注入失败）
+                    self.kbd_stop(true, out);
+                    self.kbd_cool = Some(now);
+                    out.push(Action::KbdLost);
+                }
+            }
+            ToInput::PeerActive(epoch) => {
+                if self.drive.is_some() {
+                    if epoch == 0 || epoch == self.epoch {
+                        // 驱动中对方动了它自己的鼠标：光标回本机；开了跟随就让键盘留在对方（原样带上按键记录）
+                        let keep = self.follow && self.peer_kbd && !self.paused && self.desk_ok && !self.fg_blocked;
+                        let prev = self.epoch;
+                        if let Some((_, keys)) = self.go_home_exit_with(keep, out) {
+                            if keep {
+                                self.kbd_begin(keys, prev, out);
+                            }
+                        }
+                        self.yielded_at = Some(now);
+                    }
+                } else if !self.driven && self.kbd.is_none() {
+                    self.peer_req = Some(now);
+                    self.kbd_try_start(now, out);
+                }
+            }
+            ToInput::KbdIn(b) => {
+                self.kbd_in = b;
+                self.kbd_yielded = false;
+                if b {
+                    self.peer_req = None;
+                    // 两边同时开始互相转发（竞态）：本机这一轮结束，各回各家
+                    self.kbd_stop(true, out);
+                    // 本机刚暂停（和对方的 KbdEnter 擦肩而过）：请对方收回
+                    if self.paused {
+                        self.kbd_yielded = true;
+                        out.push(Action::YieldKbd);
+                    }
+                }
+            }
+            ToInput::PeerStale => {
+                if self.kbd_stop(true, out) {
+                    out.push(Action::KbdLost);
+                }
+                // 对方的键盘打到本机、却收不到对方的帧（单向卡住）：请对方收回（反方向通的话对方立刻提示）
+                if self.kbd_in && !self.kbd_yielded {
+                    self.kbd_yielded = true;
+                    out.push(Action::YieldKbd);
                 }
             }
             ToInput::GoHome => {
                 self.go_home_exit(out);
+                if self.kbd_stop(true, out) {
+                    out.push(Action::KbdLost);
+                }
             }
             ToInput::Driven(b) => {
                 self.driven = b;
@@ -768,6 +1188,9 @@ impl Kvm {
                 self.yield_acc_at = None;
                 if b {
                     self.go_home_exit(out); // 双方同时跨屏：本机放手
+                    // 对方的鼠标过来了：最后在用的鼠标在本机屏幕上，本机键盘回本机
+                    self.kbd_stop(true, out);
+                    self.peer_req = None;
                 } else {
                     // 对方放手时本机光标可能正停在共用的那条边上：先离开过边才跨
                     self.disarm();
@@ -777,11 +1200,17 @@ impl Kvm {
                 self.paused = p;
                 if p {
                     self.go_home_exit(out);
+                    self.kbd_stop(true, out);
+                    self.peer_req = None;
+                    if self.kbd_in {
+                        out.push(Action::YieldKbd); // 对方的键盘正打到本机：请它收回
+                    }
                 }
                 out.push(Action::Paused(p));
             }
             ToInput::Quit => {
                 self.go_home_exit(out);
+                self.kbd_stop(true, out);
             }
         }
     }
@@ -789,6 +1218,7 @@ impl Kvm {
     /// 看门狗发现钩子被系统摘掉：正在驱动就先回到本机。
     pub fn hooks_lost(&mut self, out: &mut Vec<Action>) {
         self.go_home_exit(out);
+        self.kbd_stop(true, out);
     }
 
     /// 驱动中看门狗（定时器每 250ms）：cur = 真实光标位置；hook_idle = 距最后一次钩子回调的毫秒数；
@@ -810,8 +1240,22 @@ impl Kvm {
 
     /// 定时器（250ms）：fg_blocked = 前台是管理员窗口；desk_ok = 输入桌面是 Default。
     /// 驱动中任一不满足就立刻回到本机（Leave 让对方抬起所有键）。
-    pub fn poll(&mut self, fg_blocked: bool, desk_ok: bool, out: &mut Vec<Action>) {
+    pub fn poll(&mut self, fg_blocked: bool, desk_ok: bool, now: u32, out: &mut Vec<Action>) {
         self.fg_blocked = fg_blocked;
+        if !desk_ok || fg_blocked {
+            // 本机锁屏/安全桌面/管理员窗口：钩子收不到按键，不能再转发
+            if self.kbd_stop(true, out) && desk_ok {
+                self.warn(out);
+            }
+            // 对方的键盘打到本机却注入不进来：请它收回（每次只请一回）
+            if self.kbd_in && !self.kbd_yielded {
+                self.kbd_yielded = true;
+                out.push(Action::YieldKbd);
+                if desk_ok {
+                    out.push(Action::KbdLost); // 管理员窗口：两台都提示（锁屏时这边看不到，不弹）
+                }
+            }
+        }
         if self.drive.is_some() && (!desk_ok || fg_blocked) {
             let land = self.go_home_exit(out);
             if desk_ok {
@@ -835,6 +1279,15 @@ impl Kvm {
         if !fg_blocked && self.warned {
             self.warned = false;
             out.push(Action::Error { msg: FG_BLOCKED_MSG, on: false });
+        }
+        self.kbd_stop_due(now, out);
+        self.kbd_try_start(now, out);
+        if let Some(t) = self.act_pend {
+            if recent(Some(t), now, PEER_REQ_MS) && self.drive.is_none() && !self.driven {
+                self.maybe_active(now, out);
+            } else {
+                self.act_pend = None;
+            }
         }
     }
 
@@ -975,7 +1428,17 @@ fn execute(actions: &mut Vec<Action>) {
                 Action::HideCursor(token) => crate::cursor::request_hide(TID.with(|t| t.get()), token),
                 Action::ShowCursor => crate::cursor::request_show(),
                 Action::Yield => hub.send(Msg::Yield { epoch: crate::inject::driven_epoch() }),
-                a @ (Action::Driving(_) | Action::Paused(_) | Action::Error { .. } | Action::Mask { .. }) => {
+                Action::YieldKbd => hub.send(Msg::Yield { epoch: crate::inject::kbd_epoch() }),
+                Action::Active(driven) => {
+                    hub.send(Msg::Active { epoch: if driven { crate::inject::driven_epoch() } else { 0 } })
+                }
+                a @ (Action::Driving(_)
+                | Action::Paused(_)
+                | Action::Error { .. }
+                | Action::Mask { .. }
+                | Action::KbdOut(_)
+                | Action::KbdLost
+                | Action::KbdHere) => {
                     DEFER.with(|d| d.borrow_mut().push(a));
                     deferred = true;
                 }
@@ -994,8 +1457,20 @@ fn run_deferred(hub: &Hub) {
     let list: Vec<Action> = DEFER.with(|d| d.borrow_mut().drain(..).collect());
     for a in list {
         match a {
-            Action::Driving(b) => hub.set_status(|s| s.driving = b),
+            Action::Driving(b) => {
+                hub.set_status(|s| s.driving = b);
+                if b {
+                    // 鼠标跨到对方了：本机的“键盘”提示马上收起（对方那台会弹它自己的）
+                    hub.to_desktop(crate::hub::ToDesktop::KbdTipGone);
+                }
+            }
             Action::Paused(b) => hub.set_status(|s| s.paused = b),
+            Action::KbdOut(b) => {
+                crate::log!("{}", if b { "键盘跟随：本机键盘打到对方" } else { "键盘跟随：本机键盘回到本机" });
+                hub.set_status(|s| s.kbd_out = b)
+            }
+            Action::KbdLost => hub.to_desktop(crate::hub::ToDesktop::KbdNote(false)),
+            Action::KbdHere => hub.to_desktop(crate::hub::ToDesktop::KbdNote(true)),
             Action::Error { msg, on } => hub.set_status(|s| {
                 if on {
                     s.last_error = msg.to_string();
@@ -1111,10 +1586,12 @@ unsafe extern "system" fn key_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
         }
         if kb.dwExtraInfo != INJECT_MARK {
             let ev = key_event(kb);
-            if !ev.injected {
+            let v = dispatch(|k, out| k.key(ev, out));
+            // 转发给对方的按键不算本机在用（否则本机打字时对方的鼠标 500ms 内过不来）
+            if !ev.injected && v == Verdict::Pass {
                 note_physical();
             }
-            if dispatch(|k, out| k.key(ev, out)) == Verdict::Swallow {
+            if v == Verdict::Swallow {
                 return LRESULT(1);
             }
         }
@@ -1232,8 +1709,9 @@ pub fn run(hub: Arc<Hub>, rx: Receiver<ToInput>) {
                     crate::log!("输入桌面{}", if desk_ok { "回到 Default" } else { "切走了（安全桌面/锁屏）" });
                 }
                 let blocked = desk_ok && crate::elev::foreground_blocked();
+                let now = tick();
                 dispatch(|k, out| {
-                    k.poll(blocked, desk_ok, out);
+                    k.poll(blocked, desk_ok, now, out);
                     if k.refused != last_refused {
                         if !k.refused.is_empty() {
                             crate::log!("顶在边上没跨过去：{}", k.refused);
@@ -1448,7 +1926,7 @@ mod tests {
         };
         let mut k = Kvm::new(desk(), &cfg, E0, Box::new(probe));
         let mut out = vec![];
-        k.msg(ToInput::PeerUp { name: "b".into(), desk: desk() }, 0, &mut out);
+        k.msg(ToInput::PeerUp { name: "b".into(), desk: desk(), caps: 0 }, 0, &mut out);
         assert!(out.is_empty());
         T { k, held, probes, t: 1000 }
     }
@@ -1469,7 +1947,7 @@ mod tests {
         }
         fn poll(&mut self, blocked: bool, desk_ok: bool) -> Vec<Action> {
             let mut out = vec![];
-            self.k.poll(blocked, desk_ok, &mut out);
+            self.k.poll(blocked, desk_ok, self.t, &mut out);
             out
         }
         fn rel(&mut self, dx: i32, dy: i32) -> (Verdict, Vec<Action>) {
@@ -1508,7 +1986,7 @@ mod tests {
             let e = self.k.epoch;
             assert_eq!(
                 out,
-                vec![Action::Send(Msg::Enter { epoch: e, x: 0, y: 500 }), Action::HideCursor(e), Action::Driving(true)]
+                vec![Action::Send(Msg::Enter { epoch: e, x: 0, y: 500, prev: 0 }), Action::HideCursor(e), Action::Driving(true)]
             );
             assert!(self.k.driving());
             assert!(!self.k.parked());
@@ -1526,6 +2004,13 @@ mod tests {
         vec![Action::Send(Msg::Leave { epoch }), Action::SetCursor(land), Action::ShowCursor, Action::Driving(false)]
     }
 
+    /// 用户自己跨回本机（推回边、热键）：回家 + 马上提示“键盘”。
+    fn back_actions(epoch: u32, land: Point) -> Vec<Action> {
+        let mut v = home_actions(epoch, land);
+        v.push(Action::KbdHere);
+        v
+    }
+
     #[test]
     fn cross_right_edge_enters_and_parks() {
         let mut t = setup();
@@ -1539,7 +2024,7 @@ mod tests {
         let mut t = setup();
         let (v, out) = t.mv(1925, 500);
         assert_eq!(v, Verdict::Swallow);
-        assert_eq!(out[0], Action::Send(Msg::Enter { epoch: E0 + 1, x: 0, y: 500 }));
+        assert_eq!(out[0], Action::Send(Msg::Enter { epoch: E0 + 1, x: 0, y: 500, prev: 0 }));
     }
 
     #[test]
@@ -1611,7 +2096,7 @@ mod tests {
         let (v, out) = t.rel(-10, 4);
         assert_eq!(v, Verdict::Swallow);
         // 回到 (1919, 504)，往内挪一像素
-        assert_eq!(out, home_actions(e, Point::new(1918, 504)));
+        assert_eq!(out, back_actions(e, Point::new(1918, 504)));
         assert!(!t.k.driving());
         // 回来后，本机移动放行
         assert_eq!(t.mv(1900, 504), (Verdict::Pass, vec![]));
@@ -1710,7 +2195,7 @@ mod tests {
         t.rel(400, 200);
         let (v, out) = t.key(0x91, true);
         assert_eq!(v, Verdict::Swallow);
-        assert_eq!(out, home_actions(e, Point::new(1918, 300)));
+        assert_eq!(out, back_actions(e, Point::new(1918, 300)));
         // 热键的自动重复和抬起：吞掉，也不切换暂停
         assert_eq!(t.key(0x91, true), (Verdict::Swallow, vec![]));
         assert_eq!(t.key(0x91, false), (Verdict::Swallow, vec![]));
@@ -1818,10 +2303,10 @@ mod tests {
         t.msg(ToInput::PeerDown);
         assert_eq!(t.mv(1919, 500), (Verdict::Pass, vec![]));
 
-        t.msg(ToInput::PeerUp { name: "b".into(), desk: Desk::default() });
+        t.msg(ToInput::PeerUp { name: "b".into(), desk: Desk::default(), caps: 0 });
         assert_eq!(t.mv(1919, 500), (Verdict::Pass, vec![]));
 
-        t.msg(ToInput::PeerUp { name: "b".into(), desk: desk() });
+        t.msg(ToInput::PeerUp { name: "b".into(), desk: desk(), caps: 0 });
         t.cross();
     }
 
@@ -2044,7 +2529,7 @@ mod tests {
         // 松开后再推就回来
         t.mouse(MouseKind::Button(Button::Left, false), PARK, false);
         let (_, out) = t.rel(-5, 0);
-        assert_eq!(out, home_actions(e, Point::new(1918, 510)));
+        assert_eq!(out, back_actions(e, Point::new(1918, 510)));
     }
 
     #[test]
@@ -2111,5 +2596,481 @@ mod tests {
         // 只处理一次
         assert_eq!(t.key(0x5B, true), (Verdict::Pass, vec![]));
         assert_eq!(t.key(0x5B, false), (Verdict::Pass, vec![]));
+    }
+
+    // ───── 键盘跟随 ─────
+
+    /// 开了键盘跟随、对方也支持（caps 带 CAP_KBD）。时间离起点远一点，避开各种“刚刚”。
+    fn setup_follow() -> T {
+        let mut t = setup();
+        let mut cfg = Config::default();
+        cfg.input.kbd_follow = true;
+        t.msg(ToInput::Config(Box::new(cfg)));
+        t.msg(ToInput::PeerUp { name: "b".into(), desk: desk(), caps: crate::proto::CAP_KBD });
+        t.t += 5000;
+        t
+    }
+
+    fn kbd_enter(epoch: u32) -> Vec<Action> {
+        vec![Action::Send(Msg::KbdEnter { epoch, prev: 0 }), Action::KbdOut(true)]
+    }
+
+    fn kbd_leave(epoch: u32) -> Vec<Action> {
+        vec![Action::Send(Msg::KbdLeave { epoch }), Action::KbdOut(false)]
+    }
+
+    impl T {
+        /// 本机鼠标在本机移动一段（远离跨屏那条边）：位移 = |dx| + |dy|。
+        fn local_move(&mut self, dx: i32) -> (Verdict, Vec<Action>) {
+            self.t += 8;
+            let cur = Point::new(800, 500);
+            self.mouse_cur(MouseKind::Move, Point::new(800 + dx, 500), cur, false)
+        }
+        /// 对方鼠标在用，本机开始只转发键盘（断言开始了），返回这一轮的 epoch。
+        fn start_kbd(&mut self) -> u32 {
+            let e = self.k.epoch + 1;
+            assert_eq!(self.msg(ToInput::PeerActive(0)), kbd_enter(e));
+            assert!(self.k.kbd_out());
+            e
+        }
+    }
+
+    #[test]
+    fn peer_active_starts_kbd_forward_and_local_mouse_reclaims() {
+        let mut t = setup_follow();
+        let e = t.start_kbd();
+        // 键盘打到对方，光标照常在本机（不隐藏、不停放）
+        assert_eq!(
+            t.key(0x41, true),
+            (Verdict::Swallow, vec![Action::Send(Msg::Key { epoch: e, scan: 0x10, ext: false, vk: 0x41, down: true })])
+        );
+        t.key(0x41, false);
+        // 本机鼠标小动（累计 ≤ 24 像素）：照常放行，不收回
+        assert_eq!(t.local_move(10), (Verdict::Pass, vec![]));
+        assert_eq!(t.local_move(10), (Verdict::Pass, vec![]));
+        assert!(t.k.kbd_out());
+        // 累计超过 24：收回（马上提示“键盘”）并告诉对方本机鼠标在用
+        let (v, out) = t.local_move(10);
+        assert_eq!(v, Verdict::Pass);
+        let mut want = kbd_leave(e);
+        want.extend([Action::KbdHere, Action::Active(false)]);
+        assert_eq!(out, want);
+        assert!(!t.k.kbd_out());
+        // 打字时不再弹
+        assert_eq!(t.key(0x42, true), (Verdict::Pass, vec![]));
+    }
+
+    #[test]
+    fn click_reclaims_immediately_and_active_is_rate_limited() {
+        let mut t = setup_follow();
+        let e = t.start_kbd();
+        t.t += 8;
+        let (v, out) = t.mouse(MouseKind::Button(Button::Left, true), Point::new(800, 500), false);
+        assert_eq!(v, Verdict::Pass);
+        let mut want = kbd_leave(e);
+        want.extend([Action::KbdHere, Action::Active(false)]);
+        assert_eq!(out, want);
+        // 300ms 内不重发；之后再发
+        assert_eq!(t.local_move(100).1, vec![]);
+        t.t += 300;
+        assert_eq!(t.local_move(100).1, vec![Action::Active(false)]);
+        // 对方的键盘已经打到本机：不必再发
+        t.msg(ToInput::KbdIn(true));
+        t.t += 400;
+        assert_eq!(t.local_move(100).1, vec![]);
+    }
+
+    #[test]
+    fn no_active_without_peer_support_or_when_paused() {
+        let mut t = setup();
+        t.t += 5000;
+        // 对方不支持：照旧，什么都不发
+        assert_eq!(t.local_move(100).1, vec![]);
+        let mut t = setup_follow();
+        t.msg(ToInput::Pause(true));
+        t.t += 400;
+        assert_eq!(t.local_move(100).1, vec![]);
+        // 本机关了跟随也照样发 Active（对方的键盘跟不跟由对方的开关定）
+        let mut t = setup_follow();
+        t.msg(ToInput::Config(Box::new(Config::default())));
+        assert_eq!(t.local_move(100).1, vec![Action::Active(false)]);
+        // 但对方的 Active 本机不理
+        assert_eq!(t.msg(ToInput::PeerActive(0)), vec![]);
+        assert!(!t.k.kbd_out());
+    }
+
+    #[test]
+    fn kbd_start_guards_and_retry() {
+        // 本机刚打过字：先不交，300ms 后定时器补做
+        let mut t = setup_follow();
+        t.key(0x41, true);
+        t.key(0x41, false);
+        assert_eq!(t.msg(ToInput::PeerActive(0)), vec![]);
+        assert_eq!(t.poll(false, false), vec![]);
+        t.t += 300;
+        let e = t.k.epoch + 1;
+        assert_eq!(t.poll(false, true), kbd_enter(e));
+
+        // 按着键：不交；键松开后补做
+        let mut t = setup_follow();
+        t.held.borrow_mut()[0x10] = true;
+        assert_eq!(t.msg(ToInput::PeerActive(0)), vec![]);
+        t.t += 250;
+        assert_eq!(t.poll(false, true), vec![]);
+        t.held.borrow_mut()[0x10] = false;
+        t.t += 250;
+        let e = t.k.epoch + 1;
+        assert_eq!(t.poll(false, true), kbd_enter(e));
+
+        // 请求过期（1 秒）就作废
+        let mut t = setup_follow();
+        t.held.borrow_mut()[0x01] = true; // 鼠标左键按着（拖动中）
+        assert_eq!(t.msg(ToInput::PeerActive(0)), vec![]);
+        t.held.borrow_mut()[0x01] = false;
+        t.t += 1100;
+        assert_eq!(t.poll(false, true), vec![]);
+
+        // 本机鼠标刚在用：不交（两边同时动时别抢）
+        let mut t = setup_follow();
+        t.local_move(100);
+        assert_eq!(t.msg(ToInput::PeerActive(0)), vec![]);
+        // 之后本机鼠标又动：之前的请求作废
+        t.t += 300;
+        t.local_move(100);
+        t.t += 400;
+        assert_eq!(t.poll(false, true), vec![]);
+
+        // 暂停 / 管理员窗口 / 安全桌面 / 没开跟随 / 对方不支持：不交
+        for f in [
+            |t: &mut T| {
+                t.msg(ToInput::Pause(true));
+            },
+            |t: &mut T| {
+                t.poll(true, true);
+            },
+            |t: &mut T| {
+                t.poll(false, false);
+            },
+            |t: &mut T| {
+                t.msg(ToInput::Config(Box::new(Config::default())));
+            },
+            |t: &mut T| {
+                t.msg(ToInput::PeerUp { name: "b".into(), desk: desk(), caps: 0 });
+            },
+        ] {
+            let mut t = setup_follow();
+            f(&mut t);
+            let out = t.msg(ToInput::PeerActive(0));
+            assert!(!out.iter().any(|a| matches!(a, Action::Send(Msg::KbdEnter { .. }))), "{out:?}");
+            assert!(!t.k.kbd_out());
+        }
+    }
+
+    #[test]
+    fn reclaim_waits_for_forwarded_keys() {
+        let mut t = setup_follow();
+        let e = t.start_kbd();
+        t.key(0xA2, true); // LCtrl 转发给对方
+        // 本机鼠标在用，但 Ctrl 还按着：先不收回（组合键不拆到两台上）
+        assert_eq!(t.local_move(100).1, vec![]);
+        assert!(t.k.kbd_out());
+        // 组合键照常打到对方
+        assert_eq!(t.key(0x43, true).1, vec![Action::Send(Msg::Key { epoch: e, scan: 0x10, ext: false, vk: 0x43, down: true })]);
+        t.key(0x43, false);
+        // Ctrl 抬起：抬起发给对方，然后收回，并告诉对方本机鼠标在用
+        let mut want = vec![Action::Send(Msg::Key { epoch: e, scan: 0x10, ext: false, vk: 0xA2, down: false })];
+        want.extend(kbd_leave(e));
+        want.extend([Action::KbdHere, Action::Active(false)]);
+        assert_eq!(t.key(0xA2, false), (Verdict::Swallow, want));
+        assert!(!t.k.kbd_out());
+
+        // 一直按着：最多等 500ms
+        let mut t = setup_follow();
+        let e = t.start_kbd();
+        t.key(0xA0, true); // LShift
+        t.local_move(100);
+        t.t += 400;
+        assert_eq!(t.poll(false, true), vec![]);
+        t.t += 200;
+        let mut want = kbd_leave(e);
+        want.extend([Action::KbdHere, Action::Active(false)]);
+        assert_eq!(t.poll(false, true), want);
+        // 之后本机看到的 Shift 抬起要吞掉（本机没见过它按下）
+        assert_eq!(t.key(0xA0, false), (Verdict::Swallow, vec![]));
+    }
+
+    #[test]
+    fn hotkey_in_kbd_mode_reclaims_with_cooldown() {
+        let mut t = setup_follow();
+        let e = t.start_kbd();
+        assert_eq!(t.key(0x91, true), (Verdict::Swallow, [kbd_leave(e), vec![Action::KbdHere]].concat()));
+        assert_eq!(t.key(0x91, false), (Verdict::Swallow, vec![]));
+        assert!(!t.k.paused);
+        // 1.5 秒内对方再动也不交；之后可以
+        t.t += 500;
+        assert_eq!(t.msg(ToInput::PeerActive(0)), vec![]);
+        t.t += 1100;
+        let e = t.k.epoch + 1;
+        assert_eq!(t.msg(ToInput::PeerActive(0)), kbd_enter(e));
+    }
+
+    #[test]
+    fn driving_turns_into_kbd_forward_on_peer_active() {
+        let mut t = setup_follow();
+        t.held.borrow_mut()[0xA0] = true; // 跨屏时就按着 LShift
+        t.cross();
+        t.held.borrow_mut()[0xA0] = false;
+        let e = t.k.epoch;
+        t.key(0x41, true); // A 转发给对方，还按着
+        // 旧轮次的 Active 不理
+        assert_eq!(t.msg(ToInput::PeerActive(e - 1)), vec![]);
+        assert!(t.k.driving());
+        // 对方动了它自己的鼠标：光标回本机，键盘留在对方（新一轮；不单发 Leave，KbdEnter.prev 让对方把键接过去）
+        let mut want = home_actions(e, Point::new(1918, 500));
+        want.remove(0);
+        want.extend([Action::Send(Msg::KbdEnter { epoch: e + 1, prev: e }), Action::KbdOut(true)]);
+        assert_eq!(t.msg(ToInput::PeerActive(e)), want);
+        assert!(!t.k.driving() && t.k.kbd_out());
+        // 跨屏前就按着的 Shift：抬起照旧还给本机（不会卡在本机）
+        assert_eq!(t.key(0xA0, false), (Verdict::Pass, vec![]));
+        // 还按着的 A：自动重复发到对方新一轮（对方把它接到了新一轮，一直按着）
+        assert_eq!(
+            t.key(0x41, true),
+            (Verdict::Swallow, vec![Action::Send(Msg::Key { epoch: e + 1, scan: 0x10, ext: false, vk: 0x41, down: true })])
+        );
+        assert_eq!(t.key(0x41, false).0, Verdict::Swallow);
+    }
+
+    #[test]
+    fn driving_without_follow_treats_active_as_yield() {
+        let mut t = setup_follow();
+        t.msg(ToInput::Config(Box::new(Config::default())));
+        t.cross();
+        let e = t.k.epoch;
+        assert_eq!(t.msg(ToInput::PeerActive(e)), home_actions(e, Point::new(1918, 500)));
+        assert!(!t.k.kbd_out());
+    }
+
+    #[test]
+    fn crossing_from_kbd_mode_carries_keys() {
+        let mut t = setup_follow();
+        let e = t.start_kbd();
+        t.key(0xA2, true); // Ctrl 转发着
+        t.held.borrow_mut()[0xA2] = true;
+        t.t += 8;
+        t.mouse_cur(MouseKind::Move, Point::new(1000, 500), Point::new(1000, 500), false);
+        // 顶到边跨过去：只转发键盘直接转成驱动（Enter.prev，对方把 Ctrl 接过去，不单发 KbdLeave）；这一下不发 Active
+        t.t += 8;
+        let (v, out) = t.mouse_cur(MouseKind::Move, EDGE, Point::new(1900, 500), false);
+        assert_eq!(v, Verdict::Swallow);
+        let mut want = vec![Action::KbdOut(false)];
+        want.extend([
+            Action::Send(Msg::Enter { epoch: e + 1, x: 0, y: 500, prev: e }),
+            Action::HideCursor(e + 1),
+            Action::Driving(true),
+        ]);
+        assert_eq!(out, want);
+        // Ctrl 仍算“对方的”：抬起发给对方（不还给本机）
+        assert_eq!(
+            t.key(0xA2, false),
+            (Verdict::Swallow, vec![Action::Send(Msg::Key { epoch: e + 1, scan: 0x10, ext: false, vk: 0xA2, down: false })])
+        );
+    }
+
+    #[test]
+    fn kbd_forward_ends_on_events() {
+        type F = fn(&mut T) -> Vec<Action>;
+        let cases: [(F, bool, bool); 8] = [
+            // (事件, 发 KbdLeave, 弹“已收回”)
+            (|t| t.msg(ToInput::PeerDown), true, false),
+            (|t| t.msg(ToInput::Pause(true)), true, false),
+            (|t| t.msg(ToInput::GoHome), true, true),
+            (|t| t.msg(ToInput::PeerStale), true, true),
+            (|t| t.msg(ToInput::Driven(true)), true, false),
+            (|t| t.msg(ToInput::Quit), true, false),
+            (|t| t.msg(ToInput::Config(Box::new(Config::default()))), true, false),
+            (|t| t.poll(false, false), true, false),
+        ];
+        for (f, leave, lost) in cases {
+            let mut t = setup_follow();
+            let e = t.start_kbd();
+            let out = f(&mut t);
+            assert!(!t.k.kbd_out(), "{out:?}");
+            assert_eq!(out.contains(&Action::Send(Msg::KbdLeave { epoch: e })), leave, "{out:?}");
+            assert!(out.contains(&Action::KbdOut(false)), "{out:?}");
+            assert_eq!(out.contains(&Action::KbdLost), lost, "{out:?}");
+        }
+        // 前台是管理员窗口：收回并提示
+        let mut t = setup_follow();
+        let e = t.start_kbd();
+        let mut want = kbd_leave(e);
+        want.push(Action::Error { msg: FG_BLOCKED_MSG, on: true });
+        assert_eq!(t.poll(true, true), want);
+        // 改排布等重新加载（跟随仍开着）：不打断
+        let mut t = setup_follow();
+        t.start_kbd();
+        let mut cfg = Config::default();
+        cfg.input.kbd_follow = true;
+        assert_eq!(t.msg(ToInput::Config(Box::new(cfg))), vec![]);
+        assert!(t.k.kbd_out());
+    }
+
+    #[test]
+    fn peer_yield_for_kbd_round_reclaims_with_cooldown() {
+        let mut t = setup_follow();
+        let e = t.start_kbd();
+        // 旧轮次的不理
+        assert_eq!(t.msg(ToInput::Yield(e - 1)), vec![]);
+        let mut want = kbd_leave(e);
+        want.push(Action::KbdLost);
+        assert_eq!(t.msg(ToInput::Yield(e)), want);
+        t.t += 500;
+        assert_eq!(t.msg(ToInput::PeerActive(0)), vec![]);
+    }
+
+    #[test]
+    fn kbd_in_race_and_yield_back() {
+        // 两边同时开始互相转发：本机收到对方的 KbdEnter（KbdIn）就结束自己的
+        let mut t = setup_follow();
+        let e = t.start_kbd();
+        assert_eq!(t.msg(ToInput::KbdIn(true)), kbd_leave(e));
+        // 对方的键盘打到本机时：本机暂停（热键）→ 请对方收回
+        let (v, out) = t.key(0x91, true);
+        assert_eq!(v, Verdict::Swallow);
+        assert_eq!(out, vec![Action::Paused(true), Action::YieldKbd]);
+        // 前台是管理员窗口：请对方收回，只请一回
+        let mut t = setup_follow();
+        t.msg(ToInput::KbdIn(true));
+        assert_eq!(t.poll(true, true), vec![Action::YieldKbd, Action::KbdLost]);
+        assert_eq!(t.poll(true, true), vec![]);
+        // 锁屏：请对方收回，但本机看不到提示，不弹
+        let mut t = setup_follow();
+        t.msg(ToInput::KbdIn(true));
+        assert_eq!(t.poll(false, false), vec![Action::YieldKbd]);
+    }
+
+    #[test]
+    fn driven_with_follow_keys_stay_and_mouse_sends_active() {
+        let mut t = setup_follow();
+        t.msg(ToInput::Driven(true));
+        // 被控时本机按键：开了跟随不踢对方（键盘本来就该打在本机）
+        assert_eq!(t.key(0x41, true), (Verdict::Pass, vec![]));
+        // 本机鼠标动：对方支持就发 Active（对方回去，并把它的键盘转过来）
+        t.t += 8;
+        let out = t.mouse(MouseKind::Button(Button::Left, true), PARK, false).1;
+        assert_eq!(out, vec![Action::Active(true)]);
+    }
+
+    #[test]
+    fn keyboard_tip_when_keys_come_home() {
+        // 本机鼠标一在用就收回并马上弹“键盘”（没在对方打过字也弹），打字时不再弹
+        let mut t = setup_follow();
+        let e = t.start_kbd();
+        let mut want = kbd_leave(e);
+        want.extend([Action::KbdHere, Action::Active(false)]);
+        assert_eq!(t.local_move(100).1, want);
+        assert_eq!(t.key(0x42, true), (Verdict::Pass, vec![]));
+        // 还有转发出去没抬起的键：等它抬起，收回的那一刻弹
+        let mut t = setup_follow();
+        let e = t.start_kbd();
+        t.key(0x41, true);
+        assert!(!t.local_move(100).1.contains(&Action::KbdHere));
+        let (v, out) = t.key(0x41, false);
+        assert_eq!(v, Verdict::Swallow);
+        assert_eq!(out[1..4], [kbd_leave(e), vec![Action::KbdHere]].concat()[..]);
+        // 热键收回：也弹
+        let mut t = setup_follow();
+        let e = t.start_kbd();
+        let hk = t.k.hotkey as u32;
+        let (v, out) = t.key(hk, true);
+        assert_eq!(v, Verdict::Swallow);
+        assert_eq!(out, [kbd_leave(e), vec![Action::KbdHere]].concat());
+        // 对方鼠标过来（提示由本机 injector 弹）、只转发键盘时跨过去（键盘本来就在对方）：input 这边不弹
+        let mut t = setup_follow();
+        t.start_kbd();
+        assert!(!t.msg(ToInput::Driven(true)).contains(&Action::KbdHere));
+        let mut t = setup_follow();
+        t.start_kbd();
+        t.cross();
+        assert!(t.k.driving());
+    }
+
+    #[test]
+    fn injected_keys_not_taken_as_local_when_crossing() {
+        // 本机正收着对方的键盘（对方按着 Ctrl，注入在本机）：跨屏时这个 Ctrl 不算本机按着的
+        let mut t = setup_follow();
+        t.msg(ToInput::KbdIn(true));
+        t.held.borrow_mut()[0xA2] = true; // GetAsyncKeyState 报 Ctrl 按着（其实是注入的）
+        t.held.borrow_mut()[0xA0] = true; // Shift 是本机真按着的
+        t.key(0xA0, true);
+        t.cross();
+        let e = t.k.epoch;
+        // 本机自己按 Ctrl：照常转发（不会被当成“跨屏前就按着”吞掉）
+        assert_eq!(
+            t.key(0xA2, true),
+            (Verdict::Swallow, vec![Action::Send(Msg::Key { epoch: e, scan: 0x10, ext: false, vk: 0xA2, down: true })])
+        );
+        // 真按着的 Shift：抬起还给本机
+        assert_eq!(t.key(0xA0, false), (Verdict::Pass, vec![]));
+    }
+
+    #[test]
+    fn hotkey_pause_while_driven_with_follow_yields() {
+        let mut t = setup_follow();
+        t.msg(ToInput::Driven(true));
+        let (v, out) = t.key(0x91, true);
+        assert_eq!(v, Verdict::Swallow);
+        assert_eq!(out, vec![Action::Paused(true), Action::Yield]);
+    }
+
+    #[test]
+    fn pending_active_sent_after_admin_window_closes() {
+        let mut t = setup_follow();
+        t.poll(true, true); // 前台是管理员窗口
+        t.t += 8;
+        // 点一下：被挡住，记下
+        assert_eq!(t.mouse(MouseKind::Button(Button::Left, true), Point::new(800, 500), false).1, vec![]);
+        // 管理员窗口没了：补发
+        t.t += 250;
+        let out = t.poll(false, true);
+        assert!(out.contains(&Action::Active(false)), "{out:?}");
+        // 只补一次
+        t.t += 250;
+        assert!(!t.poll(false, true).contains(&Action::Active(false)));
+        // 超过 1 秒才恢复：不补
+        let mut t = setup_follow();
+        t.poll(true, true);
+        t.t += 8;
+        t.mouse(MouseKind::Button(Button::Left, true), Point::new(800, 500), false);
+        t.t += 1200;
+        assert!(!t.poll(false, true).contains(&Action::Active(false)));
+    }
+
+    #[test]
+    fn request_during_cooldown_survives_until_cooldown_ends() {
+        let mut t = setup_follow();
+        let e = t.start_kbd();
+        let mut want = kbd_leave(e);
+        want.push(Action::KbdLost);
+        assert_eq!(t.msg(ToInput::Yield(e)), want);
+        t.t += 100;
+        assert_eq!(t.msg(ToInput::PeerActive(0)), vec![]);
+        // 1 秒后请求本该过期，但冷却还没结束：留着；冷却一结束就开始
+        t.t += 1200;
+        assert_eq!(t.poll(false, true), vec![]);
+        t.t += 250;
+        let e2 = t.k.epoch + 1;
+        assert_eq!(t.poll(false, true), kbd_enter(e2));
+    }
+
+    #[test]
+    fn kbd_in_while_paused_or_stale_asks_peer_to_take_back() {
+        let mut t = setup_follow();
+        t.msg(ToInput::Pause(true));
+        assert_eq!(t.msg(ToInput::KbdIn(true)), vec![Action::YieldKbd]);
+        let mut t = setup_follow();
+        t.msg(ToInput::KbdIn(true));
+        assert_eq!(t.msg(ToInput::PeerStale), vec![Action::YieldKbd]);
+        assert_eq!(t.msg(ToInput::PeerStale), vec![]);
     }
 }

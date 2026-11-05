@@ -4,6 +4,12 @@
 //!
 //! 只说哪台电脑复制了。没同步成功（太大 / 密码类 / 对方未接收）不加字：图标由绿变琥珀，停稳后左右轻抖一下。
 //!
+//! 键盘跟随的提示（同一颗胶囊，设计稿 设计\灵动岛\键盘提示\ 变体 B）：
+//!   ( [⌨] 键盘 工位电脑 ) 键盘刚换到这台（动了这台的鼠标）就马上在这台弹，不等打字，后面是这台的名字（cfg.name，太长截短名字）
+//!                        两台同时只留一颗：一台弹了，另一台正显示的“键盘”马上收起（Msg::KbdTip；本机鼠标跨过去时本机先收）。
+//!   ( [⌨] 键盘 已收回 )  键盘被意外收回（断线、管理员窗口、锁屏）：琥珀图标，两台都弹；加强版警示——
+//!                        停留 KBD_HOLD_FAIL，抖得更明显（STRONG_AMP），隔一会儿再抖一次。
+//!
 //! 跑在 desktop 线程（有消息循环）。窗口：WS_EX_LAYERED | TOPMOST | TOOLWINDOW | NOACTIVATE | TRANSPARENT ——
 //! 不抢焦点、点击穿透。液态玻璃全在 CPU 上算（不引入 Direct2D/GDI+，省内存），参数见设计稿 设计\灵动岛\液态玻璃\glass.py：
 //!   弹出前（窗口还隐藏着）截下胶囊背后那块屏幕 → 三次盒式模糊（≈高斯）+ 提饱和度（只算一次）→
@@ -74,6 +80,54 @@ pub struct Note {
     pub kind: Kind,
     pub detail: String,
     pub ok: bool,
+}
+
+/// 胶囊左边的图标。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Icon {
+    /// 两张叠放的圆角方块（剪贴板）
+    Copy,
+    /// 键盘（键盘跟随）
+    Keyboard,
+}
+
+/// 实际显示的内容：粗体主词 + 常规后半句（可空）+ 图标；strong = 加强版警示（停更久、抖更明显、抖两次）。
+/// cut_verb：放不下时截短后半句（键盘提示的电脑名），否则截短主词（剪贴板的电脑名）。
+#[derive(Clone, Debug, PartialEq)]
+struct Tip {
+    word: String,
+    verb: String,
+    cut_verb: bool,
+    icon: Icon,
+    ok: bool,
+    strong: bool,
+}
+
+impl Tip {
+    fn clip(n: &Note) -> Tip {
+        Tip { word: n.who.clone(), verb: VERB.into(), cut_verb: false, icon: Icon::Copy, ok: n.ok, strong: false }
+    }
+
+    /// ok：“键盘 <本机名>”；否则“键盘 已收回”。
+    fn keyboard(ok: bool, here: &str) -> Tip {
+        let verb = if ok { here.trim().to_string() } else { "已收回".to_string() };
+        Tip { word: "键盘".into(), verb, cut_verb: true, icon: Icon::Keyboard, ok, strong: !ok }
+    }
+
+    /// 最小宽度：剪贴板沿用 MIN_W；键盘提示按内容来（“键盘”只有 80）。
+    fn min_w(&self) -> f32 {
+        if self.icon == Icon::Copy { MIN_W } else { H }
+    }
+
+    fn hold(&self) -> Duration {
+        if self.strong {
+            KBD_HOLD_FAIL
+        } else if self.ok {
+            HOLD
+        } else {
+            HOLD_FAIL
+        }
+    }
 }
 
 /// detail 最多这么多个字符（协议里截短用）。
@@ -185,6 +239,13 @@ const LEAVE_MS: f32 = 360.0;
 const HOLD: Duration = Duration::from_millis(1800);
 const HOLD_FAIL: Duration = Duration::from_millis(2200);
 const SHAKE_MS: f32 = 360.0;
+/// 键盘被意外收回：停留更久。
+const KBD_HOLD_FAIL: Duration = Duration::from_millis(4000);
+/// 加强版轻抖：幅度、时长、来回次数；第二次在 STRONG_AGAIN_MS 后再抖一次。
+const STRONG_AMP: f32 = 7.0;
+const STRONG_MS: f32 = 520.0;
+const STRONG_CYCLES: f32 = 4.0;
+const STRONG_AGAIN_MS: f32 = 1400.0;
 /// 换内容时宽度弹簧的时长（之后就当停稳）。
 const RESIZE_MS: f32 = 420.0;
 const FRAME_MS: u32 = 15;
@@ -271,11 +332,26 @@ fn leave(t: f32, wf: f32) -> Pose {
 
 /// 没同步成功的轻抖：t 毫秒。
 fn shake(t: f32) -> f32 {
-    if !(0.0..SHAKE_MS).contains(&t) {
+    burst(t, 4.0, SHAKE_MS, 3.0)
+}
+
+/// 一次衰减的左右抖动。
+fn burst(t: f32, amp: f32, dur: f32, cycles: f32) -> f32 {
+    if !(0.0..dur).contains(&t) {
         return 0.0;
     }
-    let u = t / SHAKE_MS;
-    4.0 * (std::f32::consts::TAU * 3.0 * u).sin() * (1.0 - u)
+    let u = t / dur;
+    amp * (std::f32::consts::TAU * cycles * u).sin() * (1.0 - u)
+}
+
+/// 加强版：抖得更明显，隔一会儿再抖一次（第二次稍弱）。
+fn shake_strong(t: f32) -> f32 {
+    burst(t, STRONG_AMP, STRONG_MS, STRONG_CYCLES) + burst(t - STRONG_AGAIN_MS, STRONG_AMP * 0.7, STRONG_MS, STRONG_CYCLES)
+}
+
+/// 抖动总时长（之后就当停稳）。
+fn shake_len(strong: bool) -> f32 {
+    if strong { STRONG_AGAIN_MS + STRONG_MS } else { SHAKE_MS }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -520,40 +596,45 @@ fn text_width(dc: HDC, f: HFONT, s: &[u16]) -> i32 {
     }
 }
 
-/// 名字（放不下就截短加省略号）和胶囊最终宽度（逻辑像素）。
-fn layout(name: &str, s: f32) -> Option<(Vec<u16>, f32)> {
+/// 主词（粗）、后半句（常规，可空）和胶囊最终宽度（逻辑像素）。放不下时截短一段加省略号：
+/// cut_verb 截后半句，否则截主词（主词为空时用“对方”）。后半句为空时不留词间距。
+fn layout(name: &str, verb: &str, cut_verb: bool, min_w: f32, s: f32) -> Option<(Vec<u16>, Vec<u16>, f32)> {
     let fonts = Fonts::new(s);
     let probe = Dib::new(1, 1)?;
-    let verb: Vec<u16> = VERB.encode_utf16().collect();
-    let vw = text_width(probe.dc, fonts.regular, &verb) as f32 / s;
-    let fixed = PAD_L + ICON + GAP + WORD_GAP + vw + PAD_R;
-    let mut chars: Vec<char> = name.trim().chars().collect();
-    if chars.is_empty() {
-        chars = "对方".chars().collect();
-    }
-    let full: String = chars.iter().collect();
-    let mut nm: Vec<u16> = full.encode_utf16().collect();
-    let mut nw = text_width(probe.dc, fonts.bold, &nm) as f32 / s;
-    while fixed + nw > MAX_W && chars.len() > 1 {
+    let w = |t: &[u16], f: HFONT| text_width(probe.dc, f, t) as f32 / s;
+    let name = if name.trim().is_empty() { "对方" } else { name.trim() };
+    let verb = verb.trim();
+    let total = |nm: &[u16], vb: &[u16]| {
+        let vw = if vb.is_empty() { 0.0 } else { WORD_GAP + w(vb, fonts.regular) };
+        PAD_L + ICON + GAP + w(nm, fonts.bold) + vw + PAD_R
+    };
+    let mut nm: Vec<u16> = name.encode_utf16().collect();
+    let mut vb: Vec<u16> = verb.encode_utf16().collect();
+    // 放不下：截短其中一段（一个字一个字去掉，加省略号）
+    let mut chars: Vec<char> = if cut_verb { verb.chars().collect() } else { name.chars().collect() };
+    while total(&nm, &vb) > MAX_W && chars.len() > 1 {
         chars.pop();
-        let t: String = chars.iter().collect::<String>() + "…";
-        nm = t.encode_utf16().collect();
-        nw = text_width(probe.dc, fonts.bold, &nm) as f32 / s;
+        let t: Vec<u16> = (chars.iter().collect::<String>() + "…").encode_utf16().collect();
+        if cut_verb {
+            vb = t;
+        } else {
+            nm = t;
+        }
     }
-    Some((nm, (fixed + nw).clamp(MIN_W, MAX_W)))
+    let wf = total(&nm, &vb).clamp(min_w, MAX_W);
+    Some((nm, vb, wf))
 }
 
-/// 画内容层：图标（绿/琥珀圆 + 白色“复制”图标）+ 名字（粗）+ “已复制”（常规）+ 文字晕影。
-fn draw_content(name: &[u16], wf: f32, s: f32, ok: bool, light: bool) -> Option<Content> {
+/// 画内容层：图标（绿/琥珀圆 + 白色线条图标）+ 主词（粗）+ 动词（常规，可空）+ 文字晕影。
+fn draw_content(name: &[u16], verb: &[u16], icon: Icon, wf: f32, s: f32, ok: bool, light: bool) -> Option<Content> {
     let cw = (wf * s).ceil() as i32 + 2;
     let chh = (H * s).ceil() as i32 + 2;
     let (cwu, chu) = (cw as usize, chh as usize);
-    // 文字蒙版：名字和“已复制”分开画（颜色/透明度不同）
+    // 文字蒙版：主词和动词分开画（颜色/透明度不同）
     let fonts = Fonts::new(s);
-    let verb: Vec<u16> = VERB.encode_utf16().collect();
     let tx = ((PAD_L + ICON + GAP) * s).round() as i32;
     let mut masks = Vec::new();
-    for (txt, f, x) in [(name, fonts.bold, tx), (&verb[..], fonts.regular, 0)] {
+    for (txt, f, x) in [(name, fonts.bold, tx), (verb, fonts.regular, 0)] {
         let mut m = Dib::new(cw, chh)?;
         let x = if masks.is_empty() {
             x
@@ -623,12 +704,26 @@ fn draw_content(name: &[u16], wf: f32, s: f32, ok: bool, light: bool) -> Option<
             }
             let p = &mut px[y * cwu + x];
             over(p, icol, cov);
-            // 后一张：描边，被前一张（加描边宽的实心）盖住的部分不画
-            let back = sat(0.5 - ((sq(fx, fy, 5.6, 5.6)).abs() - sw / 2.0));
-            let front_fill = sat(0.5 - (sq(fx, fy, 8.8, 8.8) - sw));
-            let front = sat(0.5 - ((sq(fx, fy, 8.8, 8.8)).abs() - sw / 2.0));
-            over(p, [1.0, 1.0, 1.0], back * (1.0 - front_fill) * cov);
-            over(p, [1.0, 1.0, 1.0], front * cov);
+            match icon {
+                Icon::Copy => {
+                    // 后一张：描边，被前一张（加描边宽的实心）盖住的部分不画
+                    let back = sat(0.5 - ((sq(fx, fy, 5.6, 5.6)).abs() - sw / 2.0));
+                    let front_fill = sat(0.5 - (sq(fx, fy, 8.8, 8.8) - sw));
+                    let front = sat(0.5 - ((sq(fx, fy, 8.8, 8.8)).abs() - sw / 2.0));
+                    over(p, [1.0, 1.0, 1.0], back * (1.0 - front_fill) * cov);
+                    over(p, [1.0, 1.0, 1.0], front * cov);
+                }
+                Icon::Keyboard => {
+                    // 22 单位画布：描边外框 12.4×8（圆角 2）+ 上排 4 个、下排 2 个 1.5 见方的小键 + 中间空格键
+                    let k = |v: f32| v * u;
+                    let mut d = sd_rrect(fx, fy, icx, icy, k(6.2), k(4.0), k(2.0)).abs() - sw / 2.0;
+                    for (kx, ky) in [(7.4, 9.75), (9.8, 9.75), (12.2, 9.75), (14.6, 9.75), (7.4, 12.25), (14.6, 12.25)] {
+                        d = d.min(sd_rrect(fx, fy, icx + k(kx - 11.0), icy + k(ky - 11.0), k(0.75), k(0.75), k(0.4)));
+                    }
+                    d = d.min(sd_rrect(fx, fy, icx, icy + k(1.25), k(1.95), k(0.75), k(0.75)));
+                    over(p, [1.0, 1.0, 1.0], sat(0.5 - d) * cov);
+                }
+            }
         }
     }
     // 文字
@@ -856,7 +951,7 @@ struct Island {
     phase: Phase,
     hold: Duration,
     /// 正在显示的提示
-    note: Option<Note>,
+    note: Option<Tip>,
 }
 
 thread_local! {
@@ -868,7 +963,37 @@ pub fn show(note: &Note) {
     if busy_fullscreen() {
         return;
     }
-    with_island(|is| is.present(note));
+    with_island(|is| is.present(&Tip::clip(note)));
+}
+
+/// 键盘跟随提示：ok = 键盘打到了这台（“键盘 <here>”，here = 本机名）；否则键盘被意外收回
+/// （“键盘 已收回”，加强版警示）。只能在 desktop 线程调用。
+pub fn keyboard(ok: bool, here: &str) {
+    if busy_fullscreen() {
+        return;
+    }
+    with_island(|is| is.present(&Tip::keyboard(ok, here)));
+}
+
+/// 收起正显示的“键盘 <本机名>”（用户到另一台干活了，那台弹它自己的）：两台同时只留一颗。
+/// 停着的收起（正常收起动画）；还在长出来的直接隐藏；别的提示（剪贴板、“键盘 已收回”）不动。
+pub fn keyboard_gone() {
+    ISLAND.with(|cell| {
+        // 从没弹过就没有窗口：不为收起而建窗口
+        let Ok(mut g) = cell.try_borrow_mut() else { return };
+        let Some(is) = g.as_mut() else { return };
+        if !is.note.as_ref().is_some_and(|n| n.icon == Icon::Keyboard && n.ok) {
+            return;
+        }
+        match is.phase {
+            Phase::Appear { .. } => is.hide(),
+            Phase::Hold { .. } => {
+                is.phase = Phase::Leave { start: Instant::now() };
+                is.tick();
+            }
+            Phase::Hidden | Phase::Leave { .. } => {}
+        }
+    });
 }
 
 /// 本机刚弹的“已复制”其实没被对方接收：还显示着就原地改成没同步成功（琥珀图标 + 轻抖）。
@@ -878,11 +1003,12 @@ pub fn fail_own(name: &str, detail: &str) {
         if !matches!(is.phase, Phase::Appear { .. } | Phase::Hold { .. }) {
             return;
         }
+        let _ = detail;
         let Some(n) = is.note.as_ref() else { return };
-        if !n.ok || n.who != name {
+        if n.icon != Icon::Copy || !n.ok || n.word != name {
             return;
         }
-        let n = Note { ok: false, detail: detail.to_string(), ..n.clone() };
+        let n = Tip { ok: false, ..n.clone() };
         is.present(&n);
     });
 }
@@ -980,7 +1106,7 @@ impl Island {
         (((MAX_W * 1.05 + 2.0 * MARGIN) * s).ceil() as i32, ((H + 2.0 * MARGIN) * s).ceil() as i32)
     }
 
-    fn present(&mut self, note: &Note) {
+    fn present(&mut self, note: &Tip) {
         let fresh = matches!(self.phase, Phase::Hidden);
         if fresh {
             // 新弹出：定位、截背景
@@ -1011,7 +1137,7 @@ impl Island {
             }
         }
         let s = self.s;
-        let Some((name, wf)) = layout(&note.who, s) else { return };
+        let Some((name, verb, wf)) = layout(&note.word, &note.verb, note.cut_verb, note.min_w(), s) else { return };
         let old_wf = self.wf;
         self.wf = wf;
         if fresh {
@@ -1021,11 +1147,11 @@ impl Island {
             self.light = light;
             self.tint_a = a;
         }
-        self.content = draw_content(&name, wf, s, note.ok, self.light);
+        self.content = draw_content(&name, &verb, note.icon, wf, s, note.ok, self.light);
         if self.content.is_none() {
             return;
         }
-        self.hold = if note.ok { HOLD } else { HOLD_FAIL };
+        self.hold = note.hold();
         let was_ok = self.note.as_ref().is_none_or(|n| n.ok);
         self.note = Some(note.clone());
         let now = Instant::now();
@@ -1055,6 +1181,7 @@ impl Island {
         let ms = |t: Instant| now.saturating_duration_since(t).as_secs_f32() * 1000.0;
         let wf = self.wf;
         let fail = self.note.as_ref().is_some_and(|n| !n.ok);
+        let strong = self.note.as_ref().is_some_and(|n| n.strong);
         let (pose, next) = loop {
             match self.phase {
                 Phase::Hidden => return,
@@ -1082,8 +1209,8 @@ impl Island {
                     }
                     if let Some(t0) = sh {
                         let t = ms(t0);
-                        if t < SHAKE_MS {
-                            p.dx = shake(t);
+                        if t < shake_len(strong) {
+                            p.dx = if strong { shake_strong(t) } else { shake(t) };
                             animating = true;
                         }
                     }
@@ -1211,7 +1338,7 @@ mod tests {
             let (ww, wh) = Island::win_size(scale);
             let (wu, hu) = (ww as usize, wh as usize);
             let bd = Backdrop { w: wu, h: hu, blurred: vec![bgc; wu * hu], mean_lum: lum(bgc) };
-            let (name, wf) = layout("WiFi电脑", scale).expect("layout");
+            let (name, verb, wf) = layout("WiFi电脑", VERB, false, MIN_W, scale).expect("layout");
             assert!((MIN_W..=MAX_W).contains(&wf));
             let (light, a) = choose_glass(&bd, wu as f32 / 2.0, hu as f32 / 2.0, wf, scale);
             // 明显亮 / 明显暗时浅深玻璃是定的；中间调（橙色）两种都可能
@@ -1219,7 +1346,7 @@ mod tests {
                 assert_eq!(light, lum(bgc) > 0.5, "bg {bgc:?}");
             }
             assert!((LIGHT.a.min(DARK.a)..=A_MAX + 0.02).contains(&a));
-            let content = draw_content(&name, wf, scale, true, light).expect("content");
+            let content = draw_content(&name, &verb, Icon::Copy, wf, scale, true, light).expect("content");
             let f = Frame { bd: &bd, content: &content, light, tint_a: a, s: scale, cx: wu as f32 / 2.0, cy: hu as f32 / 2.0 };
             let mut out = vec![0u8; wu * hu * 4];
             f.draw(Pose { w: wf, h: H, alpha: 1.0, content: 1.0, dy: 0.0, dx: 0.0 }, &mut out);
@@ -1229,6 +1356,91 @@ mod tests {
             assert_eq!(out[3], 0);
             // 预乘：颜色不超过 alpha
             assert!(out.chunks_exact(4).all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3]));
+        }
+    }
+
+    #[test]
+    fn keyboard_tip_layout_and_shake() {
+        let lay = |t: &Tip| layout(&t.word, &t.verb, t.cut_verb, t.min_w(), 1.0).expect("layout");
+        // “键盘 工位电脑”：不受剪贴板的 MIN_W 限制，名字跟在后面
+        let (word, verb, w_ok) = lay(&Tip::keyboard(true, "工位电脑"));
+        assert_eq!(String::from_utf16_lossy(&word), "键盘");
+        assert_eq!(String::from_utf16_lossy(&verb), "工位电脑");
+        assert!((120.0..160.0).contains(&w_ok), "{w_ok}");
+        let (_, verb, w_fail) = lay(&Tip::keyboard(false, "工位电脑"));
+        assert_eq!(String::from_utf16_lossy(&verb), "已收回");
+        assert!(w_fail < w_ok, "{w_fail}");
+        // 名字太长：截短名字，“键盘”留着
+        let (word, verb, w_long) = lay(&Tip::keyboard(true, &"很长的名字".repeat(10)));
+        assert_eq!(String::from_utf16_lossy(&word), "键盘");
+        assert!(String::from_utf16_lossy(&verb).ends_with('…'));
+        assert!(w_long <= MAX_W);
+        // 剪贴板照旧（截主词）
+        let (_, _, w_clip) = layout("A", VERB, false, MIN_W, 1.0).expect("layout");
+        assert_eq!(w_clip, MIN_W);
+        let (nm, vb, _) = layout(&"名".repeat(60), VERB, false, MIN_W, 1.0).expect("layout");
+        assert!(String::from_utf16_lossy(&nm).ends_with('…'));
+        assert_eq!(String::from_utf16_lossy(&vb), VERB);
+        // 加强版：停得更久，抖两次，幅度更大
+        assert!(Tip::keyboard(false, "x").hold() > HOLD_FAIL);
+        assert_eq!(Tip::keyboard(true, "x").hold(), HOLD);
+        let peak = |f: fn(f32) -> f32, from: f32, to: f32| (from as i32..to as i32).map(|t| f(t as f32).abs()).fold(0.0, f32::max);
+        assert!(peak(shake_strong, 0.0, STRONG_MS) > peak(shake, 0.0, SHAKE_MS) + 1.5);
+        assert!(peak(shake_strong, STRONG_AGAIN_MS, STRONG_AGAIN_MS + STRONG_MS) > 2.0);
+        assert_eq!(shake_strong(STRONG_AGAIN_MS - 100.0), 0.0);
+        assert_eq!(shake_strong(shake_len(true) + 1.0), 0.0);
+        for ok in [true, false] {
+            let t = Tip::keyboard(ok, "机械革命");
+            let (word, verb, wf) = layout(&t.word, &t.verb, true, H, 1.5).expect("layout");
+            assert!(draw_content(&word, &verb, Icon::Keyboard, wf, 1.5, ok, true).is_some());
+        }
+    }
+
+    /// 手动看效果：cargo test dump_keyboard_tips -- --ignored，输出到 %TEMP%\kmlink-island-*.bmp。
+    #[test]
+    #[ignore]
+    fn dump_keyboard_tips() {
+        let scale = 2.0f32;
+        for (tag, bgc) in [("light", [0.95, 0.95, 0.96]), ("dark", [0.06, 0.08, 0.14])] {
+            for (verb, ok) in [("工位电脑", true), ("已收回", false)] {
+                let (ww, wh) = Island::win_size(scale);
+                let (wu, hu) = (ww as usize, wh as usize);
+                let bd = Backdrop { w: wu, h: hu, blurred: vec![bgc; wu * hu], mean_lum: lum(bgc) };
+                let (name, verb, wf) = layout("键盘", verb, true, H, scale).unwrap();
+                let (light, a) = choose_glass(&bd, wu as f32 / 2.0, hu as f32 / 2.0, wf, scale);
+                let content = draw_content(&name, &verb, Icon::Keyboard, wf, scale, ok, light).unwrap();
+                let f = Frame { bd: &bd, content: &content, light, tint_a: a, s: scale, cx: wu as f32 / 2.0, cy: hu as f32 / 2.0 };
+                let mut out = vec![0u8; wu * hu * 4];
+                f.draw(Pose { w: wf, h: H, alpha: 1.0, content: 1.0, dy: 0.0, dx: 0.0 }, &mut out);
+                // 合成到背景上，写 24 位 BMP（自底向上）
+                let mut bmp = Vec::new();
+                let row = (wu * 3 + 3) & !3;
+                let size = 54 + row * hu;
+                bmp.extend_from_slice(b"BM");
+                bmp.extend_from_slice(&(size as u32).to_le_bytes());
+                bmp.extend_from_slice(&[0; 4]);
+                bmp.extend_from_slice(&54u32.to_le_bytes());
+                bmp.extend_from_slice(&40u32.to_le_bytes());
+                bmp.extend_from_slice(&(wu as i32).to_le_bytes());
+                bmp.extend_from_slice(&(hu as i32).to_le_bytes());
+                bmp.extend_from_slice(&1u16.to_le_bytes());
+                bmp.extend_from_slice(&24u16.to_le_bytes());
+                bmp.extend_from_slice(&[0; 24]);
+                for y in (0..hu).rev() {
+                    let mut r = Vec::with_capacity(row);
+                    for x in 0..wu {
+                        let p = &out[(y * wu + x) * 4..][..4];
+                        let k = 1.0 - p[3] as f32 / 255.0;
+                        for (c, bgv) in [(p[0], bgc[2]), (p[1], bgc[1]), (p[2], bgc[0])] {
+                            r.push((c as f32 + bgv * 255.0 * k).round().clamp(0.0, 255.0) as u8);
+                        }
+                    }
+                    r.resize(row, 0);
+                    bmp.extend_from_slice(&r);
+                }
+                let path = std::env::temp_dir().join(format!("kmlink-island-{tag}-{}.bmp", if ok { "ok" } else { "lost" }));
+                std::fs::write(&path, bmp).unwrap();
+            }
         }
     }
 }
