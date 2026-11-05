@@ -19,7 +19,7 @@
 //!    右“通用”——剪贴板同步 / 复制提示 / 开机自启三个开关，点了立即写配置。
 //!    输入框（对方 IP、密钥、名字）按回车或失焦时校验：对就写入；不对则该行提示变红、输入框红圈。输入框用真的 EDIT 控件
 //!    （光标、选择、中文输入法、粘贴都靠它），平时隐藏，点到哪个框才盖上去。
-//! 3. 状态：每 500ms 读 status.json（主程序写；connected 为真且 pid 还活着才算已连接）、peer.json、config.toml（改了就重新读入）。
+//! 3. 状态：每 500ms 读 status.json（主程序写；connected 为真、主程序互斥量在且 pid 还活着才算已连接）、peer.json、config.toml（改了就重新读入）。
 //!
 //! 只允许一个设置窗口（命名互斥量 Local\kmlink-settings），再打开就把已有的窗口提到前面。
 //! 所有窗口坐标是物理像素（进程已 PerMonitorV2）；布局常量是 96 DPI 下的逻辑像素，乘 s = dpi/96。
@@ -49,12 +49,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, FindWindowW,
-    GetClientRect, GetMessageW, GetWindowTextLengthW, GetWindowTextW, HICON, HMENU, ICONINFO, IDC_ARROW, IDC_HAND, IDC_IBEAM,
-    IDC_SIZEALL, IsIconic, KillTimer, LoadCursorW, MSG, MoveWindow, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_RESTORE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
-    WM_SETCURSOR, WM_SETFONT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
+    GetClientRect, GetForegroundWindow, GetMessageW, GetWindowTextLengthW, GetWindowTextW, HICON, HMENU, ICONINFO, IDC_ARROW,
+    IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IsIconic, KillTimer, LoadCursorW, MSG, MoveWindow, PostQuitMessage, RegisterClassExW, SW_HIDE,
+    SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetCursor, SetForegroundWindow, SetTimer, SetWindowPos,
+    SetWindowTextW, ShowWindow, TranslateMessage, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CAPTURECHANGED,
+    WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
     WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
 };
 use windows::core::{BOOL, PCWSTR, s, w};
@@ -188,6 +188,19 @@ fn status_text(l: &Layout) -> String {
 fn clean_name(s: &str) -> Option<String> {
     let t = s.trim();
     if t.is_empty() || t.chars().count() > NAME_MAX || t.chars().any(char::is_control) { None } else { Some(t.to_string()) }
+}
+
+/// 输入框提交时和打开时相比没改：按字段规范化后比较（名字按 clean_name、IP 去首尾空白、密钥去空白转小写）。
+fn edit_unchanged(f: Field, text: &str, orig: &str) -> bool {
+    let key = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+    match f {
+        Field::Ip => text.trim() == orig.trim(),
+        Field::Key => key(text) == key(orig),
+        Field::LocalName | Field::PeerName => match (clean_name(text), clean_name(orig)) {
+            (Some(a), Some(b)) => a == b,
+            _ => text.trim() == orig.trim(),
+        },
+    }
 }
 
 /// 密钥只显示首尾：“982e0241…2895a8b”。
@@ -676,6 +689,10 @@ struct App {
     edit: Option<Field>,
     /// 名字输入框里当前的字（量宽度用）
     edit_text: String,
+    /// 打开输入框时框里的字：提交时没改就什么都不写（免得拿旧值盖掉期间别处改的新值）
+    edit_orig: String,
+    /// 窗口是否在前台（WM_ACTIVATE）。切走时输入框失焦不算提交，留着草稿，切回来焦点还给它
+    active: bool,
     draft_ip: Option<String>,
     draft_key: Option<String>,
     err_ip: Option<&'static str>,
@@ -1509,11 +1526,12 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// 读 status.json：(已连接, 对方名字)。
+/// 读 status.json：(已连接, 对方名字)。主程序的互斥量还在、且写文件的 pid 还活着才算已连接
+/// （主程序异常退出留下的旧文件 + pid 被别的进程复用时，单看 pid 会误报）。
 fn read_status() -> (bool, String) {
     let Ok(s) = std::fs::read_to_string(config::dir().join("status.json")) else { return (false, String::new()) };
     match parse_status(&s) {
-        Some((pid, c, name)) => (c && pid_alive(pid), name),
+        Some((pid, c, name)) => (c && sys::daemon_running() && pid_alive(pid), name),
         None => (false, String::new()),
     }
 }
@@ -1921,7 +1939,8 @@ pub fn run() {
             SendMessageW(*h, WM_SETFONT, Some(WPARAM(f.h.0 as usize)), Some(LPARAM(0)));
         }
         let mine = local_monitors();
-        let sw = [cfg.clipboard.enabled, cfg.clipboard.notify, cfg.autostart];
+        // 开机自启以注册表为准（主程序没在跑时 config 里的值可能没生效）
+        let sw = [cfg.clipboard.enabled, cfg.clipboard.notify, sys::autostart_get().is_some()];
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
                 hwnd,
@@ -1951,6 +1970,8 @@ pub fn run() {
                 tracking: false,
                 edit: None,
                 edit_text: String::new(),
+                edit_orig: String::new(),
+                active: false,
                 draft_ip: None,
                 draft_key: None,
                 err_ip: None,
@@ -2119,6 +2140,7 @@ fn activate(f: Field) {
         a.edit = Some(f);
         a.err_name = false;
         a.edit_text = text.clone();
+        a.edit_orig = text.clone();
         Some((a.edits[f.slot()], text))
     }) else {
         return;
@@ -2163,6 +2185,8 @@ fn finish(f: Field, commit: bool, enter: bool) {
         if a.edit != Some(f) {
             return None;
         }
+        // 没改过的框提交时什么都不写（不合法的草稿照旧留着红字）
+        let unchanged = edit_unchanged(f, &text, &a.edit_orig);
         let out = if !commit {
             match f {
                 Field::Ip => {
@@ -2190,7 +2214,7 @@ fn finish(f: Field, commit: bool, enter: bool) {
                         None => {
                             a.draft_ip = None;
                             a.err_ip = None;
-                            Outcome::SetPeer(text.trim().to_string())
+                            if unchanged { Outcome::Done } else { Outcome::SetPeer(text.trim().to_string()) }
                         }
                         Some(e) => {
                             a.err_ip = Some(e);
@@ -2208,7 +2232,7 @@ fn finish(f: Field, commit: bool, enter: bool) {
                     if config::parse_key(&k).is_some() {
                         a.draft_key = None;
                         a.err_key = None;
-                        Outcome::SetKey(k.to_ascii_lowercase())
+                        if unchanged { Outcome::Done } else { Outcome::SetKey(k.to_ascii_lowercase()) }
                     } else {
                         a.err_key = Some("须为 64 位十六进制");
                         if enter {
@@ -2221,14 +2245,14 @@ fn finish(f: Field, commit: bool, enter: bool) {
                 }
                 Field::LocalName | Field::PeerName => match clean_name(&text) {
                     Some(n) if f == Field::LocalName => {
-                        if n == a.local_name() {
+                        if unchanged || n == a.local_name() {
                             Outcome::Done
                         } else {
                             Outcome::SetName(n)
                         }
                     }
                     Some(n) => {
-                        if !a.connected || n == a.peer_name() {
+                        if !a.connected || unchanged || n == a.peer_name() {
                             Outcome::Done
                         } else {
                             Outcome::Rename(n)
@@ -2294,7 +2318,8 @@ fn poll() {
     let (connected, status_name) = read_status();
     let peer = read_peer();
     let mt = cfg_mtime();
-    let reload = with_app(|a| a.cfg_mtime != mt).unwrap_or(false);
+    // 拖动 / 落位动画中先不重新读入（也不记下新的修改时间），结束后第一次轮询再读，免得丢掉对方改的排布
+    let reload = with_app(|a| a.cfg_mtime != mt && a.drag.is_none() && a.drop.is_none()).unwrap_or(false);
     let new_cfg = if reload { Config::load() } else { None };
     let r = with_app(|a| {
         let before = (a.connected, a.status_name.clone(), a.peer_file_name.clone(), a.peer.clone(), a.rename_pending.is_some());
@@ -2329,11 +2354,10 @@ fn poll() {
                         a.sw_t[i] = Some(Instant::now());
                     }
                 }
-                if !busy {
-                    let mut l = c.layout.layout;
-                    l.scale = sanitize_scale(l.scale);
-                    a.layout = l;
-                }
+                // reload 只在不拖动时发生
+                let mut l = c.layout.layout;
+                l.scale = sanitize_scale(l.scale);
+                a.layout = l;
                 a.cfg = c;
             }
         }
@@ -2442,11 +2466,26 @@ fn on_click(hot: Hot) {
                 a.sw[i]
             });
             if let Some(v) = v {
-                write_cfg(|c| match i {
-                    0 => c.clipboard.enabled = v,
-                    1 => c.clipboard.notify = v,
-                    _ => c.autostart = v,
-                });
+                match i {
+                    0 => {
+                        write_cfg(|c| c.clipboard.enabled = v);
+                    }
+                    1 => {
+                        write_cfg(|c| c.clipboard.notify = v);
+                    }
+                    _ => {
+                        // 开机自启：直接改注册表（主程序没在跑也要生效），开关和配置都按实际结果来
+                        sys::autostart_set(v);
+                        let actual = sys::autostart_get().is_some();
+                        if actual != v {
+                            with_app(|a| {
+                                a.sw[2] = actual;
+                                a.sw_t[2] = Some(Instant::now());
+                            });
+                        }
+                        write_cfg(|c| c.autostart = actual);
+                    }
+                }
             }
         }
         Hot::Minus => on_scale(-1),
@@ -2484,6 +2523,8 @@ fn on_click(hot: Hot) {
 
 fn on_down(hwnd: HWND, x: f32, y: f32) {
     let Some((hot, editing, popover)) = with_app(|a| {
+        // 每次按下都从头算：上次在窗口外松手留下的 press 不能带到这次
+        a.press = Hot::None;
         let sc = scene(a);
         (hit(a, &sc, x, y), a.edit, a.popover)
     }) else {
@@ -2525,7 +2566,12 @@ fn on_down(hwnd: HWND, x: f32, y: f32) {
         Hot::NamePeer => activate(Field::PeerName),
         Hot::None | Hot::Pop => {}
         h => {
-            with_app(|a| a.press = h);
+            // 捕获鼠标：在窗口外松手也能收到 WM_LBUTTONUP，把 press 清掉
+            if with_app(|a| a.press = h).is_some() {
+                unsafe {
+                    SetCapture(hwnd);
+                }
+            }
         }
     }
     refresh();
@@ -2594,19 +2640,28 @@ fn on_up(x: f32, y: f32) {
                 a.layout.offset = offset;
                 a.drop = Some(DropAnim { from: d.pos, view0: d.view, t0: Instant::now() });
             }
-            return (true, Hot::None);
+            return (true, Hot::None, false);
         }
         let sc = scene(a);
         let h = hit(a, &sc, x, y);
         let pressed = std::mem::replace(&mut a.press, Hot::None);
-        (false, if pressed == h { h } else { Hot::None })
+        (false, if pressed == h { h } else { Hot::None }, pressed != Hot::None)
     });
     match r {
-        Some((true, _)) => unsafe {
+        Some((true, _, _)) => unsafe {
             let _ = ReleaseCapture();
             refresh();
         },
-        Some((false, h)) if h != Hot::None => on_click(h),
+        Some((false, h, captured)) => {
+            if captured {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+            }
+            if h != Hot::None {
+                on_click(h);
+            }
+        }
         _ => {}
     }
 }
@@ -2770,12 +2825,19 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 LRESULT(0)
             }
             WM_CAPTURECHANGED => {
-                // 捕获被意外拿走：放弃这次拖动
-                if with_app(|a| a.drag.take().is_some()).unwrap_or(false) {
+                // 捕获被意外拿走：放弃这次拖动 / 按下（on_up 自己放捕获时两者都已清空）
+                if with_app(|a| {
+                    let pressed = std::mem::replace(&mut a.press, Hot::None) != Hot::None;
+                    a.drag.take().is_some() || pressed
+                })
+                .unwrap_or(false)
+                {
                     refresh();
                 }
                 LRESULT(0)
             }
+            // 光标在子窗口（输入框）上：返回 FALSE 让 EDIT 自己设成 I 形光标，别用父窗口的 hover 盖掉
+            WM_SETCURSOR if HWND(wp.0 as *mut _) != hwnd => LRESULT(0),
             WM_SETCURSOR if (lp.0 as usize & 0xFFFF) == HTCLIENT => {
                 let c = with_app(|a| {
                     if a.drag.as_ref().is_some_and(|d| d.active) {
@@ -2795,6 +2857,21 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             WM_TIMER => {
                 on_timer(hwnd, wp.0);
                 LRESULT(0)
+            }
+            WM_ACTIVATE => {
+                let on = (wp.0 & 0xFFFF) as u32 != WA_INACTIVE;
+                // 先记下前后台（随后的 EN_KILLFOCUS 要看）
+                let edit = with_app(|a| {
+                    a.active = on;
+                    a.edit.filter(|_| on).map(|f| a.edits[f.slot()])
+                })
+                .flatten();
+                // 默认处理会把焦点给主窗口；之后若还有开着的输入框（切走时留下的草稿），把焦点还给它
+                let r = DefWindowProcW(hwnd, msg, wp, lp);
+                if let Some(h) = edit {
+                    let _ = SetFocus(Some(h));
+                }
+                r
             }
             WM_COMMAND => {
                 let id = (wp.0 & 0xFFFF) as i32;
@@ -2819,9 +2896,13 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                             refresh();
                         }
                     } else if code == EN_KILLFOCUS
-                        && let Some(Some(f)) = with_app(|a| a.edit.filter(|f| f.slot() == slot))
+                        && let Some((Some(f), active)) = with_app(|a| (a.edit.filter(|f| f.slot() == slot), a.active))
                     {
-                        finish(f, true, false);
+                        // 窗口被切走（Alt+Tab、最小化）引起的失焦：不提交，框和草稿留着，切回来接着改。
+                        // 只有焦点在窗口内移走才提交（回车另走 on_key）。
+                        if active && GetForegroundWindow() == hwnd {
+                            finish(f, true, false);
+                        }
                     }
                 }
                 LRESULT(0)
@@ -3047,6 +3128,25 @@ mod tests {
         assert_eq!(clean_name(&"字".repeat(16)).as_deref(), Some("字".repeat(16).as_str()));
         assert_eq!(clean_name(&"字".repeat(17)), None);
         assert_eq!(clean_name("a\tb"), None);
+    }
+
+    #[test]
+    fn unchanged_edit() {
+        // 名字：首尾空白不算改
+        assert!(edit_unchanged(Field::LocalName, " 书房 ", "书房"));
+        assert!(edit_unchanged(Field::PeerName, "WiFi电脑", "WiFi电脑 "));
+        assert!(!edit_unchanged(Field::LocalName, "书房2", "书房"));
+        // 不合法的名字只和同样的字相等
+        assert!(edit_unchanged(Field::PeerName, "  ", ""));
+        assert!(!edit_unchanged(Field::LocalName, "", "书房"));
+        // IP：去首尾空白
+        assert!(edit_unchanged(Field::Ip, " 192.168.1.5 ", "192.168.1.5"));
+        assert!(!edit_unchanged(Field::Ip, "192.168.1.6", "192.168.1.5"));
+        assert!(edit_unchanged(Field::Ip, "1.2.3", "1.2.3"));
+        // 密钥：去所有空白、大小写不敏感
+        let k = "982e0241".repeat(8);
+        assert!(edit_unchanged(Field::Key, &format!(" {} {} ", &k[..32].to_uppercase(), &k[32..]), &k));
+        assert!(!edit_unchanged(Field::Key, &"0".repeat(64), &k));
     }
 
     #[test]

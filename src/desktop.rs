@@ -62,13 +62,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows::Win32::Foundation::{ERROR_SUCCESS, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SAM_FLAGS, REG_SZ, RegCloseKey, RegDeleteValueW,
-    RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -106,8 +102,6 @@ const END_WAIT: Duration = Duration::from_secs(3);
 const PBT_APMSUSPEND: usize = 4;
 
 const ICON_SIZE: u32 = 32;
-const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const RUN_VALUE: PCWSTR = w!("kmlink");
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
@@ -482,82 +476,18 @@ fn icon_rgba(connected: bool) -> Vec<u8> {
     v
 }
 
-/// 开机自启的注册表值：带引号的 exe 路径。
-fn run_value(exe: &Path) -> String {
-    format!("\"{}\"", exe.display())
-}
-
-// ---------- 注册表（开机自启） ----------
-
-fn open_run_key(sam: REG_SAM_FLAGS) -> Option<HKEY> {
-    let mut k = HKEY::default();
-    let r = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, None, sam, &mut k) };
-    (r == ERROR_SUCCESS).then_some(k)
-}
-
-/// 当前 Run 里 "kmlink" 的值（没有则 None）。
-fn autostart_get() -> Option<String> {
-    let k = open_run_key(KEY_QUERY_VALUE)?;
-    let mut out = None;
-    unsafe {
-        let mut len = 0u32;
-        if RegQueryValueExW(k, RUN_VALUE, None, None, None, Some(&mut len)) == ERROR_SUCCESS {
-            let mut buf = vec![0u16; (len as usize).div_ceil(2) + 1];
-            let mut bytes = (buf.len() * 2) as u32;
-            if RegQueryValueExW(k, RUN_VALUE, None, None, Some(buf.as_mut_ptr() as *mut u8), Some(&mut bytes))
-                == ERROR_SUCCESS
-            {
-                let n = (bytes as usize / 2).min(buf.len());
-                out = Some(clip::utf16_until_nul(&buf[..n]));
-            }
-        }
-        let _ = RegCloseKey(k);
-    }
-    out
-}
-
-/// 写/删 Run 值。成功返回 true。
-fn autostart_set(on: bool) -> bool {
-    let Some(k) = open_run_key(KEY_SET_VALUE) else {
-        log!("开机自启：打开注册表失败");
-        return false;
-    };
-    let ok = unsafe {
-        if on {
-            match std::env::current_exe() {
-                Ok(exe) => {
-                    let bytes: Vec<u8> = sys::wide(&run_value(&exe)).iter().flat_map(|u| u.to_le_bytes()).collect();
-                    RegSetValueExW(k, RUN_VALUE, None, REG_SZ, Some(&bytes)) == ERROR_SUCCESS
-                }
-                Err(e) => {
-                    log!("开机自启：取 exe 路径失败：{e}");
-                    false
-                }
-            }
-        } else {
-            let r = RegDeleteValueW(k, RUN_VALUE);
-            r == ERROR_SUCCESS || r == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND
-        }
-    };
-    unsafe {
-        let _ = RegCloseKey(k);
-    }
-    if !ok {
-        log!("开机自启：{}失败", if on { "写入" } else { "删除" });
-    }
-    ok
-}
+// ---------- 开机自启（注册表读写在 sys） ----------
 
 /// 启动时：cfg 要求自启则确保注册表指向当前 exe。返回实际是否自启。
 fn autostart_sync(want: bool) -> bool {
-    let cur = autostart_get();
+    let cur = sys::autostart_get();
     if want {
-        let expect = std::env::current_exe().ok().map(|e| run_value(&e));
+        let expect = std::env::current_exe().ok().map(|e| sys::run_value(&e));
         if cur.is_none() || (expect.is_some() && cur != expect) {
-            autostart_set(true);
+            sys::autostart_set(true);
         }
     }
-    autostart_get().is_some()
+    sys::autostart_get().is_some()
 }
 
 // ---------- 状态 ----------
@@ -660,6 +590,8 @@ struct State {
     dpis: Vec<u32>,
     /// 上次写进 status.json 的内容（t = 0；变了才写）。
     status_file: Option<StatusFile>,
+    /// 上次写 status.json 失败了（连续失败只记一次日志）。
+    status_failed: bool,
     /// 托盘上次显示的内容（变了才刷新）。
     shown: Option<(bool, String)>,
     connected: bool,
@@ -769,16 +701,25 @@ impl State {
         }
     }
 
-    /// 连接状态变了才重写 status.json（设置窗口读）。
+    /// 连接状态变了才重写 status.json（设置窗口读）。写成功才记下，失败的由每秒的 TIMER_CONFIG 重试；
+    /// 连续失败只记第一次日志。
     fn write_status(&mut self, st: &Status) {
         let f = status_file(st, 0);
         if self.status_file.as_ref() == Some(&f) {
             return;
         }
-        if let Err(e) = config::save_status(&status_file(st, config::now_ms())) {
-            log!("写 status.json 失败：{e}");
+        match config::save_status(&status_file(st, config::now_ms())) {
+            Ok(()) => {
+                self.status_file = Some(f);
+                self.status_failed = false;
+            }
+            Err(e) => {
+                if !self.status_failed {
+                    log!("写 status.json 失败：{e}");
+                }
+                self.status_failed = true;
+            }
         }
-        self.status_file = Some(f);
     }
 
     /// 对方给本机改名：只写配置文件里的 name，由重新加载去更新 hub.cfg 并重发 Hello。
@@ -932,8 +873,8 @@ impl State {
             self.hub.set_status(|s| s.paused = on);
         } else if id == it.autostart.id() {
             let want = it.autostart.is_checked();
-            autostart_set(want);
-            let actual = autostart_get().is_some();
+            sys::autostart_set(want);
+            let actual = sys::autostart_get().is_some();
             it.autostart.set_checked(actual);
             self.save_autostart(actual);
         } else if id == it.folder.id() {
@@ -976,6 +917,9 @@ impl State {
             TIMER_CONFIG => {
                 self.check_config();
                 self.check_rename_peer();
+                // status.json 上次没写成就重试（内容没变时是空操作）
+                let st = self.hub.status();
+                self.write_status(&st);
                 // 兜底：万一叫醒消息丢了
                 self.pump();
             }
@@ -1127,8 +1071,8 @@ impl State {
             self.hub.send(hello(&c, self.desk.clone(), self.dpis.clone()));
         }
         if c.autostart != old.autostart {
-            autostart_set(c.autostart);
-            self.items.autostart.set_checked(autostart_get().is_some());
+            sys::autostart_set(c.autostart);
+            self.items.autostart.set_checked(sys::autostart_get().is_some());
         }
     }
 }
@@ -1367,6 +1311,7 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
         desk,
         dpis,
         status_file: None,
+        status_failed: false,
         shown: Some((st.connected, tip_text(&st))),
         connected: st.connected,
     };
@@ -1776,12 +1721,6 @@ mod tests {
         assert_eq!(status_line(&s), "已连接 OFFICE（已暂停）");
         s.peer_name = "x".repeat(200);
         assert!(tip_text(&s).chars().count() < 128);
-    }
-
-    #[test]
-    fn run_value_quoted() {
-        let p = Path::new(r"C:\Program Files\kmlink\kmlink.exe");
-        assert_eq!(run_value(p), "\"C:\\Program Files\\kmlink\\kmlink.exe\"");
     }
 }
 

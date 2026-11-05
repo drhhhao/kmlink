@@ -1,17 +1,26 @@
 //! 少量公用的 Win32 小工具。
 
 use crate::geom::{Desk, Rect};
-#[cfg(test)]
-use windows::Win32::Foundation::ERROR_SUCCESS;
+use std::path::Path;
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_HANDLE, GetLastError, LPARAM, RECT, WIN32_ERROR,
+    CloseHandle, E_ACCESSDENIED, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE,
+    ERROR_SUCCESS, GetLastError, LPARAM, RECT, WIN32_ERROR,
 };
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO};
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SAM_FLAGS, REG_SZ, RegCloseKey, RegDeleteValueW,
+    RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+};
+use windows::Win32::System::Threading::{CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
 };
-use windows::core::{BOOL, PCWSTR};
+use windows::core::{BOOL, PCWSTR, w};
+
+/// 主程序的单实例互斥量（main.rs 建，设置窗口拿来判断主程序在不在）。
+pub const DAEMON_MUTEX: PCWSTR = w!("Local\\kmlink-daemon");
+const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const RUN_VALUE: PCWSTR = w!("kmlink");
 
 /// 必须在创建任何窗口之前调用：之后所有坐标都是物理像素。
 pub fn dpi_aware() {
@@ -98,6 +107,90 @@ fn mutex_taken(created: bool, err: WIN32_ERROR) -> bool {
     if created { err == ERROR_ALREADY_EXISTS } else { err == ERROR_ACCESS_DENIED }
 }
 
+/// 命名互斥量现在有没有（只打开、不创建）。别的实例以管理员身份运行时打开会被拒绝，也算有。
+fn mutex_exists(name: PCWSTR) -> bool {
+    unsafe {
+        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, name) {
+            Ok(h) => {
+                let _ = CloseHandle(h);
+                true
+            }
+            Err(e) => e.code() == E_ACCESSDENIED,
+        }
+    }
+}
+
+/// 主程序（守护进程）在不在运行：看它的单实例互斥量。
+pub fn daemon_running() -> bool {
+    mutex_exists(DAEMON_MUTEX)
+}
+
+// ---------- 开机自启（HKCU\...\Run 的 "kmlink" 值） ----------
+
+/// 开机自启的注册表值：带引号的 exe 路径。
+pub(crate) fn run_value(exe: &Path) -> String {
+    format!("\"{}\"", exe.display())
+}
+
+fn open_run_key(sam: REG_SAM_FLAGS) -> Option<HKEY> {
+    let mut k = HKEY::default();
+    let r = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, None, sam, &mut k) };
+    (r == ERROR_SUCCESS).then_some(k)
+}
+
+/// 当前 Run 里 "kmlink" 的值（没有则 None）。
+pub(crate) fn autostart_get() -> Option<String> {
+    let k = open_run_key(KEY_QUERY_VALUE)?;
+    let mut out = None;
+    unsafe {
+        let mut len = 0u32;
+        if RegQueryValueExW(k, RUN_VALUE, None, None, None, Some(&mut len)) == ERROR_SUCCESS {
+            let mut buf = vec![0u16; (len as usize).div_ceil(2) + 1];
+            let mut bytes = (buf.len() * 2) as u32;
+            if RegQueryValueExW(k, RUN_VALUE, None, None, Some(buf.as_mut_ptr() as *mut u8), Some(&mut bytes))
+                == ERROR_SUCCESS
+            {
+                let n = (bytes as usize / 2).min(buf.len());
+                out = Some(crate::clip::utf16_until_nul(&buf[..n]));
+            }
+        }
+        let _ = RegCloseKey(k);
+    }
+    out
+}
+
+/// 写/删 Run 值（写的是当前 exe 的路径）。成功返回 true。
+pub(crate) fn autostart_set(on: bool) -> bool {
+    let Some(k) = open_run_key(KEY_SET_VALUE) else {
+        crate::log!("开机自启：打开注册表失败");
+        return false;
+    };
+    let ok = unsafe {
+        if on {
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    let bytes: Vec<u8> = wide(&run_value(&exe)).iter().flat_map(|u| u.to_le_bytes()).collect();
+                    RegSetValueExW(k, RUN_VALUE, None, REG_SZ, Some(&bytes)) == ERROR_SUCCESS
+                }
+                Err(e) => {
+                    crate::log!("开机自启：取 exe 路径失败：{e}");
+                    false
+                }
+            }
+        } else {
+            let r = RegDeleteValueW(k, RUN_VALUE);
+            r == ERROR_SUCCESS || r == ERROR_FILE_NOT_FOUND
+        }
+    };
+    unsafe {
+        let _ = RegCloseKey(k);
+    }
+    if !ok {
+        crate::log!("开机自启：{}失败", if on { "写入" } else { "删除" });
+    }
+    ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +206,22 @@ mod tests {
         let name = wide(&format!("Local\\kmlink-test-{}", std::process::id()));
         assert!(!already_running(PCWSTR(name.as_ptr()), false));
         assert!(already_running(PCWSTR(name.as_ptr()), false));
+    }
+
+    #[test]
+    fn mutex_probe() {
+        let name = wide(&format!("Local\\kmlink-probe-{}", std::process::id()));
+        assert!(!mutex_exists(PCWSTR(name.as_ptr())));
+        // 只打开不创建：探测本身不会让它存在
+        assert!(!mutex_exists(PCWSTR(name.as_ptr())));
+        assert!(!already_running(PCWSTR(name.as_ptr()), false));
+        assert!(mutex_exists(PCWSTR(name.as_ptr())));
+    }
+
+    #[test]
+    fn run_value_quoted() {
+        let p = Path::new(r"C:\Program Files\kmlink\kmlink.exe");
+        assert_eq!(run_value(p), "\"C:\\Program Files\\kmlink\\kmlink.exe\"");
     }
 
     #[test]

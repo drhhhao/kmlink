@@ -30,7 +30,6 @@ mod ui;
 use std::sync::Arc;
 use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole};
-use windows::core::w;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -70,7 +69,7 @@ fn daemon(with_console: bool) {
     log::init("kmlink");
 
     // 只允许一个实例（另一个以管理员身份运行时也算）
-    if sys::already_running(w!("Local\\kmlink-daemon"), true) {
+    if sys::already_running(sys::DAEMON_MUTEX, true) {
         log!("已经在运行，退出");
         log::flush(500);
         return;
