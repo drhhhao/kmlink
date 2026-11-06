@@ -13,7 +13,7 @@
 
 use windows::Win32::Foundation::SIZE;
 use windows::Win32::Graphics::Gdi::{
-    AddFontMemResourceEx, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
+    AddFontMemResourceEx, ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
     CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DIB_RGB_COLORS, DeleteDC, DeleteObject, FONT_QUALITY, GGI_MARK_NONEXISTING_GLYPHS,
     GdiFlush, GetGlyphIndicesW, GetTextExtentPoint32W, GetTextFaceW, GetTextMetricsW, HBITMAP, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS,
     SRCCOPY, SelectObject, SetBkMode, SetTextAlign, SetTextColor, TA_BASELINE, TA_LEFT, TEXTMETRICW, TRANSPARENT, TextOutW,
@@ -159,7 +159,13 @@ pub struct Font {
     /// 字号（逻辑像素）、DPI 缩放
     px: f32,
     s: f32,
+    /// 灰度抗锯齿字体的 SS 倍大双胞胎：画字时先按它画大再缩回来（GDI 自己的灰度抗锯齿只有十几级灰、笔画硬对齐像素，
+    /// 细笔画的中文发毛发虚）。量宽也按它（÷ SS），画出来和量出来一致。
+    ss: Option<Box<Font>>,
 }
+
+/// 超采样倍数。
+const SS: i32 = 4;
 
 // ───────────────────────── 界面字体（私有加载） ─────────────────────────
 
@@ -204,6 +210,13 @@ impl Font {
 
     /// 界面字体：中文 Km Rounded + 英文数字 Nunito（粗细加一档：常规 → SemiBold，600 及以上 → ExtraBold），
     /// 缺字退回微软雅黑。私有字体没加载成功就是微软雅黑。q：抗锯齿方式（透明底上用 ANTIALIASED_QUALITY）。
+    /// 画在透明底上的界面字体（灰度抗锯齿），只能经 Painter::text 画：带超采样双胞胎，比 GDI 灰度抗锯齿细腻。
+    pub fn ui_smooth(px: f32, weight: i32, s: f32) -> Font {
+        let mut f = Font::ui(px, weight, s, ANTIALIASED_QUALITY);
+        f.ss = Some(Box::new(Font::ui(px, weight, s * SS as f32, ANTIALIASED_QUALITY)));
+        f
+    }
+
     pub fn ui(px: f32, weight: i32, s: f32, q: FONT_QUALITY) -> Font {
         if !fonts_ok() {
             return Font::with_quality(&["Microsoft YaHei UI"], px, weight, s, q);
@@ -214,7 +227,7 @@ impl Font {
         let fb = create_font("Microsoft YaHei UI", px, weight, s, q);
         // 单元高度沿用雅黑的比例（布局都是照它排的），基线按字号居中
         let cell = (px * 1.32).round();
-        Font { h, latin: Some(latin), fb: Some(fb), cell, base: cell / 2.0 + 0.37 * px, px, s }
+        Font { h, latin: Some(latin), fb: Some(fb), cell, base: cell / 2.0 + 0.37 * px, px, s, ss: None }
     }
 
     /// 竖直居中在 cy（物理像素）时的基线（物理像素）。
@@ -289,7 +302,7 @@ impl Font {
             let _ = DeleteDC(dc);
             (tm.tmHeight as f32 / s, tm.tmAscent as f32 / s)
         };
-        Font { h, latin: None, fb: None, cell, base, px, s }
+        Font { h, latin: None, fb: None, cell, base, px, s, ss: None }
     }
 }
 
@@ -351,6 +364,9 @@ pub fn text_px(dc: HDC, font: &Font, text: &str) -> i32 {
     if text.is_empty() {
         return 0;
     }
+    if let Some(big) = &font.ss {
+        return (text_px(dc, big, text) as f32 / SS as f32).round() as i32;
+    }
     let mut w = 0;
     for (f, run) in font.runs(dc, text) {
         unsafe {
@@ -384,6 +400,50 @@ pub fn draw_text_px(dc: HDC, font: &Font, x: i32, baseline: i32, text: &str) -> 
         SetTextAlign(dc, windows::Win32::Graphics::Gdi::TEXT_ALIGN_OPTIONS(old_align));
     }
     cx - x
+}
+
+/// 超采样覆盖率蒙版（ow × oh，0..1，行优先）：big（SS 倍大的字体）白字黑底画在 (bx, baseline)（大图物理像素），
+/// 每 SS×SS 块取平均，再轻微加浓（同 DirectWrite 的 enhanced contrast，细笔画不发灰）。
+fn ss_cov(big: &Font, ow: i32, oh: i32, bx: i32, baseline: i32, text: &str) -> Option<Vec<f32>> {
+    let (ow, oh) = (ow.max(1), oh.max(1));
+    let mut tmp = Surface::new(ow * SS, oh * SS)?;
+    unsafe {
+        SetTextColor(tmp.dc, COLORREF(0x00FF_FFFF));
+    }
+    draw_text_px(tmp.dc, big, bx, baseline, text);
+    let tw = (ow * SS) as usize;
+    let k = SS as usize;
+    let src = tmp.pixels();
+    let n = (SS * SS) as f32 * 255.0;
+    let mut out = vec![0.0f32; (ow * oh) as usize];
+    for j in 0..oh as usize {
+        for i in 0..ow as usize {
+            let mut sum = 0u32;
+            for v in 0..k {
+                for p in &src[(j * k + v) * tw + i * k..][..k] {
+                    sum += ((p >> 16 & 255) + (p >> 8 & 255) + (p & 255)) / 3;
+                }
+            }
+            if sum > 0 {
+                out[j * ow as usize + i] = (sum as f32 / n).powf(0.8);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// 一行字的覆盖率蒙版（w × h，0..1，行优先）：左边 x、基线 baseline（物理像素）。
+/// 带超采样双胞胎的字体（Font::ui_smooth）按 SS 倍画再缩；否则 GDI 直接画，取 RGB 最大值。
+pub fn text_cov(font: &Font, w: i32, h: i32, x: i32, baseline: i32, text: &str) -> Option<Vec<f32>> {
+    if let Some(big) = &font.ss {
+        return ss_cov(big, w, h, x * SS, baseline * SS, text);
+    }
+    let mut m = Surface::new(w, h)?;
+    unsafe {
+        SetTextColor(m.dc, COLORREF(0x00FF_FFFF));
+    }
+    draw_text_px(m.dc, font, x, baseline, text);
+    Some(m.pixels().iter().map(|p| ((p >> 16 & 255).max(p >> 8 & 255).max(p & 255)) as f32 / 255.0).collect())
 }
 
 // ───────────────────────── 绘制 ─────────────────────────
@@ -771,12 +831,46 @@ impl<'a> Painter<'a> {
         if text.is_empty() {
             return;
         }
+        if let Some(big) = &font.ss {
+            self.text_ss(x, y, text, font, big, c);
+            return;
+        }
         unsafe {
             let dc = self.surf.dc;
             SetTextColor(dc, c.colorref());
             let bx = (x * self.s).round() as i32;
             let by = ((y + font.base) * self.s).round() as i32;
             draw_text_px(dc, font, bx, by, text);
+        }
+    }
+
+    /// 超采样画字：按 SS 倍大画成覆盖率蒙版（ss_cov），再用 c 混到画布上。
+    fn text_ss(&mut self, x: f32, y: f32, text: &str, font: &Font, big: &Font, c: Rgba) {
+        let k = SS as f32;
+        let (px, py) = (x * self.s, y * self.s);
+        let (x0, y0) = (px.floor() as i32, py.floor() as i32);
+        // 子像素起点（大图坐标）；左边留 1 个输出像素给外伸的笔画
+        let ox = ((px - x0 as f32) * k).round() as i32 + SS;
+        let oy = ((py - y0 as f32) * k).round() as i32;
+        let ow = (text_px(self.surf.dc, big, text) + 3 * SS + SS - 1) / SS;
+        let oh = ((font.cell * self.s * k).ceil() as i32 + 2 * SS + SS - 1) / SS;
+        let Some(cov) = ss_cov(big, ow, oh, ox, oy + (font.base * self.s * k).round() as i32, text) else { return };
+        let ga = c.a * self.alpha;
+        let (sw, sh) = (self.surf.w, self.surf.h);
+        let dst = self.surf.pixels();
+        for j in 0..oh {
+            let dy = y0 + j;
+            if dy < 0 || dy >= sh {
+                continue;
+            }
+            for i in 0..ow {
+                let dx = x0 - 1 + i;
+                let a = cov[(j * ow + i) as usize];
+                if dx < 0 || dx >= sw || a <= 0.0 {
+                    continue;
+                }
+                blend(&mut dst[(dy * sw + dx) as usize], c, a * ga);
+            }
         }
     }
 

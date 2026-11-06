@@ -27,14 +27,14 @@
 //! 连续复制：原地换名字，宽度用弹簧变过去，停留重新计时。全屏游戏 / 演示（SHQueryUserNotificationState）时不弹。
 //! 收起后释放全部缓冲，只留一个隐藏窗口。
 
-use crate::ui::{Font, draw_text_px, text_px};
+use crate::ui::{Font, text_cov, text_px};
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BitBlt, CreateCompatibleDC,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BitBlt, CreateCompatibleDC,
     CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, ReleaseDC, SRCCOPY, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -594,8 +594,7 @@ struct Fonts {
 
 impl Fonts {
     fn new(s: f32) -> Fonts {
-        let q = ANTIALIASED_QUALITY;
-        Fonts { bold: Font::ui(FONT_PX, 700, s, q), regular: Font::ui(FONT_PX, 400, s, q), button: Font::ui(BTN_FONT_PX, 700, s, q) }
+        Fonts { bold: Font::ui_smooth(FONT_PX, 700, s), regular: Font::ui_smooth(FONT_PX, 400, s), button: Font::ui_smooth(BTN_FONT_PX, 700, s) }
     }
 }
 
@@ -671,40 +670,26 @@ fn draw_content(
     let fonts = Fonts::new(s);
     let tx = ((PAD_L + ICON + GAP) * s).round() as i32;
     let mut masks = Vec::new();
+    let probe = Dib::new(1, 1)?;
     for (txt, f, x) in [(name, &fonts.bold, tx), (verb, &fonts.regular, 0)] {
-        let mut m = Dib::new(cw, chh)?;
         let x = if masks.is_empty() {
             x
         } else {
-            let nw = text_width(m.dc, &fonts.bold, name);
+            let nw = text_width(probe.dc, &fonts.bold, name);
             tx + nw + (WORD_GAP * s).round() as i32
         };
-        unsafe {
-            SetBkMode(m.dc, TRANSPARENT);
-            SetTextColor(m.dc, COLORREF(0x00FF_FFFF));
-            // 竖直居中：按字号算基线（ui::Font::baseline_at）
-            let y = f.baseline_at(chh as f32 / 2.0 + 0.5 * s).round() as i32;
-            draw_text_px(m.dc, f, x, y, &String::from_utf16_lossy(txt));
-            let _ = GdiFlush();
-        }
-        let cov: Vec<f32> = m.bytes().chunks_exact(4).map(|p| p[0].max(p[1]).max(p[2]) as f32 / 255.0).collect();
-        masks.push(cov);
+        // 竖直居中：按字号算基线（ui::Font::baseline_at）
+        let y = f.baseline_at(chh as f32 / 2.0 + 0.5 * s).round() as i32;
+        masks.push(text_cov(f, cw, chh, x, y, &String::from_utf16_lossy(txt))?);
     }
     // 按钮文字蒙版
     let btn = match button {
         Some((label, hover)) => {
             let (bx, by, bw, bh) = btn_rect(label, wf, s)?;
-            let mut m = Dib::new(cw, chh)?;
-            unsafe {
-                SetBkMode(m.dc, TRANSPARENT);
-                SetTextColor(m.dc, COLORREF(0x00FF_FFFF));
-                let tw = text_px(m.dc, &fonts.button, label);
-                let x = (bx + (bw - tw as f32) / 2.0).round() as i32;
-                let y = fonts.button.baseline_at(by + bh / 2.0 + 0.5 * s).round() as i32;
-                draw_text_px(m.dc, &fonts.button, x, y, label);
-                let _ = GdiFlush();
-            }
-            let cov: Vec<f32> = m.bytes().chunks_exact(4).map(|p| p[0].max(p[1]).max(p[2]) as f32 / 255.0).collect();
+            let tw = text_px(probe.dc, &fonts.button, label);
+            let x = (bx + (bw - tw as f32) / 2.0).round() as i32;
+            let y = fonts.button.baseline_at(by + bh / 2.0 + 0.5 * s).round() as i32;
+            let cov = text_cov(&fonts.button, cw, chh, x, y, label)?;
             Some((bx, by, bw, bh, cov, hover))
         }
         None => None,

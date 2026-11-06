@@ -594,8 +594,8 @@ struct State {
     hwnd: HWND,
     rx: Receiver<ToDesktop>,
     mrx: Receiver<MenuId>,
-    /// 托盘图标被点（左键 / 右键抬起）：图标的矩形（物理像素）→ 开关托盘面板
-    trx: Receiver<RECT>,
+    /// 托盘图标被点：(图标的矩形（物理像素）, 是否左键)。左键打开设置窗口，右键开关托盘面板
+    trx: Receiver<(RECT, bool)>,
     /// 已收到退出：不再处理 channel，等 WM_QUIT。
     quitting: bool,
     tray: Option<TrayIcon>,
@@ -682,8 +682,13 @@ impl State {
     /// drain 菜单事件和 ToDesktop；收到退出时 PostQuitMessage，由消息循环收尾。
     fn pump(&mut self) {
         while !self.quitting {
-            if let Ok(r) = self.trx.try_recv() {
-                crate::panel::toggle(r, self.panel_view());
+            if let Ok((r, left)) = self.trx.try_recv() {
+                if left {
+                    crate::panel::close();
+                    open_settings();
+                } else {
+                    crate::panel::toggle(r, self.panel_view());
+                }
                 continue;
             }
             let cmds = crate::panel::take_cmds();
@@ -1529,7 +1534,7 @@ fn build_tray(items: &Items, st: &Status) -> Option<TrayIcon> {
     ]) {
         log!("托盘菜单创建失败：{e}");
     }
-    // 原生菜单不再挂到图标上（点图标弹自绘的托盘面板，panel.rs）；菜单项仍留作状态记录
+    // 原生菜单不再挂到图标上（右键图标弹自绘的托盘面板，panel.rs）；菜单项仍留作状态记录
     let _ = menu;
     let mut b = TrayIconBuilder::new().with_tooltip(tip_text(st));
     match Icon::from_rgba(icon_rgba(st.connected), ICON_SIZE, ICON_SIZE) {
@@ -1579,14 +1584,15 @@ fn run(hub: Arc<Hub>, rx: Receiver<ToDesktop>, first_run: bool) {
             let _ = PostMessageW(Some(HWND(hv as *mut core::ffi::c_void)), WM_APP_WAKE, WPARAM(0), LPARAM(0));
         }
     }));
-    // 托盘图标左键 / 右键抬起 → 托盘面板（panel.rs）；别的鼠标事件丢掉（免得堆在内部无界队列里）
-    let (ttx, trx) = unbounded::<RECT>();
+    // 托盘图标左键抬起 → 设置窗口；右键抬起 → 托盘面板（panel.rs）；别的鼠标事件丢掉（免得堆在内部无界队列里）
+    let (ttx, trx) = unbounded::<(RECT, bool)>();
     TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
         if let TrayIconEvent::Click { rect, button_state: tray_icon::MouseButtonState::Up, button, .. } = e
             && matches!(button, tray_icon::MouseButton::Left | tray_icon::MouseButton::Right)
         {
             let (x, y) = (rect.position.x.round() as i32, rect.position.y.round() as i32);
-            let _ = ttx.send(RECT { left: x, top: y, right: x + rect.size.width as i32, bottom: y + rect.size.height as i32 });
+            let r = RECT { left: x, top: y, right: x + rect.size.width as i32, bottom: y + rect.size.height as i32 };
+            let _ = ttx.send((r, button == tray_icon::MouseButton::Left));
             unsafe {
                 let _ = PostMessageW(Some(HWND(hv as *mut core::ffi::c_void)), WM_APP_WAKE, WPARAM(0), LPARAM(0));
             }

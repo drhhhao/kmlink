@@ -32,7 +32,14 @@ def opts():
     o.notdef_outline = True; o.glyph_names = False; o.hinting = True
     return o
 
+def smooth(f):
+    """没有 gasp 表时 GDI 小字号不做抗锯齿（源樣黑體圓就没有，中文字边一圈锯齿发糊）：补一张“所有字号都平滑”。"""
+    if 'gasp' not in f:
+        from fontTools.ttLib import newTable
+        g = newTable('gasp'); g.version = 1; g.gaspRange = {0xFFFF: 0x000F}; f['gasp'] = g
+
 def cut(f, keep, dst):
+    smooth(f)
     s = subset.Subsetter(opts()); s.populate(unicodes=[ord(c) for c in keep]); s.subset(f); f.save(dst)
     print(os.path.basename(dst), f'{os.path.getsize(dst) / 1e3:.0f} KB')
 

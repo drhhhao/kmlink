@@ -1,6 +1,6 @@
 //! 托盘面板（替换原生右键菜单；设计稿 设计\托盘菜单\proof.html，底用系统亚克力）。
 //!
-//! 左键、右键点托盘图标都打开，弹在图标正上方（任务栏在上面时弹在下方），离任务栏 12。宽 300，从上到下：
+//! 右键点托盘图标打开（左键打开设置窗口），弹在图标正上方（任务栏在上面时弹在下方），离任务栏 12。宽 300，从上到下：
 //!   头部：状态图标块（已连接 绿 / 已暂停 琥珀 / 等待连接 灰）+ 标题 + 灰字（对方名字），右边“暂停 / 继续”；
 //!   声音：分段“关 | 1 | 2 | 两台”，灰字说在哪台放；键盘跟随、开机自启两个开关；
 //!   更新一行（检查更新 / 正在检查… / 已是最新 / 新版 x 更新 / 正在更新 45% / 正在重启 / 已更新到 x / 更新失败 重试）；
@@ -22,7 +22,7 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    ANTIALIASED_QUALITY, BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
     PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -214,17 +214,16 @@ struct Fonts {
 
 impl Fonts {
     fn new(s: f32) -> Fonts {
-        let q = ANTIALIASED_QUALITY;
         Fonts {
-            title: Font::ui(14.0, 700, s, q),
-            sub: Font::ui(11.5, 400, s, q),
-            row: Font::ui(13.5, 400, s, q),
-            link: Font::ui(13.0, 400, s, q),
-            btn: Font::ui(12.5, 700, s, q),
-            seg: Font::ui(12.5, 400, s, q),
-            seg_on: Font::ui(12.5, 700, s, q),
-            ver: Font::ui(12.0, 400, s, q),
-            upd_b: Font::ui(13.5, 700, s, q),
+            title: Font::ui_smooth(14.0, 700, s),
+            sub: Font::ui_smooth(11.5, 400, s),
+            row: Font::ui_smooth(13.5, 400, s),
+            link: Font::ui_smooth(13.0, 400, s),
+            btn: Font::ui_smooth(12.5, 700, s),
+            seg: Font::ui_smooth(12.5, 400, s),
+            seg_on: Font::ui_smooth(12.5, 700, s),
+            ver: Font::ui_smooth(12.0, 400, s),
+            upd_b: Font::ui_smooth(13.5, 700, s),
         }
     }
 }
