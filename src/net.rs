@@ -144,6 +144,8 @@ const ERR_PEER_KEY: &str = "对方的临时公钥无效";
 pub const ERR_SELF: &str = "对方地址指向本机";
 pub const ERR_OLD: &str = "对方版本太旧，请两台都更新";
 pub const ERR_UDP_DOWN: &str = "UDP 不可用，已改走 TCP";
+/// 经线连着时状态里的“对方地址”。
+pub const CABLE_ADDR: &str = "USB 线";
 
 pub fn spawn(hub: Arc<Hub>, rx: Receiver<Out>, injector: Arc<Injector>, audio: Arc<crate::audio::Port>) {
     let opts = Opts {
@@ -152,6 +154,7 @@ pub fn spawn(hub: Arc<Hub>, rx: Receiver<Out>, injector: Arc<Injector>, audio: A
         dial_every: Duration::from_secs(2),
         id: proto::instance_id(),
         audio: Some(audio),
+        cable: crate::cable::start(hub.clone()),
     };
     start(hub, rx, injector, opts);
 }
@@ -165,6 +168,8 @@ struct Opts {
     id: u64,
     /// 声音（测试里没有）。
     audio: Option<Arc<crate::audio::Port>>,
+    /// USB 键鼠线（测试里没有；KMLINK_CABLE=off 时也没有）。
+    cable: Option<Arc<crate::cable::Cable>>,
 }
 
 type SessionHandle = Arc<Session>;
@@ -200,6 +205,9 @@ struct Net {
     clip_gen: AtomicU64,
     /// 最近一次有鼠标移动经过本机（发出或收到）的时间（mono_ms）：这时图片限速发，别把 WiFi 占满让移动排队。
     mouse_at: AtomicU64,
+    /// 叫醒 dialer（会话断了 / 线通了或断了）：不用等下一个 2 秒。
+    dial_wake: Mutex<bool>,
+    dial_cv: Condvar,
     #[cfg(test)]
     stats: TestStats,
 }
@@ -234,6 +242,8 @@ struct Session {
     peer: SocketAddr,
     /// 对方的 instance id（旧版本为 0）。
     peer_id: u64,
+    /// 经 USB 线（对端地址是本机的桥）：UDP 包改走线，状态里显示“USB 线”。
+    cable: bool,
     sig: CfgSig,
     /// 最近一次收到帧的时间。
     last_rx: Mutex<RxClock>,
@@ -276,6 +286,12 @@ impl UdpPeer {
     /// 收到一个认证通过的 UDP 包。
     fn heard(&mut self, src: SocketAddr, now: Instant) {
         self.addr = Some(src);
+        self.learned = true;
+        self.last = Some(now);
+    }
+
+    /// 经线收到一个认证通过的包（地址不变：线上的包不用地址）。
+    fn heard_cable(&mut self, now: Instant) {
         self.learned = true;
         self.last = Some(now);
     }
@@ -367,6 +383,8 @@ fn start(hub: Arc<Hub>, rx: Receiver<Out>, injector: Arc<Injector>, opts: Opts) 
         tq_cv: Condvar::new(),
         clip_gen: AtomicU64::new(0),
         mouse_at: AtomicU64::new(0),
+        dial_wake: Mutex::new(false),
+        dial_cv: Condvar::new(),
         #[cfg(test)]
         stats: TestStats::default(),
     });
@@ -383,6 +401,20 @@ fn start(hub: Arc<Hub>, rx: Receiver<Out>, injector: Arc<Injector>, opts: Opts) 
     if let Some(a) = &net.opts.audio {
         let w = Arc::downgrade(&net);
         a.set_sender(Box::new(move |sid, plain| w.upgrade().is_some_and(|n| n.send_audio(sid, plain))));
+    }
+    if let Some(c) = &net.opts.cable {
+        let w = Arc::downgrade(&net);
+        c.set_sink(Box::new(move |pkt| {
+            if let Some(n) = w.upgrade() {
+                n.on_dgram(pkt, None);
+            }
+        }));
+        let w = Arc::downgrade(&net);
+        c.set_notify(Box::new(move || {
+            if let Some(n) = w.upgrade() {
+                n.wake_dialer();
+            }
+        }));
     }
     net
 }
@@ -811,6 +843,19 @@ fn layout_msg(cfg: &Config) -> Msg {
     Msg::Layout { side: l.side, offset: l.offset, scale: l.scale, rev: cfg.layout.rev }
 }
 
+pub fn share_msg(cfg: &Config) -> Msg {
+    Msg::Share { mouse: cfg.share.mouse, kbd: cfg.share.keyboard, rev: cfg.share.rev }
+}
+
+fn on_off(b: bool) -> &'static str {
+    if b { "开" } else { "关" }
+}
+
+/// 采用对方的鼠标/键盘开关吗（同排布：rev 大的赢；rev 相同而开关不同，instance id 小的让）。
+fn adopt_share(cur: &config::ShareCfg, mouse: bool, kbd: bool, rev: u64, my_id: u64, peer_id: u64) -> bool {
+    rev > cur.rev || (rev == cur.rev && (cur.mouse, cur.keyboard) != (mouse, kbd) && peer_id != 0 && my_id < peer_id)
+}
+
 /// reader 线程自己的状态。
 #[derive(Default)]
 struct RxState {
@@ -930,7 +975,8 @@ impl Net {
 
     fn send_hello<W: Write>(&self, w: &mut W, tx: &mut Sealer, cfg: &Config) -> io::Result<()> {
         write_frame(w, tx, &proto::encode_msg(&self.hello(cfg)))?;
-        write_frame(w, tx, &proto::encode_msg(&layout_msg(cfg)))
+        write_frame(w, tx, &proto::encode_msg(&layout_msg(cfg)))?;
+        write_frame(w, tx, &proto::encode_msg(&share_msg(cfg)))
     }
 
     /// 发现连到了自己：报错，60 秒内不再拨这个地址。
@@ -977,6 +1023,7 @@ impl Net {
         let psk = self.psk(&cfg)?;
         let peer = stream.peer_addr().ok()?;
         let ip = peer.ip();
+        let via_cable = self.opts.cable.as_ref().is_some_and(|c| c.owns(peer));
         let _ = stream.set_nodelay(true);
         set_sndbuf(&stream, TCP_SNDBUF);
 
@@ -1011,7 +1058,8 @@ impl Net {
             }
             Err(e) if client && is_closed(&e) => {
                 // 服务端解不开我们的第一帧就会直接断开：多半是密钥不一致（客户端只连 cfg.peer，可以显示）
-                self.log_ip(ip, "auth", format!("与 {ip} 认证失败：对方断开了连接（多半是两边的配对密钥不一致）"), true);
+                // 已经有会话（比如刚经 USB 线连上，对方拒了这条多余的）：只记日志，不改状态
+                self.log_ip(ip, "auth", format!("与 {ip} 认证失败：对方断开了连接（多半是两边的配对密钥不一致）"), self.current().is_none());
                 return None;
             }
             Err(e) => {
@@ -1054,6 +1102,7 @@ impl Net {
             nonce_c,
             peer,
             peer_id: *peer_id,
+            cable: via_cable,
             sig: CfgSig::of(&cfg),
             last_rx: Mutex::new(RxClock { at: Instant::now(), staled: false, homed: false }),
             udp_warned: AtomicBool::new(false),
@@ -1071,7 +1120,8 @@ impl Net {
             return None;
         }
         self.clear_err();
-        crate::log!("已连接 {peer}（{}）", if client { "主动" } else { "被动" });
+        let via = if via_cable { "，经 USB 线".to_string() } else { String::new() };
+        crate::log!("已连接 {peer}（{}{via}）", if client { "主动" } else { "被动" });
         Some((sess, stream, rx, hello))
     }
 
@@ -1081,7 +1131,11 @@ impl Net {
         {
             let mut cur = lock(&self.holder);
             if let Some(old) = cur.as_ref() {
-                if keep_old(old.started.elapsed(), &old.nonce_c, &new.nonce_c) {
+                // 经线来的新会话不按 nonce 让位给网络会话（两边看法一致）。
+                // 反过来不拦：同一台对方走网络连过来，说明它那头的线已经断了（它只在没有会话时才走网络），
+                // 本机这头可能还要 1.2 秒才发现（拔线时串口不一定报错），马上接受它，切换不卡顿。
+                let cable_wins = new.cable && !old.cable;
+                if !cable_wins && keep_old(old.started.elapsed(), &old.nonce_c, &new.nonce_c) {
                     return Err("让位给已有连接".into());
                 }
                 if other_peer_busy(old.peer_id, new.peer_id, lock(&old.last_rx).at.elapsed()) {
@@ -1125,6 +1179,9 @@ impl Net {
             s.peer_caps = 0;
             s.peer_app.clear();
         });
+        drop(cur);
+        // 马上重连（线断了就改走网络），不等 dialer 的下一个 2 秒
+        self.wake_dialer();
     }
 
     fn run_reader(&self, sess: SessionHandle, mut stream: TcpStream, mut opener: Opener, first: Msg) {
@@ -1205,9 +1262,9 @@ impl Net {
                         u.addr = Some(SocketAddr::new(sess.peer.ip(), udp_port));
                     }
                 }
-                let addr = sess.peer.to_string();
+                let addr = if sess.cable { CABLE_ADDR.to_string() } else { sess.peer.to_string() };
                 let n = name.clone();
-                let udp_down = self.udp.get().is_none();
+                let udp_down = !sess.cable && self.udp.get().is_none();
                 let app = proto::sanitize_name(app);
                 self.hub.set_status(|s| {
                     s.connected = true;
@@ -1286,6 +1343,7 @@ impl Net {
                     a.peer_mode(sess.id, sess.peer_id, mode, rev);
                 }
             }
+            Msg::Share { mouse, kbd, rev } => self.apply_share(sess, mouse, kbd, rev),
             Msg::AudioAck { playing } => {
                 if let Some(a) = &self.opts.audio {
                     a.peer_ack(playing);
@@ -1316,6 +1374,40 @@ impl Net {
             st.layout = Some((mine, rev));
         }
         self.hub.to_input(ToInput::Config(Box::new(new_cfg)));
+    }
+
+    /// 对方的鼠标/键盘开关：rev 更新就采用并马上存盘（很少变，不限频）。本机的赢时回发一次，免得两台停在不同状态。
+    fn apply_share(&self, sess: &Session, mouse: bool, kbd: bool, rev: u64) {
+        if rev > config::now_ms().saturating_add(MAX_REV_AHEAD) {
+            crate::log!("忽略对方不合理的开关版本 {rev}");
+            return;
+        }
+        let new_cfg = {
+            let mut c = self.hub.cfg.write().unwrap_or_else(|e| e.into_inner());
+            if !adopt_share(&c.share, mouse, kbd, rev, self.opts.id, sess.peer_id) {
+                if (c.share.mouse, c.share.keyboard) != (mouse, kbd) {
+                    let m = share_msg(&c);
+                    drop(c);
+                    self.enqueue(Out::Msg(m));
+                }
+                return;
+            }
+            c.share = config::ShareCfg { mouse, keyboard: kbd, rev };
+            c.clone()
+        };
+        crate::log!("采用对方的开关：鼠标{} 键盘{}", on_off(mouse), on_off(kbd));
+        if self.opts.persist {
+            let r = config::update(&new_cfg, |c| {
+                if c.share.rev <= rev {
+                    c.share = config::ShareCfg { mouse, keyboard: kbd, rev };
+                }
+            });
+            if let Err(e) = r {
+                crate::log!("保存配置失败：{e}");
+            }
+        }
+        self.hub.to_input(ToInput::Config(Box::new(new_cfg)));
+        self.hub.to_desktop(ToDesktop::Status);
     }
 
     /// 把攒着的 peer.json / 排布写盘：每样每秒至多一次（force = 会话结束，写掉剩下的）。内容没变时 config 那边不写。
@@ -1389,10 +1481,68 @@ impl Net {
         }
     }
 
+    /// 叫醒 dialer：马上看一眼要不要连（会话刚断 / 线刚通或刚断）。
+    fn wake_dialer(&self) {
+        *lock(&self.dial_wake) = true;
+        self.dial_cv.notify_all();
+    }
+
+    /// 连一个地址并跑起会话；会话建立了返回 true。
+    fn dial(self: &Arc<Self>, addr: SocketAddr, dialed: &str) -> bool {
+        match TcpStream::connect_timeout(&addr, DIAL_TIMEOUT) {
+            Ok(s) => {
+                let Some((sess, s, opener, first)) = self.establish(s, Some(dialed)) else { return false };
+                let me = self.clone();
+                let sess2 = sess.clone();
+                if !spawn_named("net-conn", move || me.run_reader(sess, s, opener, first)) {
+                    self.end_session(&sess2, "创建线程失败");
+                }
+                true
+            }
+            Err(e) => {
+                self.note_err(format!("连接 {addr} 失败：{e}"));
+                false
+            }
+        }
+    }
+
+    /// 已经走网络连着、线又通了：换到线上。只由 instance id 大的一方发起（两边不会同时换）；
+    /// 鼠标正在动 / 正在控制对方或被控时不换（换会话会让鼠标回到本机），会话刚建立 3 秒内也不换。
+    fn want_upgrade(&self, cur: &Session) -> bool {
+        if cur.cable || cur.peer_id == 0 || self.opts.id < cur.peer_id || cur.started.elapsed() < Duration::from_secs(3) {
+            return false;
+        }
+        let st = self.hub.status();
+        !(self.mouse_active() || st.driving || st.driven)
+    }
+
     fn run_dialer(self: Arc<Self>) {
         loop {
             let jitter = Duration::from_millis(crypto::random32()[0] as u64 * 500 / 256);
-            std::thread::sleep(self.opts.dial_every + jitter);
+            {
+                let mut w = lock(&self.dial_wake);
+                if !*w {
+                    w = self.dial_cv.wait_timeout(w, self.opts.dial_every + jitter).unwrap_or_else(|e| e.into_inner()).0;
+                }
+                *w = false;
+            }
+            let via_cable = self.opts.cable.as_ref().and_then(|c| c.dial_addr());
+            if let Some(cur) = self.current() {
+                if let Some(a) = via_cable {
+                    if self.want_upgrade(&cur) {
+                        crate::log!("USB 线通了，改走线");
+                        self.dial(a, CABLE_ADDR);
+                    }
+                }
+                continue;
+            }
+            // 线通着就先走线（不需要填对方地址）；连不上再走网络
+            if let Some(a) = via_cable {
+                if self.psk(&self.hub.cfg()).is_some() && self.dial(a, CABLE_ADDR) {
+                    continue;
+                }
+            }
+            // 线没连成，可能是对方同时经线连过来、本机这条让了位：已有会话就别再走网络（免得把线上的顶掉）
             if self.current().is_some() {
                 continue;
             }
@@ -1473,38 +1623,54 @@ impl Net {
                     continue;
                 }
             };
-            // 先过滤再解密：长度不对的、不是会话对端 IP 发来的（端口可以变）直接丢
-            // 计数器最高位为 1 的是声音包（另一套密钥），解密后只交给声音模块的无锁环，不在这里多做事。
-            let audio = crypto::is_audio(&buf[..n]);
-            let ok_len = if audio {
-                (AUDIO_MIN_PKT..=AUDIO_MAX_PKT).contains(&n)
-            } else {
-                (UDP_MIN_PKT..=UDP_MAX_PKT).contains(&n)
-            };
-            if !ok_len {
-                continue;
-            }
-            let Some(sess) = self.current() else { continue };
-            if src.ip() != sess.peer.ip() {
-                continue;
-            }
-            if audio {
-                let Some(a) = &self.opts.audio else { continue };
-                let arrive = crate::smooth::now_us() as u32;
-                let Some(plain) = lock(&sess.audio_rx).open(&buf[..n]) else { continue };
-                lock(&sess.udp_peer).heard(src, Instant::now());
-                a.packet(sess.id, &plain, arrive);
-                continue;
-            }
-            let Some(plain) = lock(&sess.udp_rx).open(&buf[..n]) else { continue };
-            lock(&sess.udp_peer).heard(src, Instant::now());
-            if let Some(UdpMsg::Move { epoch, seq, x, y, t }) = UdpMsg::decode(&plain) {
-                self.mark_mouse();
-                #[cfg(test)]
-                self.stats.udp_moves.fetch_add(1, Ordering::Relaxed);
-                self.injector.moved(sess.id, epoch, seq, x, y, t);
-            }
+            self.on_dgram(&buf[..n], Some(src));
         }
+    }
+
+    /// 一个 UDP 包（鼠标位置 / Hi / 声音）。src = 网络上的源地址；None = 经 USB 线来的。
+    /// 先过滤再解密：长度不对的、和当前会话走的路不一致的（网络包要来自会话对端 IP，端口可以变）直接丢。
+    /// 计数器最高位为 1 的是声音包（另一套密钥），解密后只交给声音模块的无锁环，不在这里多做事。
+    fn on_dgram(&self, pkt: &[u8], src: Option<SocketAddr>) {
+        let n = pkt.len();
+        let audio = crypto::is_audio(pkt);
+        let ok_len = if audio { (AUDIO_MIN_PKT..=AUDIO_MAX_PKT).contains(&n) } else { (UDP_MIN_PKT..=UDP_MAX_PKT).contains(&n) };
+        if !ok_len {
+            return;
+        }
+        let Some(sess) = self.current() else { return };
+        match src {
+            Some(a) if sess.cable || a.ip() != sess.peer.ip() => return,
+            None if !sess.cable => return,
+            _ => {}
+        }
+        let heard = |sess: &Session| {
+            let mut u = lock(&sess.udp_peer);
+            match src {
+                Some(a) => u.heard(a, Instant::now()),
+                None => u.heard_cable(Instant::now()),
+            }
+        };
+        if audio {
+            let Some(a) = &self.opts.audio else { return };
+            let arrive = crate::smooth::now_us() as u32;
+            let Some(plain) = lock(&sess.audio_rx).open(pkt) else { return };
+            heard(&sess);
+            a.packet(sess.id, &plain, arrive);
+            return;
+        }
+        let Some(plain) = lock(&sess.udp_rx).open(pkt) else { return };
+        heard(&sess);
+        if let Some(UdpMsg::Move { epoch, seq, x, y, t }) = UdpMsg::decode(&plain) {
+            self.mark_mouse();
+            #[cfg(test)]
+            self.stats.udp_moves.fetch_add(1, Ordering::Relaxed);
+            self.injector.moved(sess.id, epoch, seq, x, y, t);
+        }
+    }
+
+    /// 这条会话的 UDP 包能发出去吗（经线：线还通；网络：UDP 端口绑上了）。
+    fn dgram_bound(&self, s: &Session) -> bool {
+        if s.cable { self.opts.cable.as_ref().is_some_and(|c| c.ready()) } else { self.udp.get().is_some() }
     }
 
     /// audio-cap 线程：加密发一包声音。会话已换 / UDP 不通（声音不走 TCP）→ false。
@@ -1513,6 +1679,11 @@ impl Net {
         if sess.id != sid || !sess.udp_live() {
             return false;
         }
+        if sess.cable {
+            let Some(c) = &self.opts.cable else { return false };
+            let Some(pkt) = lock(&sess.audio_tx).seal(plain) else { return false };
+            return c.send_dgram(&pkt);
+        }
         let Some(sock) = self.udp.get() else { return false };
         let Some(addr) = lock(&sess.udp_peer).addr else { return false };
         let Some(pkt) = lock(&sess.audio_tx).seal(plain) else { return false };
@@ -1520,6 +1691,14 @@ impl Net {
     }
 
     fn send_udp(&self, s: &Session, m: &UdpMsg) {
+        if s.cable {
+            if let Some(c) = &self.opts.cable {
+                if let Some(pkt) = lock(&s.udp_tx).seal(&m.encode()) {
+                    c.send_dgram(&pkt);
+                }
+            }
+            return;
+        }
         if let Some(sock) = self.udp.get() {
             s.send_udp(sock, m);
         }
@@ -1549,7 +1728,7 @@ impl Net {
     /// 发鼠标位置：UDP；UDP 不可用或不通时也走 TCP（进可靠队列，接收方按 seq 去重）。
     fn send_move(&self, s: &Session, m: &UdpMsg) {
         let UdpMsg::Move { epoch, seq, x, y, .. } = *m else { return };
-        let (udp, tcp) = move_route(self.udp.get().is_some(), s.udp_live());
+        let (udp, tcp) = move_route(self.dgram_bound(s), s.udp_live());
         if udp {
             self.send_udp(s, m);
         }
@@ -1560,7 +1739,7 @@ impl Net {
 
     /// UDP 不通时在状态里说明；通了就清掉。
     fn check_udp(&self, s: &Session) {
-        let bound = self.udp.get().is_some();
+        let bound = self.dgram_bound(s);
         let live = s.udp_live();
         let shown = self.hub.status().last_error == ERR_UDP_DOWN;
         if !bound || (!live && s.started.elapsed() >= UDP_GRACE) {
@@ -2682,7 +2861,7 @@ mod tests {
         let (hub, HubRx { input, desktop, net }) = Hub::new(cfg);
         let hub = Arc::new(hub);
         let injector = Arc::new(Injector::new(hub.clone()));
-        let opts = Opts { bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST), persist: false, dial_every: Duration::from_millis(100), id, audio: None };
+        let opts = Opts { bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST), persist: false, dial_every: Duration::from_millis(100), id, audio: None, cable: None };
         let net = start(hub.clone(), net, injector, opts);
         Node { net, hub, input, desktop }
     }
@@ -3055,6 +3234,14 @@ mod tests {
         assert!(!adopt_layout(2, &x, &x, 2, 5, 9));
         assert!(!adopt_layout(2, &x, &y, 2, 5, 0));
         assert!(!adopt_layout(3, &x, &y, 2, 5, 9));
+        // 鼠标/键盘开关：同上
+        let s = config::ShareCfg { mouse: true, keyboard: true, rev: 2 };
+        assert!(adopt_share(&s, false, true, 3, 9, 5));
+        assert!(!adopt_share(&s, false, true, 1, 5, 9));
+        assert!(adopt_share(&s, false, true, 2, 5, 9));
+        assert!(!adopt_share(&s, false, true, 2, 9, 5));
+        assert!(!adopt_share(&s, true, true, 2, 5, 9));
+        assert!(!adopt_share(&s, false, true, 2, 5, 0));
         // 排布合理性：rev 超前 1 天以上、数值离谱的不要
         let now = 1_700_000_000_000u64;
         assert!(layout_sane(&y, now + 1000, now));

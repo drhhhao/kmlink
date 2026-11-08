@@ -1,36 +1,48 @@
-//! 设置窗口（单独进程：`kmlink.exe settings`，关掉就退出，不占主程序内存）。全部自绘（src/ui.rs），设计稿：设计\设置窗口\proof.html（方向 B「舞台」）。
+//! 设置窗口（单独进程：`kmlink.exe settings`，关掉就退出，不占主程序内存）。全部自绘（src/ui.rs），
+//! 设计稿：设计\设置窗口\侧边栏\（方向 A：侧栏图标块点亮 + 页头总开关；说明.md 有坐标和配色）。
 //!
-//! 窗口 820 x 640（含 32 高的系统标题栏，按 DPI 缩放），不可调大小，标题“kmlink”。跟随系统浅色 / 深色
-//! （注册表 AppsUseLightTheme；收到 WM_SETTINGCHANGE "ImmersiveColorSet" 重画），标题栏用 DWMWA_CAPTION_COLOR 涂成舞台顶色。
+//! 窗口客户区 960 x 540（按 DPI 缩放），不可调大小，标题“kmlink”。跟随系统浅色 / 深色
+//! （注册表 AppsUseLightTheme；收到 WM_SETTINGCHANGE "ImmersiveColorSet" 重画），标题栏用 DWMWA_CAPTION_COLOR 涂成背景顶色。
 //! 改了就生效，没有“保存 / 取消”。
 //!
-//! 1. 舞台（上方 820 x 292，柔和渐变）：两台的显示器缩放到 740 x 188 的区域里居中。每块屏幕是圆角矩形 + “壁纸”渐变
-//!    （本机偏蓝、对方偏绿）+ 柔和投影；主显示器底部一颗玻璃胶囊：名字（本机带“本机”标签）+ “3840×2160 · 150%”，
-//!    其它显示器只写尺寸。主显示器中间一个大编号 1 / 2（config num，定了不随排布变），正放着声音的那台深、别的浅。两台相接的区段画一条绿色细条（鼠标从这里过去）。左上“已连接 / 未连接”，右上“拖动摆放”，
-//!    左下“WiFi电脑 在本机左侧 · 下移 416 像素”，右下“尺寸比例 − 1.00 +”（0.25 ~ 4，步进 0.05，点了立即生效）。
-//!    - 拖对方的屏幕：放大 2.5%、投影加深、94% 不透明，绿色虚线框标出松手后吸附的位置，左下文字实时变；拖动中画布比例不变。
+//! 左边玻璃侧栏：顶上连接状态（已连接 / 未连接 / 已暂停 + 对方名字），下面 连接 /（分隔）鼠标、键盘、声音、剪贴板 / 通用。
+//! 鼠标、键盘、声音、剪贴板各有一个总开关（在页头右边），互不影响：开着侧栏图标块是绿的，关着变灰、右边写“关”；
+//! 关着时那一页的内容变淡但照样能改。鼠标、键盘开关两台同步（config [share]，改了写新 rev，主程序发给对方）；
+//! 声音开关 = audio.mode 关 / 上次开着的那档（audio.last）；剪贴板开关 = clipboard.enabled（只管本机收发）。
+//! 未连接时页头开关左边一颗“连上后生效”。
+//!
+//! 1. 连接页：两台设备条（左 1 号、右 2 号，中间一条连线 + 链接图标；没连上时虚点、对方虚线框），
+//!    卡片：对方 IP（填一台即可）、配对密钥（两台须相同；只显示首尾，旁边复制 / 换新密钥，换之前弹小确认框）、
+//!    本机 IP（只列真实局域网 IPv4：去掉回环、169.254、Clash 的 198.18/15；有网关的优先）+ 复制。
+//!    页头右边“暂停 / 继续”（和托盘同一个动作，写 update_cmd.json 的 pause / resume，主程序每秒取走）。
+//! 2. 鼠标页：舞台——两台的显示器缩放到舞台区域里居中，每块屏幕是圆角矩形 + “壁纸”渐变（本机偏蓝、对方偏绿）+ 柔和投影；
+//!    主显示器左上角一颗玻璃编号圆（config num，定了不随排布变），底部玻璃胶囊：名字（本机带“本机”标签）+ 分辨率 · 缩放。
+//!    两台相接的区段画一条绿色细条（鼠标从这里过去；鼠标关着 / 没连上时是虚点，鼠标关着壁纸去色）。
+//!    右上“拖动摆放”，底行“机械革命 在本机左侧 · 下移 416 像素”、“尺寸比例 − 1.00 +”（0.25 ~ 4，步进 0.05）。
+//!    - 拖对方的屏幕：放大 2.5%、投影加深、94% 不透明，绿色虚线框标出松手后吸附的位置，底行文字实时变；拖动中画布比例不变。
 //!      松手后 240ms 滑进虚线框（cubic-bezier(.2,.8,.2,1)），然后写配置（rev = next_rev，排布真变了才写）。
 //!    - 改名：悬停名字出现浅底 + 铅笔、手形光标；点一下原地变输入框（绿圈），第二行变“回车保存”，Esc 取消，最多 16 字；
-//!      改好后名字旁绿勾 1.2 秒后淡出。本机名写 config.toml 的 name（主程序重新加载后会重发 Hello，对方就知道了）；
-//!      对方名写 rename_peer.json（主程序约每秒取走，连着时发给对方，对方改它自己的 name）。未连接时对方名字灰色、不能改，悬停提示“连上后可改”。
-//!    - 对方屏幕来自 peer.json（主程序写，含每块屏的 DPI，没有就只写分辨率）；从没连上过：名字“对方”、尺寸“—”、1920×1080 灰色虚线占位。
-//! 2. 卡片（下方，两栏各 4 行，行高 50）：左“连接”——对方 IP（填一台即可）、配对密钥（两台须相同；只显示首尾，旁边复制 / 换新密钥，
-//!    换之前弹小确认框）、本机 IP（只列真实局域网 IPv4：去掉回环、169.254、Clash 的 198.18/15；有网关的优先）+ 复制、开机自启。
-//!    右“共用”——声音（四段分段控件 关 / 1 / 2 / 两台：1、2 = 舞台上标着这个大数字的那台放，存成本机视角的
-//!    config audio.mode off/here/there/both（config::audio_slot_mode；编号见 config num），灰字随档位变，
-//!    未连接时灰字“连上后生效”；改了写 mode + 新 rev，主程序同步给对方）、键盘跟随、剪贴板同步、复制提示。点了立即写配置。
-//!    设计稿：设计\设置窗口\声音\（方案 A）。
-//!    输入框（对方 IP、密钥、名字）按回车或失焦时校验：对就写入；不对则该行提示变红、输入框红圈。输入框用真的 EDIT 控件
-//!    （光标、选择、中文输入法、粘贴都靠它），平时隐藏，点到哪个框才盖上去。
-//! 3. 底部一行（设计稿：设计\检查更新\settings.html）：左“kmlink 0.1.1”（对方不支持一键更新时带“· 对方 0.1.0”），
-//!    有新版时绿色小标签“新版 x.y.z”；右边一个动作：检查更新 / 正在检查… / 已是最新 / 更新两台（对方不支持：“对方需手动更新”+
-//!    更新本机）/ 正在更新 45% + 进度条 / 正在重启… / 已更新到 x / 更新失败 · 原因 + 重试。状态来自 status.json 的 upd* 字段；
-//!    点按钮写 update_cmd.json（"check" / "update"），主程序每秒取走。主程序没在运行时右边不放东西。
-//! 4. 状态：每 500ms 读 status.json（主程序写；connected 为真、主程序互斥量在且 pid 还活着才算已连接）、peer.json、config.toml（改了就重新读入）。
+//!      改好后名字旁绿勾 1.2 秒后淡出。本机名写 config.toml 的 name；对方名写 rename_peer.json（主程序约每秒取走，
+//!      连着时发给对方）。未连接时对方名字灰色、不能改，悬停提示“连上后可改”。
+//!    - 对方屏幕来自 peer.json；从没连上过：名字“对方”、尺寸“—”、1920×1080 灰色虚线占位。
+//!    卡片：移动速度滑杆（input.speed，0.5～2.0，步长 0.1；拖的时候只改内存，松手写配置）。
+//! 3. 键盘页：设备条 + “跟随鼠标”开关（input.kbd_follow；鼠标关着时键盘只能靠跟随过去，开关显示为开、不能点）。
+//! 4. 声音页：设备条（正在放的那台编号实心 + 屏幕中间喇叭；点屏幕 = 选在哪放），卡片：在哪放（1 / 2 / 两台，
+//!    1、2 = 标着这个编号的那台放，存成本机视角的 audio.mode here/there/both，改了写新 rev 由主程序同步给对方；
+//!    声音关着时点了只记进 audio.last），音量滑杆（audio.volume，0～100%，步长 5%）。
+//! 5. 剪贴板页：复制提示开关（clipboard.notify）。
+//! 6. 通用页：开机自启（直接改注册表）、暂停热键（只显示）；版本 + 更新卡片：左“kmlink 0.1.2”（对方不支持一键更新时带
+//!    “· 对方 0.1.0”），有新版时绿色小标签；右边一个动作：检查更新 / 正在检查… / 已是最新 / 更新两台（对方不支持：
+//!    “对方需手动更新”+ 更新本机）/ 正在更新 45% + 进度条 / 正在重启… / 已更新到 x / 更新失败 · 原因 + 重试。
+//!    状态来自 status.json 的 upd* 字段；点按钮写 update_cmd.json（"check" / "update"）。主程序没在运行时右边不放东西。
+//! 输入框（对方 IP、密钥、名字）按回车或失焦时校验：对就写入；不对则该行提示变红、输入框红圈。输入框用真的 EDIT 控件
+//! （光标、选择、中文输入法、粘贴都靠它），平时隐藏，点到哪个框才盖上去。
+//! 状态：每 500ms 读 status.json（主程序写；connected 为真、主程序互斥量在且 pid 还活着才算已连接）、peer.json、config.toml（改了就重新读入）。
 //!
 //! 只允许一个设置窗口（命名互斥量 Local\kmlink-settings），再打开就把已有的窗口提到前面。
 //! 所有窗口坐标是物理像素（进程已 PerMonitorV2）；布局常量是 96 DPI 下的逻辑像素，乘 s = dpi/96。
-//! 调试截图用：KMLINK_THEME=dark|light 强制主题；KMLINK_UI=hover|edit|drag|offhover|popover 直接呈现某个状态。
+//! 调试截图用：KMLINK_THEME=dark|light 强制主题；KMLINK_PAGE=conn|mouse|kbd|audio|clip|general 打开就在这一页；
+//! KMLINK_UI=hover|edit|drag|offhover|popover 直接呈现某个状态（hover/edit/drag/offhover 在鼠标页，popover 在连接页）。
 
 use crate::config::{self, Config};
 use crate::geom::{Desk, Layout, Rect, Side};
@@ -481,55 +493,194 @@ fn system_dark() -> bool {
     };
     r.is_ok() && v == 0
 }
-
 // ---------------------------------------------------------------------------
-// 布局常量（逻辑像素，客户区坐标；客户区 820 x 568）
+// 布局常量（逻辑像素，客户区坐标；客户区 960 x 540；设计稿 设计\设置窗口\侧边栏\说明.md）
 // ---------------------------------------------------------------------------
 
-const CLIENT_W: f32 = 820.0;
-const CLIENT_H: f32 = 608.0;
-/// 底部一行（版本 / 更新）的竖直中线
-const FOOT_CY: f32 = 580.0;
-const STAGE_H: f32 = 292.0;
+const CLIENT_W: f32 = 960.0;
+const CLIENT_H: f32 = 540.0;
+
+/// 侧栏里的一页。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Page {
+    Conn,
+    Mouse,
+    Kbd,
+    Audio,
+    Clip,
+    General,
+}
+
+const PAGES: [Page; 6] = [Page::Conn, Page::Mouse, Page::Kbd, Page::Audio, Page::Clip, Page::General];
+
+impl Page {
+    fn title(self) -> &'static str {
+        match self {
+            Page::Conn => "连接",
+            Page::Mouse => "鼠标",
+            Page::Kbd => "键盘",
+            Page::Audio => "声音",
+            Page::Clip => "剪贴板",
+            Page::General => "通用",
+        }
+    }
+    /// 页头标题下的灰字（连接页按连接状态现写）。
+    fn desc(self) -> &'static str {
+        match self {
+            Page::Mouse => "推过屏幕边就过去",
+            Page::Kbd => "打字到对方",
+            Page::Audio => "两台声音互通",
+            Page::Clip => "两边复制粘贴",
+            _ => "",
+        }
+    }
+    fn icon(self) -> Icon {
+        match self {
+            Page::Conn => Icon::Link,
+            Page::Mouse => Icon::Mouse,
+            Page::Kbd => Icon::Keyboard,
+            Page::Audio => Icon::Speaker,
+            Page::Clip => Icon::Clipboard,
+            Page::General => Icon::Gear,
+        }
+    }
+    /// 有总开关的页（对应 Sw 的下标）。
+    fn sw(self) -> Option<Sw> {
+        match self {
+            Page::Mouse => Some(Sw::Mouse),
+            Page::Kbd => Some(Sw::Kbd),
+            Page::Audio => Some(Sw::Audio),
+            Page::Clip => Some(Sw::Clip),
+            _ => None,
+        }
+    }
+    /// 侧栏里这一项的顶。
+    fn nav_top(self) -> f32 {
+        match self {
+            Page::Conn => 72.0,
+            Page::Mouse => 130.0,
+            Page::Kbd => 174.0,
+            Page::Audio => 218.0,
+            Page::Clip => 262.0,
+            Page::General => 468.0,
+        }
+    }
+    fn from_env(s: &str) -> Option<Page> {
+        PAGES.iter().copied().find(|p| format!("{p:?}").eq_ignore_ascii_case(s))
+    }
+}
+
+/// 开关（下标 = 动画数组的位置）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sw {
+    Mouse,
+    Kbd,
+    Audio,
+    Clip,
+    Follow,
+    Notify,
+    Autostart,
+}
+
+const SW_N: usize = 7;
+
+/// 侧栏玻璃板
+const SIDEBAR: R = R::new(10.0, 10.0, 200.0, 520.0);
+
+fn nav_rect(p: Page) -> R {
+    R::new(18.0, p.nav_top(), 182.0, 40.0)
+}
+
+/// 页头：图标块、总开关、连接页的暂停按钮（右对齐到 936，宽度量字）
+const HEAD_ICON: R = R::new(236.0, 24.0, 40.0, 40.0);
+const HEAD_SW: R = R::new(888.0, 32.0, 48.0, 28.0);
+/// 内容区左右、卡片里控件的右边
+const CX: f32 = 236.0;
+const CW: f32 = 700.0;
+const CTL_R: f32 = 916.0;
+const ROW_H: f32 = 50.0;
+
+// 连接 / 键盘 / 声音页：顶上的两台设备条，下面一张卡片
+const STRIP: R = R::new(236.0, 92.0, 700.0, 156.0);
+const CARD_Y: f32 = 264.0;
+/// 卡片第一行的顶（卡片上内边距 8）
+const ROW0: f32 = CARD_Y + 8.0;
+const IP_BOX: R = R::new(716.0, ROW0 + 9.0, 200.0, 32.0);
+const KEY_BOX: R = R::new(684.0, ROW0 + ROW_H + 9.0, 156.0, 32.0);
+const COPY_KEY: R = R::new(846.0, ROW0 + ROW_H + 9.0, 32.0, 32.0);
+const NEW_KEY: R = R::new(884.0, ROW0 + ROW_H + 9.0, 32.0, 32.0);
+const COPY_IP: R = R::new(888.0, ROW0 + ROW_H * 2.0 + 11.0, 28.0, 28.0);
+const POP: R = R::new(676.0, KEY_BOX.y - 8.0 - 80.0, 240.0, 80.0);
+const POP_OK: R = R::new(POP.x + 168.0, POP.y + 40.0, 60.0, 28.0);
+const POP_CANCEL: R = R::new(POP.x + 100.0, POP.y + 40.0, 60.0, 28.0);
+
+// 鼠标页：舞台 + 移动速度
+const STAGE: R = R::new(236.0, 92.0, 700.0, 330.0);
 /// 舞台里画屏幕的区域
-const AREA: R = R::new(40.0, 46.0, 740.0, 188.0);
+const AREA: R = R::new(266.0, 130.0, 640.0, 220.0);
 /// 两组屏幕之间各让开 3（中间放接缝绿条）
 const GAP: f32 = 3.0;
-const CARD: R = R::new(16.0, 308.0, 788.0, 244.0);
-/// 卡片第一行顶
-const ROW0: f32 = 342.0;
-const ROW_H: f32 = 50.0;
-const IP_BOX: R = R::new(204.0, 351.0, 186.0, 32.0);
-const KEY_BOX: R = R::new(166.0, 401.0, 148.0, 32.0);
-const COPY_KEY: R = R::new(320.0, 401.0, 32.0, 32.0);
-const NEW_KEY: R = R::new(358.0, 401.0, 32.0, 32.0);
-const COPY_IP: R = R::new(362.0, 453.0, 28.0, 28.0);
-const STEPPER: R = R::new(706.0, 250.0, 94.0, 28.0);
-const MINUS: R = R::new(710.0, 253.0, 24.0, 22.0);
-const PLUS: R = R::new(772.0, 253.0, 24.0, 22.0);
-const POP: R = R::new(150.0, 313.0, 240.0, 80.0);
-const POP_OK: R = R::new(318.0, 353.0, 60.0, 28.0);
-const POP_CANCEL: R = R::new(250.0, 353.0, 60.0, 28.0);
-/// 开关：0～2 在右栏第 2～4 行，3（开机自启）在左栏第 4 行。
-const SWITCH_LABELS: [&str; 4] = ["键盘跟随", "剪贴板同步", "复制提示", "开机自启"];
-const SW_N: usize = 4;
-/// 声音分段控件（右栏第 1 行，右边和开关对齐），每段 44，槽里留 2。
-const AUDIO_SEG: R = R::new(604.0, 353.0, 180.0, 28.0);
-/// 1、2 = 舞台上标着这个大数字的那台放（config::audio_slot_mode 换成本机视角的 here/there）。
-const AUDIO_LABELS: [&str; 4] = ["关", "1", "2", "两台"];
-const AUDIO_HINTS: [&str; 4] = ["各放各的", "全在 1 号放", "全在 2 号放", "混在一起都放"];
+const STEPPER: R = R::new(828.0, 382.0, 94.0, 28.0);
+const MINUS: R = R::new(832.0, 385.0, 24.0, 22.0);
+const PLUS: R = R::new(894.0, 385.0, 24.0, 22.0);
+const SPEED_CARD_Y: f32 = 438.0;
+const SPEED_MIN: f64 = 0.5;
+const SPEED_MAX: f64 = 2.0;
 
-fn audio_index(c: &Config) -> usize {
-    config::audio_mode_slot(c.audio.mode, c.me_one())
+// 声音页：在哪放（3 段 x 52，槽里留 2）、音量
+const AUDIO_SEG: R = R::new(CTL_R - 160.0, ROW0 + 11.0, 160.0, 28.0);
+/// 段 k 放第 k+1 档（audio_slot_mode 的 1 / 2 / 3；0 = 关 挪成了页头开关）。
+const AUDIO_LABELS: [&str; 3] = ["1", "2", "两台"];
+const AUDIO_HINTS: [&str; 3] = ["全在 1 号放", "全在 2 号放", "两台都放"];
+
+// 剪贴板 / 通用页：卡片从内容区顶开始
+const TOP_CARD_Y: f32 = 92.0;
+/// 通用页第二张卡片（版本 / 更新），一行
+const VER_CARD_Y: f32 = 224.0;
+const FOOT_CY: f32 = VER_CARD_Y + 8.0 + ROW_H / 2.0;
+
+/// 滑杆：轨道左边、宽（右边留 60 写数值）
+const SLIDER_X: f32 = CTL_R - 60.0 - 200.0;
+const SLIDER_W: f32 = 200.0;
+
+/// 第 row 行（从 top 起）里滑杆的点击区。
+fn slider_hit(top: f32) -> R {
+    R::new(SLIDER_X - 12.0, top + 8.0, SLIDER_W + 24.0, ROW_H - 16.0)
+}
+
+/// 滑杆上 x 处的比例（0～1）。
+fn slider_frac(x: f32) -> f32 {
+    ((x - SLIDER_X) / SLIDER_W).clamp(0.0, 1.0)
+}
+
+fn speed_frac(s: f64) -> f32 {
+    ((s.clamp(SPEED_MIN, SPEED_MAX) - SPEED_MIN) / (SPEED_MAX - SPEED_MIN)) as f32
+}
+
+/// 滑杆比例 → 速度（步长 0.1）。
+fn speed_at(frac: f32) -> f64 {
+    let v = SPEED_MIN + (SPEED_MAX - SPEED_MIN) * frac as f64;
+    ((v * 10.0).round() / 10.0).clamp(SPEED_MIN, SPEED_MAX)
+}
+
+/// 滑杆比例 → 音量（步长 5%）。
+fn volume_at(frac: f32) -> f32 {
+    ((frac * 20.0).round() / 20.0).clamp(0.0, 1.0)
+}
+
+/// 声音开着时选中的段（关着时 = 上次开着的那档）。
+fn audio_seg_index(c: &Config) -> usize {
+    let m = if c.audio.mode == config::AudioMode::Off { c.audio.on_mode() } else { c.audio.mode };
+    config::audio_mode_slot(m, c.me_one()).max(1) - 1
 }
 
 /// 分段控件里 x 落在第几段（两端的 2 像素边算进最近的段）。
 fn audio_hit(x: f32) -> usize {
-    (((x - AUDIO_SEG.x - 2.0) / 44.0).floor().max(0.0) as usize).min(3)
+    (((x - AUDIO_SEG.x - 2.0) / 52.0).floor().max(0.0) as usize).min(2)
 }
 
 fn audio_seg(k: usize) -> R {
-    R::new(AUDIO_SEG.x + 2.0 + 44.0 * k as f32, AUDIO_SEG.y + 2.0, 44.0, AUDIO_SEG.h - 4.0)
+    R::new(AUDIO_SEG.x + 2.0 + 52.0 * k as f32, AUDIO_SEG.y + 2.0, 52.0, AUDIO_SEG.h - 4.0)
 }
 
 /// 逻辑像素矩形。
@@ -556,17 +707,19 @@ impl R {
     }
 }
 
-fn switch_row(i: usize) -> R {
-    if i == 3 {
-        R::new(36.0, ROW0 + ROW_H * 3.0, 354.0, ROW_H)
-    } else {
-        R::new(430.0, ROW0 + ROW_H * (i + 1) as f32, 354.0, ROW_H)
-    }
+/// 卡片里第 i 行（从 top 起）的行矩形。
+fn row_rect(top: f32, i: usize) -> R {
+    R::new(CX + 20.0, top + 8.0 + ROW_H * i as f32, CW - 40.0, ROW_H)
 }
 
-fn switch_rect(i: usize) -> R {
-    let r = switch_row(i);
-    R::new(r.x + r.w - 40.0, r.y + (ROW_H - 24.0) / 2.0, 40.0, 24.0)
+/// 行里右边的普通开关（40 x 24）。
+fn row_switch(row: R) -> R {
+    R::new(CTL_R - 40.0, row.y + (ROW_H - 24.0) / 2.0, 40.0, 24.0)
+}
+
+/// 连接页的暂停 / 继续按钮（宽度量字后定）。
+fn pause_rect(w: f32) -> R {
+    R::new(CX + CW - w, 31.0, w, 30.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -588,9 +741,16 @@ enum Hot {
     CopyKey,
     NewKey,
     CopyIp,
-    Switch(usize),
-    /// 声音分段控件的第几段
+    Switch(Sw),
+    /// 侧栏的一项
+    Nav(Page),
+    /// 声音分段控件的第几段（0 = “1”）
     Audio(usize),
+    /// 滑杆：移动速度 / 音量
+    Speed,
+    Volume,
+    /// 连接页的暂停 / 继续
+    Pause,
     PopCancel,
     PopOk,
     Pop,
@@ -684,15 +844,17 @@ struct Fonts {
     stat: Font,
     stat_b: Font,
     step: Font,
-    group: Font,
     label: Font,
     hint: Font,
     input: Font,
     mono: Font,
     btn: Font,
     seg_on: Font,
-    /// 舞台上每台主显示器中间的大编号
-    big: Font,
+    /// 页头标题、侧栏项（选中加粗）、侧栏顶的连接状态
+    title: Font,
+    nav: Font,
+    nav_b: Font,
+    side_b: Font,
     /// 底部一行
     foot: Font,
     foot_b: Font,
@@ -719,14 +881,16 @@ impl Fonts {
             stat: uf(12.5, 400, s),
             stat_b: uf(12.5, 700, s),
             step: uf(12.5, 600, s),
-            group: uf(12.0, 700, s),
             label: uf(13.0, 400, s),
             hint: uf(11.5, 400, s),
             input: Font::new(SEGOE, 13.0, 400, s),
             mono: Font::new(&["Cascadia Mono", "Consolas"], 12.0, 400, s),
             btn: uf(12.5, 400, s),
             seg_on: uf(12.5, 700, s),
-            big: uf(46.0, 600, s),
+            title: uf(20.0, 700, s),
+            nav: uf(13.5, 400, s),
+            nav_b: uf(13.5, 700, s),
+            side_b: uf(14.0, 700, s),
             foot: uf(12.5, 400, s),
             foot_b: uf(12.5, 700, s),
             upchip: uf(11.5, 700, s),
@@ -782,7 +946,17 @@ struct App {
     err_name: bool,
     sw: [bool; SW_N],
     sw_t: [Option<Instant>; SW_N],
-    /// 声音选中的段、滑块动画（起点位置，以段为单位）
+    /// 当前页；侧栏选中块的滑动动画（起点的顶 y）
+    page: Page,
+    page_from: f32,
+    page_t: Option<Instant>,
+    /// 正在拖的滑杆（Hot::Speed / Hot::Volume）
+    slide: Option<Hot>,
+    /// 主程序报的“已暂停”
+    paused: bool,
+    /// 刚点了暂停 / 继续：主程序取走命令前先按点的显示（最多 3 秒）
+    pause_click: Option<(bool, Instant)>,
+    /// 声音分段选中的段（0 = “1”）、滑块动画（起点位置，以段为单位）
     audio: usize,
     audio_from: f32,
     audio_t: Option<Instant>,
@@ -910,7 +1084,62 @@ impl App {
         self.drop.as_ref().map(|d| ui::cubic_bezier(0.2, 0.8, 0.2, 1.0, ms_since(d.t0) / DROP_MS))
     }
 
-    fn switch_t(&self, i: usize) -> f32 {
+    /// 侧栏选中块现在的顶（带滑动动画）。
+    fn nav_y(&self) -> f32 {
+        let to = self.page.nav_top();
+        match self.page_t {
+            Some(t0) => {
+                let e = ui::cubic_bezier(0.2, 0.8, 0.2, 1.0, (ms_since(t0) / DROP_MS).min(1.0));
+                self.page_from + (to - self.page_from) * e
+            }
+            None => to,
+        }
+    }
+
+    fn go_page(&mut self, p: Page) {
+        if p != self.page {
+            self.page_from = self.nav_y();
+            self.page = p;
+            self.page_t = Some(Instant::now());
+            self.popover = false;
+        }
+    }
+
+    fn is_on(&self, s: Sw) -> bool {
+        self.sw[s as usize]
+    }
+
+    fn set_sw(&mut self, s: Sw, v: bool) {
+        let i = s as usize;
+        if self.sw[i] != v {
+            self.sw[i] = v;
+            self.sw_t[i] = Some(Instant::now());
+        }
+    }
+
+    /// 配置里各开关的样子（开机自启以注册表为准，见 run）。
+    fn sw_from(c: &Config, autostart: bool) -> [bool; SW_N] {
+        [
+            c.share.mouse,
+            c.share.keyboard,
+            c.audio.mode != config::AudioMode::Off,
+            c.clipboard.enabled,
+            c.input.kbd_follow,
+            c.clipboard.notify,
+            autostart,
+        ]
+    }
+
+    /// 显示的“已暂停”（刚点过按钮时先按点的显示）。
+    fn paused_now(&self) -> bool {
+        match self.pause_click {
+            Some((v, t)) if t.elapsed() < Duration::from_secs(3) => v,
+            _ => self.paused,
+        }
+    }
+
+    fn switch_t(&self, s: Sw) -> f32 {
+        let i = s as usize;
         let target = if self.sw[i] { 1.0 } else { 0.0 };
         match self.sw_t[i] {
             Some(t0) => {
@@ -941,6 +1170,7 @@ impl App {
         self.drop.is_some()
             || self.sw_t.iter().flatten().any(|t| ms_since(*t) < SWITCH_MS + 20.0)
             || self.audio_t.is_some_and(|t| ms_since(t) < SWITCH_MS + 20.0)
+            || self.page_t.is_some_and(|t| ms_since(t) < DROP_MS + 20.0)
             || self.flash.is_some_and(|(_, t)| ms_since(t) < FLASH_MS + FADE_MS + 20.0)
             || self.copied.is_some_and(|(_, t)| ms_since(t) < FLASH_MS + 20.0)
             || matches!(self.upd_view(), UpdView::Checking | UpdView::Restarting)
@@ -977,7 +1207,13 @@ impl App {
         };
         let f = if ink { &self.fonts.fbtn_ink } else { &self.fonts.fbtn };
         let w = self.measure(f, t) + 28.0;
-        Some((R::new(CLIENT_W - 20.0 - w, FOOT_CY - 14.0, w, 28.0), t, ink))
+        Some((R::new(CTL_R - w, FOOT_CY - 15.0, w, 30.0), t, ink))
+    }
+
+    /// 暂停 / 继续按钮的宽。
+    fn pause_w(&self) -> f32 {
+        let t = if self.paused_now() { "继续" } else { "暂停" };
+        14.0 + 12.0 + 6.0 + self.measure(&self.fonts.fbtn_ink, t) + 16.0
     }
 
     fn measure(&self, f: &Font, t: &str) -> f32 {
@@ -1231,8 +1467,25 @@ fn scene(a: &App) -> Scene {
     out
 }
 
+/// 设备条（连接 / 键盘 / 声音页）上的两台屏幕：左边 1 号、右边 2 号。(屏幕矩形, 是对方, 编号)。
+fn strip_screens(a: &App) -> [(R, bool, u8); 2] {
+    let aspect = |ms: &[Mon]| {
+        let m = ms.iter().find(|m| m.primary).or(ms.first());
+        m.map(|m| m.r.w() as f32 / m.r.h().max(1) as f32).unwrap_or(16.0 / 9.0)
+    };
+    let h = 96.0;
+    let w_of = |ms: &[Mon]| (h * aspect(ms)).clamp(120.0, 190.0);
+    let me_one = a.cfg.me_one();
+    let (l_peer, r_peer) = if me_one { (false, true) } else { (true, false) };
+    let side_w = |peer: bool| if peer { w_of(&a.peer) } else { w_of(&a.mine) };
+    let (wl, wr) = (side_w(l_peer), side_w(r_peer));
+    let x0 = STRIP.x + (STRIP.w - (wl + 120.0 + wr)) / 2.0;
+    let top = STRIP.y + 18.0;
+    [(R::new(x0, top, wl, h), l_peer, 1), (R::new(x0 + wl + 120.0, top, wr, h), r_peer, 2)]
+}
+
 fn hit(a: &App, sc: &Scene, x: f32, y: f32) -> Hot {
-    if a.popover {
+    if a.popover && a.page == Page::Conn {
         if POP_OK.contains(x, y) {
             return Hot::PopOk;
         }
@@ -1243,58 +1496,98 @@ fn hit(a: &App, sc: &Scene, x: f32, y: f32) -> Hot {
             return Hot::Pop;
         }
     }
-    if a.drag.is_some() || a.drop.is_some() {
+    if a.drag.is_some() || a.drop.is_some() || a.slide.is_some() {
         return Hot::None;
     }
-    if a.upd_button().is_some_and(|(r, ..)| r.contains(x, y)) {
-        return Hot::Upd;
+    if SIDEBAR.contains(x, y) {
+        return PAGES.iter().find(|p| nav_rect(**p).contains(x, y)).map_or(Hot::None, |p| Hot::Nav(*p));
     }
-    if IP_BOX.contains(x, y) {
-        return Hot::Ip;
+    if let Some(s) = a.page.sw()
+        && R::new(HEAD_SW.x - 4.0, HEAD_SW.y - 4.0, HEAD_SW.w + 8.0, HEAD_SW.h + 8.0).contains(x, y)
+    {
+        return Hot::Switch(s);
     }
-    if KEY_BOX.contains(x, y) {
-        return Hot::Key;
-    }
-    if COPY_KEY.contains(x, y) {
-        return Hot::CopyKey;
-    }
-    if NEW_KEY.contains(x, y) {
-        return Hot::NewKey;
-    }
-    if !a.ips.is_empty() && COPY_IP.contains(x, y) {
-        return Hot::CopyIp;
-    }
-    if AUDIO_SEG.contains(x, y) {
-        return Hot::Audio(audio_hit(x));
-    }
-    for i in 0..SW_N {
-        if switch_row(i).contains(x, y) {
-            return Hot::Switch(i);
+    match a.page {
+        Page::Conn => {
+            if a.daemon && pause_rect(a.pause_w()).contains(x, y) {
+                return Hot::Pause;
+            }
+            if IP_BOX.contains(x, y) {
+                return Hot::Ip;
+            }
+            if KEY_BOX.contains(x, y) {
+                return Hot::Key;
+            }
+            if COPY_KEY.contains(x, y) {
+                return Hot::CopyKey;
+            }
+            if NEW_KEY.contains(x, y) {
+                return Hot::NewKey;
+            }
+            if !a.ips.is_empty() && COPY_IP.contains(x, y) {
+                return Hot::CopyIp;
+            }
         }
-    }
-    if MINUS.contains(x, y) {
-        return Hot::Minus;
-    }
-    if PLUS.contains(x, y) {
-        return Hot::Plus;
-    }
-    if y >= STAGE_H {
-        return Hot::None;
-    }
-    if a.edit != Some(Field::LocalName)
-        && let Some(r) = sc.name_local
-        && r.contains(x, y)
-    {
-        return Hot::NameLocal;
-    }
-    if a.edit != Some(Field::PeerName)
-        && let Some(r) = sc.name_peer
-        && r.contains(x, y)
-    {
-        return if a.connected { Hot::NamePeer } else { Hot::NamePeerOff };
-    }
-    if sc.scr.iter().any(|s| s.peer && s.r.contains(x, y)) {
-        return Hot::Peer;
+        Page::Mouse => {
+            if MINUS.contains(x, y) {
+                return Hot::Minus;
+            }
+            if PLUS.contains(x, y) {
+                return Hot::Plus;
+            }
+            if slider_hit(row_rect(SPEED_CARD_Y, 0).y).contains(x, y) {
+                return Hot::Speed;
+            }
+            if !STAGE.contains(x, y) {
+                return Hot::None;
+            }
+            if a.edit != Some(Field::LocalName)
+                && let Some(r) = sc.name_local
+                && r.contains(x, y)
+            {
+                return Hot::NameLocal;
+            }
+            if a.edit != Some(Field::PeerName)
+                && let Some(r) = sc.name_peer
+                && r.contains(x, y)
+            {
+                return if a.connected { Hot::NamePeer } else { Hot::NamePeerOff };
+            }
+            if sc.scr.iter().any(|s| s.peer && s.r.contains(x, y)) {
+                return Hot::Peer;
+            }
+        }
+        Page::Kbd => {
+            if row_rect(CARD_Y, 0).contains(x, y) && a.cfg.share.mouse {
+                return Hot::Switch(Sw::Follow);
+            }
+        }
+        Page::Audio => {
+            if AUDIO_SEG.contains(x, y) {
+                return Hot::Audio(audio_hit(x));
+            }
+            if slider_hit(row_rect(CARD_Y, 1).y).contains(x, y) {
+                return Hot::Volume;
+            }
+            for (r, _, n) in strip_screens(a) {
+                if r.contains(x, y) {
+                    return Hot::Audio(n as usize - 1);
+                }
+            }
+        }
+        Page::Clip => {
+            if row_rect(TOP_CARD_Y, 0).contains(x, y) {
+                return Hot::Switch(Sw::Notify);
+            }
+        }
+        Page::General => {
+            if row_rect(TOP_CARD_Y, 0).contains(x, y) {
+                return Hot::Switch(Sw::Autostart);
+            }
+            if a.upd_button().is_some_and(|(r, ..)| r.contains(x, y)) {
+                return Hot::Upd;
+            }
+        }
     }
     Hot::None
 }
@@ -1304,17 +1597,25 @@ fn hit(a: &App, sc: &Scene, x: f32, y: f32) -> Hot {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-enum Icon {
+pub(crate) enum Icon {
     Copy,
     Refresh,
     Pencil,
     Check,
     Minus,
     Plus,
+    Link,
+    Mouse,
+    Keyboard,
+    Speaker,
+    Clipboard,
+    Gear,
+    Pause,
+    Play,
 }
 
 /// 图标（24 格的 viewBox，照设计稿的 SVG），中心 (cx, cy)，边长 size，线宽 sw（viewBox 单位）。
-fn icon(p: &mut Painter, which: Icon, cx: f32, cy: f32, size: f32, sw: f32, c: Rgba) {
+pub(crate) fn icon(p: &mut Painter, which: Icon, cx: f32, cy: f32, size: f32, sw: f32, c: Rgba) {
     use std::f32::consts::PI;
     let k = size / 24.0;
     let (x0, y0) = (cx - size / 2.0, cy - size / 2.0);
@@ -1357,6 +1658,78 @@ fn icon(p: &mut Painter, which: Icon, cx: f32, cy: f32, size: f32, sw: f32, c: R
         Icon::Check => p.polyline(&[m(5.0, 12.5), m(9.5, 17.0), m(19.0, 7.5)], w, c),
         Icon::Minus => p.polyline(&[m(5.0, 12.0), m(19.0, 12.0)], w, c),
         Icon::Plus => p.stroke(&[ln(m(5.0, 12.0), m(19.0, 12.0)), ln(m(12.0, 5.0), m(12.0, 19.0))], w, c),
+        Icon::Link => {
+            let (l, r) = (m(7.0, 12.0), m(17.0, 12.0));
+            let segs = [
+                Seg::Arc(l.0, l.1, 5.0 * k, PI / 2.0, PI * 1.5),
+                ln(m(7.0, 7.0), m(9.5, 7.0)),
+                ln(m(7.0, 17.0), m(9.5, 17.0)),
+                Seg::Arc(r.0, r.1, 5.0 * k, -PI / 2.0, PI / 2.0),
+                ln(m(14.5, 7.0), m(17.0, 7.0)),
+                ln(m(14.5, 17.0), m(17.0, 17.0)),
+                ln(m(8.5, 12.0), m(15.5, 12.0)),
+            ];
+            p.stroke(&segs, w, c);
+        }
+        Icon::Mouse => {
+            let (x, y) = m(6.0, 3.0);
+            p.ring(x, y, 12.0 * k, 18.0 * k, 6.0 * k, -w / 2.0, w / 2.0, c);
+            p.polyline(&[m(12.0, 7.0), m(12.0, 10.5)], w, c);
+        }
+        Icon::Keyboard => {
+            let (x, y) = m(2.5, 5.5);
+            p.ring(x, y, 19.0 * k, 13.0 * k, 2.5 * k, -w / 2.0, w / 2.0, c);
+            for (dx, dy) in [(6.5, 9.5), (10.0, 9.5), (14.0, 9.5), (17.5, 9.5), (6.5, 12.8), (17.5, 12.8)] {
+                let (px, py) = m(dx, dy);
+                p.circle(px, py, 1.15 * k, c);
+            }
+            p.polyline(&[m(9.5, 15.0), m(14.5, 15.0)], w, c);
+        }
+        Icon::Speaker => {
+            p.polyline(&[m(11.0, 5.0), m(6.0, 9.0), m(3.0, 9.0), m(3.0, 15.0), m(6.0, 15.0), m(11.0, 19.0), m(11.0, 5.0)], w, c);
+            let (ccx, ccy) = m(12.0, 12.0);
+            p.stroke(&[Seg::Arc(ccx, ccy, 4.9 * k, -PI / 4.0, PI / 4.0)], w, c);
+            p.stroke(&[Seg::Arc(ccx, ccy, 9.2 * k, -PI / 4.0, PI / 4.0)], w, c);
+        }
+        Icon::Clipboard => {
+            let (x, y) = m(8.0, 2.5);
+            p.ring(x, y, 8.0 * k, 4.0 * k, 1.0 * k, -w / 2.0, w / 2.0, c);
+            // 外框：顶边中间（夹子处）不画
+            let segs = [
+                ln(m(8.0, 4.5), m(6.0, 4.5)),
+                Seg::Arc(x0 + 6.0 * k, y0 + 6.5 * k, 2.0 * k, PI, -PI / 2.0),
+                ln(m(4.0, 6.5), m(4.0, 20.0)),
+                Seg::Arc(x0 + 6.0 * k, y0 + 20.0 * k, 2.0 * k, PI / 2.0, PI),
+                ln(m(6.0, 22.0), m(18.0, 22.0)),
+                Seg::Arc(x0 + 18.0 * k, y0 + 20.0 * k, 2.0 * k, 0.0, PI / 2.0),
+                ln(m(20.0, 20.0), m(20.0, 6.5)),
+                Seg::Arc(x0 + 18.0 * k, y0 + 6.5 * k, 2.0 * k, -PI / 2.0, 0.0),
+                ln(m(18.0, 4.5), m(16.0, 4.5)),
+            ];
+            p.stroke(&segs, w, c);
+        }
+        Icon::Gear => {
+            let (ccx, ccy) = m(12.0, 12.0);
+            for r in [7.0 * k, 2.6 * k] {
+                p.ring(ccx - r, ccy - r, 2.0 * r, 2.0 * r, r, -w / 2.0, w / 2.0, c);
+            }
+            let mut segs = Vec::with_capacity(8);
+            for i in 0..8 {
+                let t = i as f32 * PI / 4.0;
+                let (s, co) = t.sin_cos();
+                segs.push(Seg::Line(ccx + co * 7.0 * k, ccy + s * 7.0 * k, ccx + co * 10.0 * k, ccy + s * 10.0 * k));
+            }
+            p.stroke(&segs, w * 1.1, c);
+        }
+        Icon::Pause => {
+            for x in [6.5, 13.9] {
+                let (px, py) = m(x, 5.0);
+                p.rrect(px, py, 3.6 * k, 14.0 * k, 1.0 * k, c);
+            }
+        }
+        Icon::Play => {
+            p.polyline(&[m(7.0, 5.0), m(19.0, 12.0), m(7.0, 19.0), m(7.0, 5.0)], w, c);
+        }
     }
 }
 
@@ -1446,27 +1819,58 @@ fn draw_screen(p: &mut Painter, a: &App, s: &Scr) {
             p.shadow(r.x, r.y, r.w, r.h, 10.0, 0.0, 22.0, 40.0, -12.0, hexa(0, 0.42 * l));
         }
         let wall = if s.peer { th.wb } else { th.wa };
-        p.rrect_with(r.x, r.y, r.w, r.h, 10.0, |x, y| wall.at(x - r.x, y - r.y, r.w, r.h));
+        // 鼠标关着：壁纸去色（排布照样能拖）
+        let gray = if a.is_on(Sw::Mouse) { 0.0 } else { 0.85 };
+        p.rrect_with(r.x, r.y, r.w, r.h, 10.0, |x, y| desat(wall.at(x - r.x, y - r.y, r.w, r.h), gray));
         p.ring(r.x, r.y, r.w, r.h, 10.0, -1.0, 0.0, th.scrline);
     }
     if s.pill.primary {
-        // 编号：主显示器中间（屏幕顶到名字胶囊之间）一个大数字；正放着声音的那台深，别的浅
-        let one = a.cfg.me_one() != s.peer;
-        let n = if one { 1 } else { 2 };
-        let playing = a.connected && (a.audio == n || a.audio == 3);
-        let top = r.y;
-        let bottom = if s.pill.glass { s.pill.r.y } else { r.y + r.h };
-        let cy = (top + bottom) / 2.0;
-        // GDI 文字不认透明度：和数字所在处的壁纸颜色混出深浅
-        let c = if s.offline {
-            th.mutd
-        } else {
-            let wall = if s.peer { th.wb } else { th.wa };
-            wall.at(r.cx() - r.x, cy - r.y, r.w, r.h).lerp(th.fg, if playing { 0.88 } else { 0.28 })
-        };
-        text_c(p, r.cx(), cy, if one { "1" } else { "2" }, &a.fonts.big, c);
+        // 编号：主显示器左上角一颗玻璃小圆
+        let n = if a.cfg.me_one() != s.peer { 1 } else { 2 };
+        num_badge(p, a, r.x + 7.0, r.y + 7.0, n, false, s.offline);
     }
     draw_pill(p, a, &s.pill);
+}
+
+/// 去色：和自己的灰度混 t。
+fn desat(c: Rgba, t: f32) -> Rgba {
+    if t <= 0.0 {
+        return c;
+    }
+    let l = 0.3 * c.r + 0.59 * c.g + 0.11 * c.b;
+    c.lerp(Rgba { r: l, g: l, b: l, a: c.a }, t)
+}
+
+/// 屏幕左上角的编号圆（直径 22，左上角在 x, y）。solid：实心深色（声音页正在放的那台）。
+fn num_badge(p: &mut Painter, a: &App, x: f32, y: f32, n: u8, solid: bool, dim: bool) {
+    let th = &a.th;
+    let r = R::new(x, y, 22.0, 22.0);
+    let t = if n == 1 { "1" } else { "2" };
+    if solid {
+        let ink = if th.dark { hex(0xF2F2F7) } else { hex(0x1C1C1E) };
+        let ink_fg = if th.dark { hex(0x1C1C1E) } else { hex(0xFFFFFF) };
+        p.shadow(r.x, r.y, r.w, r.h, 11.0, 0.0, 1.0, 3.0, 0.0, hexa(0, 0.18));
+        p.circle(r.cx(), r.cy(), 11.0, ink);
+        text_c(p, r.cx(), r.cy(), t, &a.fonts.chip, ink_fg);
+    } else {
+        glass(p, th, r, 11.0);
+        text_c(p, r.cx(), r.cy(), t, &a.fonts.chip, if dim { th.mutd } else { th.fg });
+    }
+}
+
+/// 设备条上的一块屏幕（壁纸 + 投影；对方没连上时虚线框）。dim：整块变淡（这一项关着）。
+fn strip_screen(p: &mut Painter, a: &App, r: R, peer: bool, offline: bool) {
+    let th = &a.th;
+    if offline {
+        p.rrect(r.x, r.y, r.w, r.h, 10.0, th.off);
+        p.dashed(r.x, r.y, r.w, r.h, 10.0, 1.5, 5.0, 4.0, th.offline);
+        return;
+    }
+    p.shadow(r.x, r.y, r.w, r.h, 10.0, 0.0, 1.0, 2.0, 0.0, hexa(0, 0.08));
+    p.shadow(r.x, r.y, r.w, r.h, 10.0, 0.0, 8.0, 18.0, -8.0, hexa(0, 0.22));
+    let wall = if peer { th.wb } else { th.wa };
+    p.rrect_with(r.x, r.y, r.w, r.h, 10.0, |x, y| wall.at(x - r.x, y - r.y, r.w, r.h));
+    p.ring(r.x, r.y, r.w, r.h, 10.0, -1.0, 0.0, th.scrline);
 }
 
 /// 卡片里一个输入框的底和描边（focus：绿圈；err：红圈；hover：深一点）。
@@ -1481,15 +1885,425 @@ fn field_box(p: &mut Painter, th: &Theme, r: R, focus: bool, err: bool, hover: b
     p.rrect(r.x, r.y, r.w, r.h, 8.0, if hover && !focus { th.fillh } else { th.fill });
 }
 
+/// 卡片底（白 / 深灰，圆角 14，细描边 + 淡阴影）。
+fn card(p: &mut Painter, th: &Theme, r: R) {
+    p.shadow(r.x, r.y, r.w, r.h, 14.0, 0.0, 1.0, 3.0, 0.0, hexa(0, th.card_shadow));
+    p.rrect(r.x, r.y, r.w, r.h, 14.0, th.card);
+    p.ring(r.x, r.y, r.w, r.h, 14.0, 0.0, 1.0, th.cardline);
+}
+
+/// 舞台 / 设备条的底：圆角 16，竖直渐变 + 内描边。
+fn stage_bg(p: &mut Painter, th: &Theme, r: R) {
+    let (top, bot) = if th.dark { (hex(0x1D2129), hex(0x232427)) } else { (hex(0xE9EEF6), hex(0xF1F3F7)) };
+    p.rrect_with(r.x, r.y, r.w, r.h, 16.0, |_, y| top.lerp(bot, ((y - r.y) / r.h).clamp(0.0, 1.0)));
+    p.ring(r.x, r.y, r.w, r.h, 16.0, -1.0, 0.0, th.cardline);
+}
+
+/// 开关（t：0 关 ～ 1 开，带动画）。圆钮直径 = 高 - 4。
+fn draw_switch(p: &mut Painter, th: &Theme, r: R, t: f32) {
+    let rad = r.h / 2.0;
+    p.rrect(r.x, r.y, r.w, r.h, rad, th.swoff.lerp(th.green, t));
+    let d = r.h - 4.0;
+    let kx = r.x + 2.0 + d / 2.0 + (r.w - 4.0 - d) * t;
+    p.shadow(kx - d / 2.0, r.y + 2.0, d, d, d / 2.0, 0.0, 1.0, 3.0, 0.0, hexa(0, 0.22));
+    p.ring(kx - d / 2.0, r.y + 2.0, d, d, d / 2.0, 0.0, 0.5, hexa(0, 0.04));
+    p.circle(kx, r.cy(), d / 2.0, th.knob);
+}
+
+/// 滑杆：轨道 + 已填部分 + 圆钮，右边写数值。
+fn draw_slider(p: &mut Painter, a: &App, row: R, frac: f32, val: &str, txt: Rgba) {
+    let th = &a.th;
+    let cy = row.cy();
+    p.rrect(SLIDER_X, cy - 2.0, SLIDER_W, 4.0, 2.0, th.swoff);
+    let fx = SLIDER_X + SLIDER_W * frac.clamp(0.0, 1.0);
+    p.rrect(SLIDER_X, cy - 2.0, (fx - SLIDER_X).max(4.0), 4.0, 2.0, th.green);
+    p.shadow(fx - 11.0, cy - 11.0, 22.0, 22.0, 11.0, 0.0, 1.0, 3.0, 0.0, hexa(0, 0.22));
+    p.ring(fx - 11.0, cy - 11.0, 22.0, 22.0, 11.0, 0.0, 0.5, hexa(0, 0.06));
+    p.circle(fx, cy, 11.0, th.knob);
+    text_r(p, CTL_R, cy, val, &a.fonts.label, txt);
+}
+
+/// 侧栏 / 页头的图标块：开 = 绿，关 = 灰（图标也灰），连接 / 通用 = 中性灰。
+fn icon_block(p: &mut Painter, th: &Theme, r: R, pg: Page, on: bool, rad: f32, size: f32) {
+    let (bg, fg) = match (pg.sw(), on) {
+        (None, _) => (if th.dark { hex(0x636366) } else { hex(0x8E8E93) }, hex(0xFFFFFF)),
+        (Some(_), true) => (th.green, hex(0xFFFFFF)),
+        (Some(_), false) => {
+            if th.dark {
+                (hex(0x3A3A3C), hex(0x7C7C80))
+            } else {
+                (hex(0xE6E6EA), hex(0xA1A1A6))
+            }
+        }
+    };
+    p.rrect(r.x, r.y, r.w, r.h, rad, bg);
+    icon(p, pg.icon(), r.cx(), r.cy(), size, 2.0, fg);
+}
+
+/// 卡片里的一行：名字 + 灰字说明（没有说明时名字竖直居中）。
+fn row_text(p: &mut Painter, a: &App, row: R, name: &str, hint: &str, name_c: Rgba, hint_c: Rgba) {
+    let f = &a.fonts;
+    if hint.is_empty() {
+        p.text_mid(row.x, row.cy(), name, &f.label, name_c);
+    } else {
+        p.text_mid(row.x, row.y + 16.5, name, &f.label, name_c);
+        p.text_mid(row.x, row.y + 34.0, hint, &f.hint, hint_c);
+    }
+}
+
+/// 卡片里 n 行之间的细线。
+fn row_lines(p: &mut Painter, th: &Theme, top: f32, n: usize) {
+    for i in 1..n {
+        let r = row_rect(top, i);
+        p.rrect(r.x, r.y, r.w, 1.0, 0.0, th.hair);
+    }
+}
+
+/// 设备条：两台屏幕 + 编号 + 屏下名字。dim：整条变淡（这一项关着）。返回两块屏幕。
+fn draw_strip(p: &mut Painter, a: &App, dim: bool) -> [(R, bool, u8); 2] {
+    let th = &a.th;
+    let f = &a.fonts;
+    stage_bg(p, th, STRIP);
+    let ss = strip_screens(a);
+    for (r, peer, n) in ss {
+        let off = peer && !a.connected;
+        p.alpha = if dim { 0.45 } else { 1.0 };
+        strip_screen(p, a, r, peer, off);
+        num_badge(p, a, r.x + 7.0, r.y + 7.0, n, false, off || dim);
+        p.alpha = 1.0;
+        let name = if peer { a.peer_name() } else { a.local_name() };
+        let c = if off || dim { th.mutd } else { th.fg };
+        let cy = r.y + r.h + 20.0;
+        let nw = p.measure(&f.name, &name);
+        let tag_w = if peer { 0.0 } else { a.measure(&f.tag, "本机") + 10.0 };
+        let total = nw + if peer { 0.0 } else { 6.0 + tag_w };
+        let x = r.cx() - total / 2.0;
+        p.text_mid(x, cy, &name, &f.name, c);
+        if !peer {
+            let t = R::new(x + nw + 6.0, cy - 8.0, tag_w, 16.0);
+            p.rrect(t.x, t.y, t.w, t.h, 5.0, th.tag);
+            text_c(p, t.cx(), t.cy(), "本机", &f.tag, th.fg2);
+        }
+    }
+    ss
+}
+
+/// 屏幕中间的玻璃圆 + 图标（声音页的喇叭、连接线中间的链接）。
+fn glass_icon(p: &mut Painter, th: &Theme, cx: f32, cy: f32, d: f32, ic: Icon, size: f32, c: Rgba) {
+    glass(p, th, R::new(cx - d / 2.0, cy - d / 2.0, d, d), d / 2.0);
+    icon(p, ic, cx, cy, size, 2.0, c);
+}
+
+fn hotkey_name(vk: u32) -> String {
+    match vk & 0xFF {
+        0x91 => "Scroll Lock".into(),
+        0x13 => "Pause".into(),
+        0x14 => "Caps Lock".into(),
+        v @ 0x70..=0x87 => format!("F{}", v - 0x6F),
+        v => format!("键 0x{v:02X}"),
+    }
+}
+
 fn render(p: &mut Painter, a: &App, sc: &Scene) {
     let th = &a.th;
     let f = &a.fonts;
     p.clear(th.bg);
-    p.vgrad(0.0, 0.0, CLIENT_W, STAGE_H, th.stage_top, th.bg);
+    p.vgrad(0.0, 0.0, CLIENT_W, 324.0, th.stage_top, th.bg);
+    // 两团很淡的光（给侧栏的玻璃板透出点颜色）
+    let glows: [(f32, f32, f32, f32, Rgba, f32); 2] = if th.dark {
+        [(60.0, 40.0, 420.0, 320.0, hex(0x3A4F7A), 0.45), (120.0, 520.0, 380.0, 300.0, hex(0x2C5A41), 0.35)]
+    } else {
+        [(60.0, 40.0, 420.0, 320.0, hex(0xA6C4FB), 0.35), (120.0, 520.0, 380.0, 300.0, hex(0x9FDFBB), 0.30)]
+    };
+    for (gx, gy, rx, ry, c, al) in glows {
+        let (x0, y0) = ((gx - rx).max(0.0), (gy - ry).max(0.0));
+        let (x1, y1) = ((gx + rx).min(CLIENT_W), (gy + ry).min(CLIENT_H));
+        p.rrect_with(x0, y0, x1 - x0, y1 - y0, 0.0, |x, y| {
+            let (dx, dy) = ((x - gx) / rx, (y - gy) / ry);
+            let t = (1.0 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
+            c.alpha(al * t * t)
+        });
+    }
 
-    // 接缝
+    // ── 侧栏 ──
+    let sb = SIDEBAR;
+    p.shadow(sb.x, sb.y, sb.w, sb.h, 16.0, 0.0, 10.0, 28.0, -14.0, hexa(0, 0.22));
+    p.rrect(sb.x, sb.y, sb.w, sb.h, 16.0, if th.dark { hexa(0x2C2C30, 0.55) } else { hexa(0xFFFFFF, 0.52) });
+    p.ring(sb.x, sb.y, sb.w, sb.h, 16.0, -1.0, 0.0, if th.dark { hexa(0xFFFFFF, 0.10) } else { hexa(0xFFFFFF, 0.95) });
+    p.ring(sb.x, sb.y, sb.w, sb.h, 16.0, 0.0, 0.5, if th.dark { hexa(0, 0.40) } else { hexa(0, 0.07) });
+    let paused = a.daemon && a.paused_now();
+    let orange = hex(0xFF9F0A);
+    let (st, dot) = if !a.connected {
+        ("未连接", th.mut2)
+    } else if paused {
+        ("已暂停", orange)
+    } else {
+        ("已连接", th.green)
+    };
+    if a.connected && !paused {
+        p.circle(30.0, 36.0, 6.5, th.greenring);
+    }
+    p.circle(30.0, 36.0, 4.0, dot);
+    p.text_mid(42.0, 36.0, st, &f.side_b, th.fg);
+    let sub = if a.connected { a.peer_name() } else { "对方未开或不在同网".to_string() };
+    p.text_mid(42.0, 55.0, &sub, &f.small, th.mutd);
+    p.rrect(30.0, 121.0, 160.0, 1.0, 0.0, th.hair);
+    let sy = a.nav_y();
+    if th.dark {
+        p.rrect(18.0, sy, 182.0, 40.0, 11.0, hexa(0xFFFFFF, 0.11));
+    } else {
+        p.shadow(18.0, sy, 182.0, 40.0, 11.0, 0.0, 1.0, 3.0, 0.0, hexa(0, 0.10));
+        p.rrect(18.0, sy, 182.0, 40.0, 11.0, hex(0xFFFFFF));
+        p.ring(18.0, sy, 182.0, 40.0, 11.0, 0.0, 0.5, hexa(0, 0.08));
+    }
+    for pg in PAGES {
+        let r = nav_rect(pg);
+        if a.hover == Hot::Nav(pg) && pg != a.page {
+            p.rrect(r.x, r.y, r.w, r.h, 11.0, th.hov);
+        }
+        let on = pg.sw().is_none_or(|s| a.is_on(s));
+        icon_block(p, th, R::new(25.0, r.y + 6.0, 28.0, 28.0), pg, on, 8.0, 17.0);
+        let font = if pg == a.page { &f.nav_b } else { &f.nav };
+        p.text_mid(63.0, r.cy(), pg.title(), font, if on { th.fg } else { th.mutd });
+        if !on {
+            text_r(p, 190.0, r.cy(), "关", &f.small, th.mutd);
+        }
+    }
+
+    // ── 页头 ──
+    let pg = a.page;
+    let on = pg.sw().is_none_or(|s| a.is_on(s));
+    icon_block(p, th, HEAD_ICON, pg, on, 11.0, 22.0);
+    let desc = match pg {
+        Page::Conn if a.connected => format!("已连接 · {}", a.peer_name()),
+        Page::Conn => "未连接".to_string(),
+        _ => pg.desc().to_string(),
+    };
+    if desc.is_empty() {
+        p.text_mid(288.0, 44.0, pg.title(), &f.title, th.fg);
+    } else {
+        p.text_mid(288.0, 36.0, pg.title(), &f.title, th.fg);
+        p.text_mid(288.0, 57.0, &desc, &f.stat, th.mutd);
+    }
+    if let Some(s) = pg.sw() {
+        draw_switch(p, th, HEAD_SW, a.switch_t(s));
+        if !a.connected && s != Sw::Clip {
+            let t = "连上后生效";
+            let w = a.measure(&f.upchip, t) + 20.0;
+            let r = R::new(HEAD_SW.x - 12.0 - w, HEAD_SW.cy() - 11.0, w, 22.0);
+            p.rrect(r.x, r.y, r.w, r.h, 11.0, th.fill);
+            text_c(p, r.cx(), r.cy(), t, &f.upchip, th.mutd);
+        }
+    }
+    if pg == Page::Conn && a.daemon {
+        let r = pause_rect(a.pause_w());
+        let hov = a.hover == Hot::Pause;
+        let ink = if th.dark { hex(0xF2F2F7) } else { hex(0x1C1C1E) };
+        let ink_fg = if th.dark { hex(0x1C1C1E) } else { hex(0xFFFFFF) };
+        let (t, ic, fg) = if paused {
+            p.rrect(r.x, r.y, r.w, r.h, 15.0, if hov { ink.lerp(th.bg, 0.15) } else { ink });
+            ("继续", Icon::Play, ink_fg)
+        } else {
+            glass(p, th, r, 15.0);
+            if hov {
+                p.rrect(r.x, r.y, r.w, r.h, 15.0, th.hov);
+            }
+            ("暂停", Icon::Pause, th.fg)
+        };
+        icon(p, ic, r.x + 14.0 + 6.0, r.cy(), 12.0, 2.4, fg);
+        p.text_mid(r.x + 14.0 + 12.0 + 6.0, r.cy(), t, &f.fbtn_ink, fg);
+    }
+
+    // 这一项关着：行内容变淡（文字和卡片底色混，形状降不透明度），仍可改
+    let tc = |c: Rgba| if on { c } else { c.lerp(th.card, 0.55) };
+
+    match pg {
+        Page::Conn => render_conn(p, a),
+        Page::Mouse => render_mouse(p, a, sc),
+        Page::Kbd => {
+            draw_strip(p, a, !on);
+            card(p, th, R::new(CX, CARD_Y, CW, 66.0));
+            let row = row_rect(CARD_Y, 0);
+            let mouse = a.cfg.share.mouse;
+            let hint = if mouse { "跟最后用的鼠标" } else { "鼠标已关，靠它过去" };
+            row_text(p, a, row, "跟随鼠标", hint, tc(th.fg), tc(th.mutd));
+            p.alpha = if on && mouse { 1.0 } else { 0.45 };
+            draw_switch(p, th, row_switch(row), if mouse { a.switch_t(Sw::Follow) } else { 1.0 });
+            p.alpha = 1.0;
+        }
+        Page::Audio => {
+            let ss = draw_strip(p, a, !on);
+            if on {
+                for (r, peer, n) in ss {
+                    let playing = a.audio == n as usize - 1 || a.audio == 2;
+                    if playing {
+                        num_badge(p, a, r.x + 7.0, r.y + 7.0, n, true, false);
+                        let c = if peer && !a.connected { th.mutd } else { th.fg };
+                        glass_icon(p, th, r.cx(), r.cy(), 38.0, Icon::Speaker, 18.0, c);
+                    }
+                }
+            }
+            card(p, th, R::new(CX, CARD_Y, CW, 116.0));
+            row_lines(p, th, CARD_Y, 2);
+            let r0 = row_rect(CARD_Y, 0);
+            row_text(p, a, r0, "在哪放", AUDIO_HINTS[a.audio.min(2)], tc(th.fg), tc(th.mutd));
+            p.alpha = if on { 1.0 } else { 0.45 };
+            let g = AUDIO_SEG;
+            p.rrect(g.x, g.y, g.w, g.h, 8.0, th.seg_track);
+            let th_r = audio_seg(0);
+            let tx = th_r.x + 52.0 * a.audio_pos();
+            p.shadow(tx, th_r.y, th_r.w, th_r.h, 6.0, 0.0, 1.0, 2.0, 0.0, hexa(0, if th.dark { 0.35 } else { 0.12 }));
+            p.rrect(tx, th_r.y, th_r.w, th_r.h, 6.0, th.seg_thumb);
+            p.alpha = 1.0;
+            for (k, label) in AUDIO_LABELS.iter().enumerate() {
+                let r = audio_seg(k);
+                let sel = k == a.audio;
+                let col = if sel || a.hover == Hot::Audio(k) { th.fg } else { th.fg2 };
+                text_c(p, r.cx(), r.cy(), label, if sel { &f.seg_on } else { &f.btn }, tc(col));
+            }
+            let r1 = row_rect(CARD_Y, 1);
+            row_text(p, a, r1, "音量", "对方的声音", tc(th.fg), tc(th.mutd));
+            let v = a.cfg.audio.volume.clamp(0.0, 1.0);
+            p.alpha = if on { 1.0 } else { 0.45 };
+            draw_slider(p, a, r1, v, &format!("{:.0}%", v * 100.0), tc(th.fg2));
+            p.alpha = 1.0;
+        }
+        Page::Clip => {
+            card(p, th, R::new(CX, TOP_CARD_Y, CW, 66.0));
+            let row = row_rect(TOP_CARD_Y, 0);
+            row_text(p, a, row, "复制提示", "复制后弹提示", tc(th.fg), tc(th.mutd));
+            p.alpha = if on { 1.0 } else { 0.45 };
+            draw_switch(p, th, row_switch(row), a.switch_t(Sw::Notify));
+            p.alpha = 1.0;
+        }
+        Page::General => {
+            card(p, th, R::new(CX, TOP_CARD_Y, CW, 116.0));
+            row_lines(p, th, TOP_CARD_Y, 2);
+            let r0 = row_rect(TOP_CARD_Y, 0);
+            row_text(p, a, r0, "开机自启", "", th.fg, th.mutd);
+            draw_switch(p, th, row_switch(r0), a.switch_t(Sw::Autostart));
+            let r1 = row_rect(TOP_CARD_Y, 1);
+            row_text(p, a, r1, "暂停热键", "暂停全部共享", th.fg, th.mutd);
+            let t = hotkey_name(a.cfg.input.hotkey_vk);
+            let w = a.measure(&f.fbtn, &t) + 20.0;
+            let k = R::new(CTL_R - w, r1.cy() - 12.0, w, 24.0);
+            p.rrect(k.x, k.y, k.w, k.h, 7.0, th.fill);
+            p.ring(k.x, k.y, k.w, k.h, 7.0, -1.0, 0.0, th.hair);
+            text_c(p, k.cx(), k.cy(), &t, &f.fbtn, th.fg2);
+            card(p, th, R::new(CX, VER_CARD_Y, CW, 66.0));
+            draw_footer(p, a);
+        }
+    }
+
+    // 提示 / 确认框
+    if let Some(t) = sc.tip.filter(|_| pg == Page::Mouse) {
+        p.shadow(t.x, t.y, t.w, t.h, 7.0, 0.0, 6.0, 16.0, -6.0, hexa(0, 0.25));
+        p.rrect(t.x, t.y, t.w, t.h, 7.0, th.tip);
+        p.ring(t.x, t.y, t.w, t.h, 7.0, -1.0, 0.0, th.tipline);
+        text_c(p, t.cx(), t.cy(), "连上后可改", &f.small, th.tipfg);
+    }
+    if a.popover && pg == Page::Conn {
+        let r = POP;
+        p.shadow(r.x, r.y, r.w, r.h, 10.0, 0.0, 10.0, 28.0, -6.0, hexa(0, 0.30));
+        p.rrect(r.x, r.y, r.w, r.h, 10.0, th.tip);
+        p.ring(r.x, r.y, r.w, r.h, 10.0, -1.0, 0.0, th.tipline);
+        p.text_mid(r.x + 14.0, r.y + 22.0, "换新密钥后两台都要重新粘贴", &f.btn, th.tipfg);
+        let cb = POP_CANCEL;
+        p.rrect(cb.x, cb.y, cb.w, cb.h, 7.0, if a.hover == Hot::PopCancel { th.fillh } else { th.fill });
+        text_c(p, cb.cx(), cb.cy(), "取消", &f.btn, th.fg);
+        let ok = POP_OK;
+        let g = if a.hover == Hot::PopOk { th.green.lerp(hex(0), 0.08) } else { th.green };
+        p.rrect(ok.x, ok.y, ok.w, ok.h, 7.0, g);
+        text_c(p, ok.cx(), ok.cy(), "更换", &f.btn, hex(0xFFFFFF));
+    }
+}
+
+/// 连接页：设备条（两台之间一条连线）+ 对方 IP / 配对密钥 / 本机 IP。
+fn render_conn(p: &mut Painter, a: &App) {
+    let th = &a.th;
+    let f = &a.fonts;
+    let ss = draw_strip(p, a, false);
+    let (l, r) = (ss[0].0, ss[1].0);
+    let y = l.cy();
+    let (x0, x1) = (l.x + l.w + 10.0, r.x - 10.0);
+    let mid = (x0 + x1) / 2.0;
+    if a.connected {
+        p.glow(x0, y - 1.0, x1 - x0, 2.0, 1.0, 6.0, th.green.alpha(0.5));
+        p.rrect(x0, y - 1.0, x1 - x0, 2.0, 1.0, th.green);
+    } else {
+        let n = ((x1 - x0) / 6.0).floor().max(1.0) as i32;
+        let step = (x1 - x0) / n as f32;
+        for i in 0..=n {
+            p.circle(x0 + step * i as f32, y, 1.3, th.offline);
+        }
+    }
+    if a.connected {
+        p.ring(mid - 15.0, y - 15.0, 30.0, 30.0, 15.0, 0.0, 3.0, th.greenring);
+    }
+    glass_icon(p, th, mid, y, 30.0, Icon::Link, 16.0, if a.connected { th.green } else { th.mutd });
+
+    card(p, th, R::new(CX, CARD_Y, CW, 166.0));
+    row_lines(p, th, CARD_Y, 3);
+    // 对方 IP
+    let r0 = row_rect(CARD_Y, 0);
+    row_text(p, a, r0, "对方 IP", a.err_ip.unwrap_or("填一台即可"), th.fg, if a.err_ip.is_some() { th.red } else { th.mutd });
+    let editing_ip = a.edit == Some(Field::Ip);
+    field_box(p, th, IP_BOX, editing_ip, a.err_ip.is_some(), a.hover == Hot::Ip);
+    if !editing_ip {
+        let v = a.draft_ip.clone().unwrap_or_else(|| a.cfg.peer.trim().to_string());
+        if v.is_empty() {
+            p.text_mid(IP_BOX.x + 10.0, IP_BOX.cy(), "未填", &f.label, th.mut2);
+        } else {
+            p.text_mid(IP_BOX.x + 10.0, IP_BOX.cy(), &v, &f.input, th.fg);
+        }
+    }
+    // 配对密钥
+    let r1 = row_rect(CARD_Y, 1);
+    row_text(p, a, r1, "配对密钥", a.err_key.unwrap_or("两台须相同"), th.fg, if a.err_key.is_some() { th.red } else { th.mutd });
+    let editing_key = a.edit == Some(Field::Key);
+    field_box(p, th, KEY_BOX, editing_key, a.err_key.is_some(), a.hover == Hot::Key);
+    if !editing_key {
+        let v = a.draft_key.clone().unwrap_or_else(|| a.cfg.key.clone());
+        p.text_mid(KEY_BOX.x + 10.0, KEY_BOX.cy(), &short_key(&v), &f.mono, th.fg);
+    }
+    for (r, h, ic) in [(COPY_KEY, Hot::CopyKey, Icon::Copy), (NEW_KEY, Hot::NewKey, Icon::Refresh)] {
+        let on = a.hover == h || (h == Hot::NewKey && a.popover);
+        p.rrect(r.x, r.y, r.w, r.h, 8.0, if on { th.fillh } else { th.fill });
+        if a.copied_now(h) {
+            icon(p, Icon::Check, r.cx(), r.cy(), 15.0, 2.4, th.green);
+        } else {
+            icon(p, ic, r.cx(), r.cy(), 15.0, 1.9, th.fg2);
+        }
+    }
+    // 本机 IP
+    let r2 = row_rect(CARD_Y, 2);
+    row_text(p, a, r2, "本机 IP", "", th.fg, th.mutd);
+    match a.ips.first() {
+        Some(ip) => {
+            text_r(p, COPY_IP.x - 6.0, r2.cy(), ip, &f.input, th.fg2);
+            if a.hover == Hot::CopyIp {
+                p.rrect(COPY_IP.x, COPY_IP.y, COPY_IP.w, COPY_IP.h, 8.0, th.fill);
+            }
+            if a.copied_now(Hot::CopyIp) {
+                icon(p, Icon::Check, COPY_IP.cx(), COPY_IP.cy(), 15.0, 2.4, th.green);
+            } else {
+                icon(p, Icon::Copy, COPY_IP.cx(), COPY_IP.cy(), 15.0, 1.9, th.mutd);
+            }
+        }
+        None => text_r(p, CTL_R, r2.cy(), "无", &f.label, th.mutd),
+    }
+}
+
+/// 鼠标页：舞台（拖动摆放）+ 移动速度。
+fn render_mouse(p: &mut Painter, a: &App, sc: &Scene) {
+    let th = &a.th;
+    let f = &a.fonts;
+    let on = a.is_on(Sw::Mouse);
+    stage_bg(p, th, STAGE);
+    text_r(p, STAGE.x + STAGE.w - 16.0, STAGE.y + 20.0, "拖动摆放", &f.small, th.mutd);
+    // 接缝：连着且鼠标开着是绿条，否则虚点
     for e in &sc.edges {
-        if a.connected {
+        if a.connected && on {
             p.glow(e.x, e.y, e.w, e.h, 1.5, 8.0, th.green.alpha(0.55));
             p.rrect(e.x, e.y, e.w, e.h, 1.5, th.green);
         } else {
@@ -1515,23 +2329,10 @@ fn render(p: &mut Painter, a: &App, sc: &Scene) {
         draw_screen(p, a, s);
         p.alpha = 1.0;
     }
-
-    // 左上状态、右上提示
-    let (chip_t, dot) = if a.connected { ("已连接", th.green) } else { ("未连接", th.mut2) };
-    let cw = 1.0 + 9.0 + 7.0 + 6.0 + p.measure(&f.chip, chip_t) + 11.0 + 1.0;
-    let chip = R::new(20.0, 12.0, cw, 26.0);
-    glass(p, th, chip, 13.0);
-    if a.connected {
-        p.circle(chip.x + 13.5, chip.cy(), 6.5, th.greenring);
-    }
-    p.circle(chip.x + 13.5, chip.cy(), 3.5, dot);
-    p.text_mid(chip.x + 23.0, chip.cy(), chip_t, &f.chip, th.fg);
-    text_r(p, CLIENT_W - 22.0, 25.0, "拖动摆放", &f.small, th.mutd);
-
-    // 左下说明、右下比例
+    // 底行：说明 + 尺寸比例
     let cy = STEPPER.cy();
-    let nw = p.text_mid(24.0, cy, &a.peer_name(), &f.stat_b, th.fg);
-    p.text_mid(24.0 + nw + 7.0, cy, &status_text(&sc.layout_now), &f.stat, th.fg2);
+    let nw = p.text_mid(STAGE.x + 18.0, cy, &a.peer_name(), &f.stat_b, th.fg);
+    p.text_mid(STAGE.x + 18.0 + nw + 7.0, cy, &status_text(&sc.layout_now), &f.stat, th.fg2);
     text_r(p, STEPPER.x - 8.0, cy, "尺寸比例", &f.small, th.mutd);
     glass(p, th, STEPPER, 14.0);
     for (r, h, ic) in [(MINUS, Hot::Minus, Icon::Minus), (PLUS, Hot::Plus, Icon::Plus)] {
@@ -1541,132 +2342,15 @@ fn render(p: &mut Painter, a: &App, sc: &Scene) {
         icon(p, ic, r.cx(), r.cy(), 12.0, 2.4, th.fg2);
     }
     text_c(p, (MINUS.x + MINUS.w + PLUS.x) / 2.0, cy, &format!("{:.2}", sanitize_scale(a.layout.scale)), &f.step, th.fg);
-
-    // 卡片
-    let c = CARD;
-    p.shadow(c.x, c.y, c.w, c.h, 14.0, 0.0, 1.0, 3.0, 0.0, hexa(0, th.card_shadow));
-    p.rrect(c.x, c.y, c.w, c.h, 14.0, th.card);
-    p.ring(c.x, c.y, c.w, c.h, 14.0, 0.0, 1.0, th.cardline);
-    p.rrect(410.0, c.y + 16.0, 1.0, c.h - 32.0, 0.0, th.hair);
-    p.text_mid(36.0, c.y + 22.0, "连接", &f.group, th.mutd);
-    p.text_mid(430.0, c.y + 22.0, "共用", &f.group, th.mutd);
-    for x in [36.0, 430.0] {
-        for i in 1..4 {
-            p.rrect(x, ROW0 + ROW_H * i as f32, 354.0, 1.0, 0.0, th.hair);
-        }
-    }
-    let two_line_at = |p: &mut Painter, x: f32, top: f32, a1: &str, b1: &str, bc: Rgba| {
-        p.text_mid(x, top + 16.5, a1, &f.label, th.fg);
-        p.text_mid(x, top + 34.0, b1, &f.hint, bc);
-    };
-    let two_line = |p: &mut Painter, top: f32, a1: &str, b1: &str, bc: Rgba| two_line_at(p, 36.0, top, a1, b1, bc);
-
-    // 对方 IP
-    two_line(p, ROW0, "对方 IP", a.err_ip.unwrap_or("填一台即可"), if a.err_ip.is_some() { th.red } else { th.mutd });
-    let editing_ip = a.edit == Some(Field::Ip);
-    field_box(p, th, IP_BOX, editing_ip, a.err_ip.is_some(), a.hover == Hot::Ip);
-    if !editing_ip {
-        let v = a.draft_ip.clone().unwrap_or_else(|| a.cfg.peer.trim().to_string());
-        if v.is_empty() {
-            p.text_mid(IP_BOX.x + 10.0, IP_BOX.cy(), "未填", &f.label, th.mut2);
-        } else {
-            p.text_mid(IP_BOX.x + 10.0, IP_BOX.cy(), &v, &f.input, th.fg);
-        }
-    }
-
-    // 配对密钥
-    let r1 = ROW0 + ROW_H;
-    two_line(p, r1, "配对密钥", a.err_key.unwrap_or("两台须相同"), if a.err_key.is_some() { th.red } else { th.mutd });
-    let editing_key = a.edit == Some(Field::Key);
-    field_box(p, th, KEY_BOX, editing_key, a.err_key.is_some(), a.hover == Hot::Key);
-    if !editing_key {
-        let v = a.draft_key.clone().unwrap_or_else(|| a.cfg.key.clone());
-        p.text_mid(KEY_BOX.x + 10.0, KEY_BOX.cy(), &short_key(&v), &f.mono, th.fg);
-    }
-    for (r, h, ic) in [(COPY_KEY, Hot::CopyKey, Icon::Copy), (NEW_KEY, Hot::NewKey, Icon::Refresh)] {
-        let on = a.hover == h || (h == Hot::NewKey && a.popover);
-        p.rrect(r.x, r.y, r.w, r.h, 8.0, if on { th.fillh } else { th.fill });
-        if a.copied_now(h) {
-            icon(p, Icon::Check, r.cx(), r.cy(), 15.0, 2.4, th.green);
-        } else {
-            icon(p, ic, r.cx(), r.cy(), 15.0, 1.9, th.fg2);
-        }
-    }
-
-    // 本机 IP
-    let r2 = ROW0 + ROW_H * 2.0;
-    p.text_mid(36.0, r2 + ROW_H / 2.0, "本机 IP", &f.label, th.fg);
-    match a.ips.first() {
-        Some(ip) => {
-            text_r(p, COPY_IP.x - 6.0, r2 + ROW_H / 2.0, ip, &f.input, th.fg2);
-            if a.hover == Hot::CopyIp {
-                p.rrect(COPY_IP.x, COPY_IP.y, COPY_IP.w, COPY_IP.h, 8.0, th.fill);
-            }
-            if a.copied_now(Hot::CopyIp) {
-                icon(p, Icon::Check, COPY_IP.cx(), COPY_IP.cy(), 15.0, 2.4, th.green);
-            } else {
-                icon(p, Icon::Copy, COPY_IP.cx(), COPY_IP.cy(), 15.0, 1.9, th.mutd);
-            }
-        }
-        None => text_r(p, 390.0, r2 + ROW_H / 2.0, "无", &f.label, th.mutd),
-    }
-
-    // 声音：分段控件
-    let hint = if a.connected { AUDIO_HINTS[a.audio] } else { "连上后生效" };
-    two_line_at(p, 430.0, ROW0, "声音", hint, th.mutd);
-    let g = AUDIO_SEG;
-    p.rrect(g.x, g.y, g.w, g.h, 8.0, th.seg_track);
-    let th_r = audio_seg(0);
-    let tx = th_r.x + 44.0 * a.audio_pos();
-    p.shadow(tx, th_r.y, th_r.w, th_r.h, 6.0, 0.0, 1.0, 2.0, 0.0, hexa(0, if th.dark { 0.35 } else { 0.12 }));
-    p.rrect(tx, th_r.y, th_r.w, th_r.h, 6.0, th.seg_thumb);
-    for (k, label) in AUDIO_LABELS.iter().enumerate() {
-        let r = audio_seg(k);
-        let on = k == a.audio;
-        let col = if on || a.hover == Hot::Audio(k) { th.fg } else { th.fg2 };
-        text_c(p, r.cx(), r.cy(), label, if on { &f.seg_on } else { &f.btn }, col);
-    }
-
-    // 开关
-    for (i, label) in SWITCH_LABELS.iter().enumerate() {
-        let row = switch_row(i);
-        if i == 0 {
-            two_line_at(p, row.x, row.y, label, "跟最后用的鼠标", th.mutd);
-        } else {
-            p.text_mid(row.x, row.cy(), label, &f.label, th.fg);
-        }
-        let r = switch_rect(i);
-        let t = a.switch_t(i);
-        p.rrect(r.x, r.y, r.w, r.h, 12.0, th.swoff.lerp(th.green, t));
-        let kx = r.x + 12.0 + 16.0 * t;
-        p.shadow(kx - 10.0, r.y + 2.0, 20.0, 20.0, 10.0, 0.0, 1.0, 3.0, 0.0, hexa(0, 0.22));
-        p.ring(kx - 10.0, r.y + 2.0, 20.0, 20.0, 10.0, 0.0, 0.5, hexa(0, 0.04));
-        p.circle(kx, r.cy(), 10.0, th.knob);
-    }
-
-    draw_footer(p, a);
-
-    // 提示 / 确认框
-    if let Some(t) = sc.tip {
-        p.shadow(t.x, t.y, t.w, t.h, 7.0, 0.0, 6.0, 16.0, -6.0, hexa(0, 0.25));
-        p.rrect(t.x, t.y, t.w, t.h, 7.0, th.tip);
-        p.ring(t.x, t.y, t.w, t.h, 7.0, -1.0, 0.0, th.tipline);
-        text_c(p, t.cx(), t.cy(), "连上后可改", &f.small, th.tipfg);
-    }
-    if a.popover {
-        let r = POP;
-        p.shadow(r.x, r.y, r.w, r.h, 10.0, 0.0, 10.0, 28.0, -6.0, hexa(0, 0.30));
-        p.rrect(r.x, r.y, r.w, r.h, 10.0, th.tip);
-        p.ring(r.x, r.y, r.w, r.h, 10.0, -1.0, 0.0, th.tipline);
-        p.text_mid(r.x + 14.0, r.y + 22.0, "换新密钥后两台都要重新粘贴", &f.btn, th.tipfg);
-        let cb = POP_CANCEL;
-        p.rrect(cb.x, cb.y, cb.w, cb.h, 7.0, if a.hover == Hot::PopCancel { th.fillh } else { th.fill });
-        text_c(p, cb.cx(), cb.cy(), "取消", &f.btn, th.fg);
-        let ok = POP_OK;
-        let g = if a.hover == Hot::PopOk { th.green.lerp(hex(0), 0.08) } else { th.green };
-        p.rrect(ok.x, ok.y, ok.w, ok.h, 7.0, g);
-        text_c(p, ok.cx(), ok.cy(), "更换", &f.btn, hex(0xFFFFFF));
-    }
+    // 移动速度
+    card(p, th, R::new(CX, SPEED_CARD_Y, CW, 66.0));
+    let row = row_rect(SPEED_CARD_Y, 0);
+    let tc = |c: Rgba| if on { c } else { c.lerp(th.card, 0.55) };
+    row_text(p, a, row, "移动速度", "在对方屏幕上", tc(th.fg), tc(th.mutd));
+    let s = a.cfg.input.speed;
+    p.alpha = if on { 1.0 } else { 0.45 };
+    draw_slider(p, a, row, speed_frac(s), &format!("{:.1}×", s.clamp(SPEED_MIN, SPEED_MAX)), tc(th.fg2));
+    p.alpha = 1.0;
 }
 
 /// 底部一行：版本 + 更新（设计稿 设计\检查更新\settings.html）。
@@ -1685,7 +2369,7 @@ fn draw_footer(p: &mut Painter, a: &App) {
         _ => a.upd.app.clone(),
     };
     let shown = if shown.is_empty() { crate::update::VERSION.to_string() } else { shown };
-    let mut x = 24.0;
+    let mut x = CX + 20.0;
     x += p.text_mid(x, cy, "kmlink", &f.foot_b, th.fg2) + 5.0;
     let mut ver = shown;
     if matches!(view, UpdView::AvailSolo(_)) && !a.upd.peer_app.is_empty() {
@@ -1702,7 +2386,7 @@ fn draw_footer(p: &mut Painter, a: &App) {
     }
 
     // 右：按钮 / 状态
-    let mut right = CLIENT_W - 20.0;
+    let mut right = CTL_R;
     if let Some((r, t, is_ink)) = a.upd_button() {
         let hov = a.hover == Hot::Upd;
         if is_ink {
@@ -2237,8 +2921,11 @@ pub fn run() {
         }
         let mine = local_monitors();
         // 开机自启以注册表为准（主程序没在跑时 config 里的值可能没生效）
-        let sw = [cfg.input.kbd_follow, cfg.clipboard.enabled, cfg.clipboard.notify, sys::autostart_get().is_some()];
-        let audio = audio_index(&cfg);
+        let sw = App::sw_from(&cfg, sys::autostart_get().is_some());
+        let audio = audio_seg_index(&cfg);
+        // 第一次（还没填对方 IP）先到连接页；KMLINK_PAGE=mouse|kbd|audio|clip|general|conn 调试截图用
+        let first = if cfg.peer.trim().is_empty() { Page::Conn } else { Page::Mouse };
+        let page = std::env::var("KMLINK_PAGE").ok().and_then(|v| Page::from_env(&v)).unwrap_or(first);
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
                 hwnd,
@@ -2277,6 +2964,12 @@ pub fn run() {
                 err_name: false,
                 sw,
                 sw_t: [None; SW_N],
+                page,
+                page_from: page.nav_top(),
+                page_t: None,
+                slide: None,
+                paused: false,
+                pause_click: None,
                 audio,
                 audio_from: audio as f32,
                 audio_t: None,
@@ -2337,6 +3030,12 @@ pub fn run() {
 /// KMLINK_UI：直接呈现某个状态（调试截图用）。
 fn debug_state() {
     let Ok(v) = std::env::var("KMLINK_UI") else { return };
+    // 这些状态在鼠标页（舞台），换新密钥确认框在连接页
+    let page = if v == "popover" { Page::Conn } else { Page::Mouse };
+    with_app(|a| {
+        a.page = page;
+        a.page_from = page.nav_top();
+    });
     match v.as_str() {
         "hover" => {
             with_app(|a| {
@@ -2654,6 +3353,12 @@ fn poll() {
         a.connected = connected;
         a.status_name = status_name;
         a.daemon = daemon;
+        let was_paused = a.paused;
+        a.paused = daemon && upd.paused;
+        if a.pause_click.is_some_and(|(v, t)| v == a.paused || t.elapsed() > Duration::from_secs(3)) {
+            a.pause_click = None;
+        }
+        let pause_changed = was_paused != a.paused;
         if upd.upd != a.upd.upd {
             a.upd_click = None; // 主程序已经接手（状态变了）
         }
@@ -2681,23 +3386,28 @@ fn poll() {
         if reload {
             a.cfg_mtime = mt;
             if let Some(c) = new_cfg {
-                let sw = [c.input.kbd_follow, c.clipboard.enabled, c.clipboard.notify, c.autostart];
-                a.set_audio(audio_index(&c));
-                for i in 0..SW_N {
-                    if sw[i] != a.sw[i] {
-                        a.sw[i] = sw[i];
-                        a.sw_t[i] = Some(Instant::now());
-                    }
+                let sw = App::sw_from(&c, c.autostart);
+                a.set_audio(audio_seg_index(&c));
+                for (i, s) in [Sw::Mouse, Sw::Kbd, Sw::Audio, Sw::Clip, Sw::Follow, Sw::Notify, Sw::Autostart].into_iter().enumerate() {
+                    a.set_sw(s, sw[i]);
                 }
+                // 正在拖的滑杆不被重新读入盖掉
+                let (speed, vol) = (a.cfg.input.speed, a.cfg.audio.volume);
+                let slide = a.slide;
                 // reload 只在不拖动时发生
                 let mut l = c.layout.layout;
                 l.scale = sanitize_scale(l.scale);
                 a.layout = l;
                 a.cfg = c;
+                match slide {
+                    Some(Hot::Speed) => a.cfg.input.speed = speed,
+                    Some(Hot::Volume) => a.cfg.audio.volume = vol,
+                    _ => {}
+                }
             }
         }
         let after = (a.connected, a.status_name.clone(), a.peer_file_name.clone(), a.peer.clone(), a.rename_pending.is_some());
-        (a.edit == Some(Field::PeerName) && !a.connected, reload || before != after || upd_changed)
+        (a.edit == Some(Field::PeerName) && !a.connected, reload || before != after || upd_changed || pause_changed)
     });
     let Some((cancel, changed)) = r else { return };
     if cancel {
@@ -2792,54 +3502,122 @@ fn mouse_xy(lp: LPARAM) -> (i32, i32) {
     ((lp.0 & 0xFFFF) as u16 as i16 as i32, ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32)
 }
 
+/// 改声音模式：新 rev（rev_mode 跟着记），主程序重新读配置后发给对方，对方换成它的视角。
+fn set_audio_mode(m: config::AudioMode) {
+    write_cfg(|c| {
+        c.audio.set_mode(m);
+        c.audio.rev = config::next_rev(c.audio.rev);
+        c.audio.rev_mode = Some(m);
+    });
+}
+
+/// 拖滑杆：内存里先改（立刻重画），松手时写配置（commit）。
+fn on_slide(h: Hot, x: f32, commit: bool) {
+    let frac = slider_frac(x);
+    let v = with_app(|a| {
+        match h {
+            Hot::Speed => a.cfg.input.speed = speed_at(frac),
+            Hot::Volume => a.cfg.audio.volume = volume_at(frac),
+            _ => {}
+        }
+        (a.cfg.input.speed, a.cfg.audio.volume)
+    });
+    if let (Some((speed, vol)), true) = (v, commit) {
+        match h {
+            Hot::Speed => {
+                write_cfg(|c| c.input.speed = speed);
+            }
+            Hot::Volume => {
+                write_cfg(|c| c.audio.volume = vol);
+            }
+            _ => {}
+        }
+    }
+    refresh();
+}
+
 fn on_click(hot: Hot) {
     let Some(main) = with_app(|a| a.hwnd) else { return };
     match hot {
-        Hot::Switch(i) => {
+        Hot::Switch(s) => {
             let v = with_app(|a| {
-                a.sw[i] = !a.sw[i];
-                a.sw_t[i] = Some(Instant::now());
-                a.sw[i]
+                let v = !a.is_on(s);
+                a.set_sw(s, v);
+                (v, config::audio_slot_mode(a.audio + 1, a.cfg.me_one()))
             });
-            if let Some(v) = v {
-                match i {
-                    0 => {
-                        write_cfg(|c| c.input.kbd_follow = v);
+            if let Some((v, on_mode)) = v {
+                match s {
+                    // 鼠标 / 键盘：两台同步（新 rev，主程序重新读配置后发给对方）
+                    Sw::Mouse => {
+                        write_cfg(|c| {
+                            c.share.mouse = v;
+                            c.share.rev = config::next_rev(c.share.rev);
+                        });
                     }
-                    1 => {
+                    Sw::Kbd => {
+                        write_cfg(|c| {
+                            c.share.keyboard = v;
+                            c.share.rev = config::next_rev(c.share.rev);
+                        });
+                    }
+                    Sw::Audio => {
+                        let m = if v { on_mode } else { config::AudioMode::Off };
+                        set_audio_mode(m);
+                    }
+                    Sw::Clip => {
                         write_cfg(|c| c.clipboard.enabled = v);
                     }
-                    2 => {
+                    Sw::Follow => {
+                        write_cfg(|c| c.input.kbd_follow = v);
+                    }
+                    Sw::Notify => {
                         write_cfg(|c| c.clipboard.notify = v);
                     }
-                    _ => {
+                    Sw::Autostart => {
                         // 开机自启：直接改注册表（主程序没在跑也要生效），开关和配置都按实际结果来
                         sys::autostart_set(v);
                         let actual = sys::autostart_get().is_some();
                         if actual != v {
-                            with_app(|a| {
-                                a.sw[3] = actual;
-                                a.sw_t[3] = Some(Instant::now());
-                            });
+                            with_app(|a| a.set_sw(Sw::Autostart, actual));
                         }
                         write_cfg(|c| c.autostart = actual);
                     }
                 }
             }
         }
+        Hot::Nav(p) => {
+            with_app(|a| a.go_page(p));
+            // 换页：正在编辑的输入框不在新页上
+            if let Some(Some(f)) = with_app(|a| a.edit) {
+                finish(f, true, false);
+            }
+        }
         Hot::Audio(k) => {
-            let changed = with_app(|a| {
-                let c = a.audio != k;
+            let r = with_app(|a| {
+                let changed = a.audio != k;
                 a.set_audio(k);
-                c.then(|| config::audio_slot_mode(k, a.cfg.me_one()))
+                (changed, a.is_on(Sw::Audio), config::audio_slot_mode(k + 1, a.cfg.me_one()))
             });
-            if let Some(Some(m)) = changed {
-                // 新 rev（rev_mode 跟着记）：主程序重新读配置后发给对方，对方换成它的视角
-                write_cfg(|c| {
-                    c.audio.mode = m;
-                    c.audio.rev = config::next_rev(c.audio.rev);
-                    c.audio.rev_mode = Some(m);
-                });
+            match r {
+                Some((true, true, m)) => set_audio_mode(m),
+                // 声音关着：只记下打开时用哪档
+                Some((true, false, m)) => {
+                    write_cfg(|c| c.audio.last = m);
+                }
+                _ => {}
+            }
+        }
+        Hot::Pause => {
+            let v = with_app(|a| {
+                let v = !a.paused_now();
+                a.pause_click = Some((v, Instant::now()));
+                v
+            });
+            if let Some(v) = v {
+                let cmd = if v { "pause" } else { "resume" };
+                if let Err(e) = write_atomic("update_cmd.json", &config::update_cmd_json(cmd, config::now_ms())) {
+                    crate::log!("设置窗口：写 update_cmd.json 失败 {e}");
+                }
             }
         }
         Hot::Upd => {
@@ -2930,6 +3708,15 @@ fn on_down(hwnd: HWND, x: f32, y: f32) {
                 }
             }
         }
+        Hot::Speed | Hot::Volume => {
+            if with_app(|a| a.slide = Some(hot)).is_some() {
+                unsafe {
+                    SetCapture(hwnd);
+                }
+                on_slide(hot, x, false);
+            }
+            return;
+        }
         Hot::Ip => activate(Field::Ip),
         Hot::Key => activate(Field::Key),
         Hot::NameLocal => activate(Field::LocalName),
@@ -2948,6 +3735,10 @@ fn on_down(hwnd: HWND, x: f32, y: f32) {
 }
 
 fn on_move(hwnd: HWND, x: f32, y: f32) {
+    if let Some(Some(h)) = with_app(|a| a.slide) {
+        on_slide(h, x, false);
+        return;
+    }
     let track = with_app(|a| {
         if let Some(d) = a.drag.as_mut() {
             if d.m0.0.is_nan() {
@@ -2969,8 +3760,8 @@ fn on_move(hwnd: HWND, x: f32, y: f32) {
                 let nx = if w >= hi - lo { lo + (hi - lo - w) / 2.0 } else { x.clamp(lo, hi - w) };
                 p + (nx - x) / v.k
             };
-            pos.0 = keep(pos.0, pw, 8.0, CLIENT_W as f64 - 8.0, v.ox);
-            pos.1 = keep(pos.1, ph, 8.0, AREA.y as f64 + AREA.h as f64 + 4.0, v.oy);
+            pos.0 = keep(pos.0, pw, STAGE.x as f64 + 8.0, (STAGE.x + STAGE.w) as f64 - 8.0, v.ox);
+            pos.1 = keep(pos.1, ph, STAGE.y as f64 + 8.0, AREA.y as f64 + AREA.h as f64 + 4.0, v.oy);
             if let Some(d) = a.drag.as_mut() {
                 d.pos = pos;
             }
@@ -3001,6 +3792,13 @@ fn on_move(hwnd: HWND, x: f32, y: f32) {
 }
 
 fn on_up(x: f32, y: f32) {
+    if let Some(Some(h)) = with_app(|a| a.slide.take()) {
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        on_slide(h, x, true);
+        return;
+    }
     let r = with_app(|a| {
         if let Some(d) = a.drag.take() {
             if d.active {
@@ -3196,6 +3994,16 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             }
             WM_CAPTURECHANGED => {
                 // 捕获被意外拿走：放弃这次拖动 / 按下（on_up 自己放捕获时两者都已清空）
+                // 拖滑杆时被拿走：停在当前值（已在内存里，写进配置）
+                if let Some(Some(h)) = with_app(|a| a.slide.take()) {
+                    let x = with_app(|a| match h {
+                        Hot::Speed => SLIDER_X + SLIDER_W * speed_frac(a.cfg.input.speed),
+                        _ => SLIDER_X + SLIDER_W * a.cfg.audio.volume,
+                    });
+                    if let Some(x) = x {
+                        on_slide(h, x, true);
+                    }
+                }
                 if with_app(|a| {
                     let pressed = std::mem::replace(&mut a.press, Hot::None) != Hot::None;
                     a.drag.take().is_some() || pressed
@@ -3332,7 +4140,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 mod tests {
     #[test]
     fn audio_segments_hit_and_layout() {
-        for k in 0..4 {
+        for k in 0..3 {
             let r = audio_seg(k);
             assert_eq!(audio_hit(r.cx()), k);
             assert_eq!(audio_hit(r.x + 0.5), k);
@@ -3340,27 +4148,51 @@ mod tests {
             assert!(AUDIO_SEG.contains(r.cx(), r.cy()));
         }
         assert_eq!(audio_hit(AUDIO_SEG.x), 0);
-        assert_eq!(audio_hit(AUDIO_SEG.x + AUDIO_SEG.w - 0.1), 3);
-        // 右边和开关对齐、在卡片第一行里
-        assert_eq!(AUDIO_SEG.x + AUDIO_SEG.w, switch_rect(0).x + switch_rect(0).w);
-        assert!(AUDIO_SEG.y > ROW0 && AUDIO_SEG.y + AUDIO_SEG.h < ROW0 + ROW_H);
-        // 四个开关各在自己那一行，卡片装得下
-        for i in 0..SW_N {
-            let r = switch_rect(i);
-            assert!(switch_row(i).contains(r.cx(), r.cy()));
-            assert!(r.y + r.h < CARD.y + CARD.h);
-        }
-        assert_eq!(switch_row(3).x, 36.0, "开机自启在左栏");
-        assert!(CARD.y > STAGE_H && CARD.y + CARD.h < CLIENT_H);
+        assert_eq!(audio_hit(AUDIO_SEG.x + AUDIO_SEG.w - 0.1), 2);
+        // 右边和行里的开关对齐、在卡片第一行里
+        let row = row_rect(CARD_Y, 0);
+        assert_eq!(AUDIO_SEG.x + AUDIO_SEG.w, row_switch(row).x + row_switch(row).w);
+        assert!(AUDIO_SEG.y > row.y && AUDIO_SEG.y + AUDIO_SEG.h < row.y + ROW_H);
         let mut c = Config::default();
         for num in [1, 2] {
             c.num = num;
-            for k in 0..4 {
-                c.audio.mode = config::audio_slot_mode(k, c.me_one());
-                assert_eq!(audio_index(&c), k);
+            for k in 1..4 {
+                c.audio.set_mode(config::audio_slot_mode(k, c.me_one()));
+                assert_eq!(audio_seg_index(&c), k - 1);
             }
+            // 关着：显示上次开着的那档
+            c.audio.set_mode(config::AudioMode::Off);
+            assert_eq!(audio_seg_index(&c), 2);
         }
     }
+
+    #[test]
+    fn page_layout_fits() {
+        // 侧栏各项不重叠、都在玻璃板里
+        for w in PAGES.windows(2) {
+            assert!(nav_rect(w[0]).y + nav_rect(w[0]).h <= nav_rect(w[1]).y);
+        }
+        for p in PAGES {
+            let r = nav_rect(p);
+            assert!(SIDEBAR.contains(r.x, r.y) && SIDEBAR.contains(r.x + r.w - 1.0, r.y + r.h - 1.0));
+            assert_eq!(Page::from_env(&format!("{p:?}").to_lowercase()), Some(p));
+        }
+        // 各页内容在窗口里
+        assert!(STAGE.y + STAGE.h < SPEED_CARD_Y && SPEED_CARD_Y + 66.0 <= CLIENT_H - 16.0);
+        assert!(STRIP.y + STRIP.h < CARD_Y && CARD_Y + 166.0 <= CLIENT_H);
+        assert!(AREA.x > STAGE.x && AREA.x + AREA.w < STAGE.x + STAGE.w && AREA.y + AREA.h < STEPPER.y);
+        assert!(POP.y > HEAD_SW.y + HEAD_SW.h && POP_OK.x + POP_OK.w <= POP.x + POP.w);
+        assert!(KEY_BOX.x + KEY_BOX.w < COPY_KEY.x && NEW_KEY.x + NEW_KEY.w == CTL_R);
+        // 滑杆
+        assert_eq!(speed_at(0.0), SPEED_MIN);
+        assert_eq!(speed_at(1.0), SPEED_MAX);
+        assert_eq!(speed_at(speed_frac(1.0)), 1.0);
+        assert_eq!(volume_at(0.8), 0.8);
+        assert_eq!(slider_frac(SLIDER_X - 50.0), 0.0);
+        assert_eq!(slider_frac(SLIDER_X + SLIDER_W + 50.0), 1.0);
+        assert_eq!(hotkey_name(0x91), "Scroll Lock");
+    }
+
 
     use super::*;
     use crate::geom::Point;

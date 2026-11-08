@@ -28,8 +28,10 @@ pub const CAP_KBD: u32 = 1;
 pub const CAP_AUDIO: u32 = 2;
 /// Hello.caps：支持一键更新（Update 消息）。
 pub const CAP_UPDATE: u32 = 4;
+/// Hello.caps：鼠标、键盘各自开关、两台同步（Share 消息）。
+pub const CAP_SHARE: u32 = 8;
 /// 本机支持的能力。
-pub const CAPS: u32 = CAP_KBD | CAP_AUDIO | CAP_UPDATE;
+pub const CAPS: u32 = CAP_KBD | CAP_AUDIO | CAP_UPDATE | CAP_SHARE;
 /// TCP 握手魔数（KML2：握手带 X25519 临时公钥）。
 pub const MAGIC: &[u8; 4] = b"KML2";
 /// 旧版魔数：收到它说明对方版本太旧。
@@ -141,6 +143,9 @@ pub enum Msg {
     /// 声音模式（发送方视角，"off"/"here"/"there"/"both"）+ 修改时间：较新的覆盖较旧的（接收方换成自己视角）。
     /// 只发给 caps 带 CAP_AUDIO 的对方。
     Audio { mode: String, rev: u64 },
+    /// 鼠标、键盘各自开关（两台一样，不用换视角）+ 修改时间：较新的覆盖较旧的。握手时和排布一起发（旧版本收到会
+    /// 当成无法解析的帧忽略），之后变了再发。
+    Share { mouse: bool, kbd: bool, rev: u64 },
     /// 本机正在放对方的声音（每秒一次）：对方据此才把自己静音（“对方听”），收不到就恢复。
     AudioAck { playing: bool },
     /// 设置窗口里给对方改名：接收方把它写进自己 config.toml 的 name（重新加载后重发 Hello）。
@@ -646,7 +651,7 @@ pub(crate) mod tests {
         let rn = Msg::Rename { name: "客厅".into() };
         assert_eq!(rt(&rn), rn);
         assert!(serde_json::from_str::<OldMsg>(&serde_json::to_string(&rn).unwrap()).is_err());
-        for m in [Msg::Audio { mode: "both".into(), rev: 9 }, Msg::AudioAck { playing: true }] {
+        for m in [Msg::Audio { mode: "both".into(), rev: 9 }, Msg::AudioAck { playing: true }, Msg::Share { mouse: false, kbd: true, rev: 7 }] {
             assert_eq!(rt(&m), m);
             assert!(serde_json::from_str::<OldMsg>(&serde_json::to_string(&m).unwrap()).is_err());
         }

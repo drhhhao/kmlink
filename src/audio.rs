@@ -382,7 +382,7 @@ impl Ctl {
                 }
                 return;
             }
-            c.audio.mode = theirs;
+            c.audio.set_mode(theirs);
             c.audio.rev = rev;
             c.audio.rev_mode = Some(theirs);
             c.clone()
@@ -392,7 +392,7 @@ impl Ctl {
         crate::log!("声音：采用对方的模式 → 本机 {}", theirs.as_str());
         let r = config::update(&new_cfg, |c| {
             if c.audio.rev <= rev {
-                c.audio.mode = theirs;
+                c.audio.set_mode(theirs);
                 c.audio.rev = rev;
                 c.audio.rev_mode = Some(theirs);
             }

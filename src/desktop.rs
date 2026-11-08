@@ -1016,18 +1016,19 @@ impl State {
         let labels = audio_labels(&cfg, &st.peer_name);
         let who = |k: usize| -> String { labels[k].split_once(' ').map(|(_, n)| n).unwrap_or("").chars().take(8).collect() };
         let audio_hint = match slot {
-            0 => "各放各的".to_string(),
-            1 | 2 => format!("全在 {} 放", who(slot)),
-            _ => "两台一起放".to_string(),
+            0 => String::new(),
+            1 | 2 => who(slot),
+            _ => "两台都放".to_string(),
         };
         crate::panel::View {
             connected: st.connected,
             paused: st.paused,
             peer_name: st.peer_name.clone(),
             audio: slot,
+            audio_last: config::audio_mode_slot(cfg.audio.on_mode(), cfg.me_one()).max(1),
             audio_hint,
-            follow: cfg.input.kbd_follow,
-            autostart: self.items.autostart.is_checked(),
+            mouse: cfg.share.mouse,
+            kbd: cfg.share.keyboard,
             upd: crate::update::state(),
             peer_upd: st.connected && st.peer_caps & crate::proto::CAP_UPDATE != 0,
         }
@@ -1042,15 +1043,13 @@ impl State {
                 self.hub.to_input(ToInput::Pause(on));
                 self.hub.set_status(|s| s.paused = on);
             }
-            Cmd::Follow(on) => {
-                self.items.follow.set_checked(on);
-                self.save_follow(on);
+            Cmd::Mouse(on) => {
+                let k = self.hub.cfg().share.keyboard;
+                self.save_share(on, k);
             }
-            Cmd::Autostart(want) => {
-                sys::autostart_set(want);
-                let actual = sys::autostart_get().is_some();
-                self.items.autostart.set_checked(actual);
-                self.save_autostart(actual);
+            Cmd::Kbd(on) => {
+                let m = self.hub.cfg().share.mouse;
+                self.save_share(m, on);
             }
             Cmd::Audio(k) => {
                 let m = config::audio_slot_mode(k, self.hub.cfg().me_one());
@@ -1117,6 +1116,26 @@ impl State {
         }
     }
 
+    /// 托盘面板的鼠标 / 键盘开关：内存里先改（新 rev），马上通知 input、发给对方，再存进配置文件（只动这一项）。
+    fn save_share(&mut self, mouse: bool, keyboard: bool) {
+        let cur = self.hub.cfg().share;
+        if (cur.mouse, cur.keyboard) == (mouse, keyboard) {
+            return;
+        }
+        log!("托盘：鼠标{} 键盘{}", if mouse { "开" } else { "关" }, if keyboard { "开" } else { "关" });
+        let rev = config::next_rev(cur.rev);
+        let share = config::ShareCfg { mouse, keyboard, rev };
+        if let Ok(mut g) = self.hub.cfg.write() {
+            g.share = share.clone();
+        }
+        let c = self.hub.cfg();
+        self.hub.to_input(ToInput::Config(Box::new(c.clone())));
+        self.hub.send(crate::net::share_msg(&c));
+        if let Err(e) = config::update(&c, |d| d.share = share) {
+            log!("保存配置失败：{e}");
+        }
+    }
+
     /// 托盘“声音”：内存里先改（新 rev，声音控制线程马上同步给对方），再存进配置文件（只动声音模式）。
     fn save_audio(&mut self, m: AudioMode) {
         let cur = self.hub.cfg().audio;
@@ -1126,13 +1145,13 @@ impl State {
         log!("托盘：声音 {}", m.as_str());
         let rev = config::next_rev(cur.rev);
         if let Ok(mut g) = self.hub.cfg.write() {
-            g.audio.mode = m;
+            g.audio.set_mode(m);
             g.audio.rev = rev;
             g.audio.rev_mode = Some(m);
         }
         let c = self.hub.cfg();
         if let Err(e) = config::update(&c, |d| {
-            d.audio.mode = m;
+            d.audio.set_mode(m);
             d.audio.rev = d.audio.rev.max(rev);
             d.audio.rev_mode = Some(m);
         }) {
@@ -1188,6 +1207,13 @@ impl State {
                 match config::take_update_cmd(config::now_ms()).as_deref() {
                     Some("check") => crate::update::check_now(),
                     Some("update") => crate::update::update_both(),
+                    // 设置窗口连接页的暂停 / 继续（和托盘同一个动作）
+                    Some("pause") => {
+                        self.panel_cmd(crate::panel::Cmd::Pause(true));
+                    }
+                    Some("resume") => {
+                        self.panel_cmd(crate::panel::Cmd::Pause(false));
+                    }
                     _ => {}
                 }
                 self.update_tick();
@@ -1345,10 +1371,25 @@ impl State {
                 log!("保存配置失败：{e}");
             }
         }
+        if c.share.rev == old.share.rev && (c.share.mouse, c.share.keyboard) != (old.share.mouse, old.share.keyboard) {
+            // 手改的鼠标/键盘开关：rev 变新才能同步给对方
+            c.share.rev = config::next_rev(c.share.rev);
+            let s = c.share.clone();
+            if let Err(e) = config::update(&c, |d| {
+                if (d.share.mouse, d.share.keyboard) == (s.mouse, s.keyboard) {
+                    d.share.rev = d.share.rev.max(s.rev);
+                }
+            }) {
+                log!("保存配置失败：{e}");
+            }
+        }
         if let Ok(mut g) = self.hub.cfg.write() {
             *g = c.clone();
         }
         self.hub.to_input(ToInput::Config(Box::new(c.clone())));
+        if c.share.rev != old.share.rev {
+            self.hub.send(crate::net::share_msg(&c));
+        }
         // 只在 rev 变了时发：采用对方排布后的重新加载（rev 相同）不回发
         if c.layout.rev != old.layout.rev {
             let l = c.layout.layout;

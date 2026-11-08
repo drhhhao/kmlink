@@ -2,9 +2,10 @@
 //!
 //! 右键点托盘图标打开（左键打开设置窗口），弹在图标正上方（任务栏在上面时弹在下方），离任务栏 12。宽 300，从上到下：
 //!   头部：状态图标块（已连接 绿 / 已暂停 琥珀 / 等待连接 灰）+ 标题 + 灰字（对方名字），右边“暂停 / 继续”；
-//!   声音：分段“关 | 1 | 2 | 两台”，灰字说在哪台放；键盘跟随、开机自启两个开关；
+//!   一行三个开关块：鼠标 / 键盘 / 声音（开 = 绿圆白图标，关 = 灰；设计稿 设计\设置窗口\侧边栏\11-托盘面板-配套改动.png）；
+//!   声音开着时下面一行“声音在 1 | 2 | 两台”，灰字是在哪台放；
 //!   更新一行（检查更新 / 正在检查… / 已是最新 / 新版 x 更新 / 正在更新 45% / 正在重启 / 已更新到 x / 更新失败 重试）；
-//!   屏幕排布与连接设置 ›、退出。
+//!   设置 ›、退出（键盘跟随、开机自启只在设置窗口里）。
 //! 点开关、分段、暂停、检查更新、更新不关面板；点设置、退出，按 Esc、点到外面（失去激活）就关。
 //!
 //! 窗口：WS_POPUP + TOOLWINDOW + TOPMOST，DWM 系统亚克力（DWMWA_SYSTEMBACKDROP_TYPE = 临时窗口）、圆角、深浅色跟系统，
@@ -48,11 +49,13 @@ pub struct View {
     pub connected: bool,
     pub paused: bool,
     pub peer_name: String,
-    /// 声音：选中第几段（0 关 / 1 / 2 / 3 两台）和段下灰字
+    /// 声音：第几档（0 关 / 1 / 2 / 3 两台）；关着时打开用哪档（1～3）；“声音在”下面的灰字（在哪台放）
     pub audio: usize,
+    pub audio_last: usize,
     pub audio_hint: String,
-    pub follow: bool,
-    pub autostart: bool,
+    /// 鼠标、键盘开关（两台同步）
+    pub mouse: bool,
+    pub kbd: bool,
     pub upd: crate::update::State,
     /// 对方连着且支持一键更新
     pub peer_upd: bool,
@@ -62,8 +65,9 @@ pub struct View {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Cmd {
     Pause(bool),
-    Follow(bool),
-    Autostart(bool),
+    Mouse(bool),
+    Kbd(bool),
+    /// 声音第几档（0 = 关）
     Audio(usize),
     Check,
     Update,
@@ -75,9 +79,10 @@ pub enum Cmd {
 enum Hot {
     None,
     Pause,
+    /// 声音在哪放的段（0 = “1”）
     Seg(usize),
-    Follow,
-    Autostart,
+    /// 开关块：0 鼠标 / 1 键盘 / 2 声音
+    Block(usize),
     UpdRow,
     UpdBtn,
     Settings,
@@ -93,10 +98,10 @@ const ROW_H: f32 = 42.0;
 const AUDIO_H: f32 = 52.0;
 const UPD_H: f32 = 52.0;
 const LINK_H: f32 = 38.0;
-const SEG_W: f32 = 38.0;
+const SEG_W: f32 = 46.0;
+/// 开关块（鼠标 / 键盘 / 声音）
+const BLOCK_H: f32 = 62.0;
 const SEG_H: f32 = 28.0;
-const SW_W: f32 = 38.0;
-const SW_H: f32 = 23.0;
 /// 离任务栏的距离
 const GAP: f32 = 12.0;
 
@@ -127,10 +132,10 @@ impl R {
 struct Lay {
     head: R,
     pause: R,
-    audio: R,
-    segs: [R; 4],
-    follow: R,
-    autostart: R,
+    /// 声音关着时 None（那一行不显示）
+    audio: Option<R>,
+    segs: [R; 3],
+    blocks: [R; 3],
     upd: R,
     upd_btn: Option<R>,
     settings: R,
@@ -148,7 +153,6 @@ struct Theme {
     fill: Rgba,
     seg_track: Rgba,
     seg_thumb: Rgba,
-    sw_off: Rgba,
     green: Rgba,
     green_bg: Rgba,
     amber: Rgba,
@@ -169,7 +173,6 @@ const LIGHT: Theme = Theme {
     fill: hexa(0x000000, 0.06),
     seg_track: hexa(0x767680, 0.12),
     seg_thumb: hex(0xFFFFFF),
-    sw_off: hexa(0x787880, 0.20),
     green: hex(0x34C759),
     green_bg: hexa(0x34C759, 0.14),
     amber: hex(0xFF9F0A),
@@ -189,7 +192,6 @@ const DARK: Theme = Theme {
     fill: hexa(0xFFFFFF, 0.10),
     seg_track: hexa(0x767680, 0.24),
     seg_thumb: hex(0x636366),
-    sw_off: hexa(0x787880, 0.36),
     green: hex(0x30D158),
     green_bg: hexa(0x30D158, 0.18),
     amber: hex(0xFF9F0A),
@@ -425,14 +427,18 @@ fn layout(v: &View, f: &Fonts, measure: &dyn Fn(&Font, &str) -> f32) -> Lay {
     y += HEAD_H;
     let sep0 = y;
     y += 1.0;
-    let audio = R::new(x0, y, iw, AUDIO_H);
-    let sx = W - IN - 4.0 * SEG_W - 4.0;
-    let segs = [0, 1, 2, 3].map(|k| R::new(sx + 2.0 + SEG_W * k as f32, audio.cy() - SEG_H / 2.0 + 2.0, SEG_W, SEG_H - 4.0));
-    y += AUDIO_H;
-    let follow = R::new(x0, y, iw, ROW_H);
-    y += ROW_H;
-    let autostart = R::new(x0, y, iw, ROW_H);
-    y += ROW_H;
+    // 三个开关块（行内边距 6，块之间 6）
+    let bw = (iw - 12.0 - 12.0) / 3.0;
+    let blocks = [0, 1, 2].map(|k| R::new(x0 + 6.0 + (bw + 6.0) * k as f32, y + 6.0, bw, BLOCK_H));
+    y += BLOCK_H + 12.0;
+    // 声音开着：下面一行“声音在 1 | 2 | 两台”
+    let a = R::new(x0, y, iw, AUDIO_H);
+    let sx = W - IN - 3.0 * SEG_W - 4.0;
+    let segs = [0, 1, 2].map(|k| R::new(sx + 2.0 + SEG_W * k as f32, a.cy() - SEG_H / 2.0 + 2.0, SEG_W, SEG_H - 4.0));
+    let audio = (v.audio != 0).then_some(a);
+    if audio.is_some() {
+        y += AUDIO_H;
+    }
     let sep1 = y;
     y += 1.0;
     let big = !matches!(
@@ -452,7 +458,7 @@ fn layout(v: &View, f: &Fonts, measure: &dyn Fn(&Font, &str) -> f32) -> Lay {
     y += LINK_H;
     let quit = R::new(x0, y, iw, LINK_H);
     y += LINK_H + PAD;
-    Lay { head, pause, audio, segs, follow, autostart, upd, upd_btn, settings, quit, seps: [sep0, sep1, sep2], h: y }
+    Lay { head, pause, audio, segs, blocks, upd, upd_btn, settings, quit, seps: [sep0, sep1, sep2], h: y }
 }
 
 /// 更新那一行右边的按钮文字（没有按钮 None）。
@@ -470,16 +476,17 @@ fn hit(l: &Lay, v: &View, x: f32, y: f32) -> Hot {
     if l.pause.contains(x, y) {
         return Hot::Pause;
     }
-    for (k, r) in l.segs.iter().enumerate() {
+    for (k, r) in l.blocks.iter().enumerate() {
         if r.contains(x, y) {
-            return Hot::Seg(k);
+            return Hot::Block(k);
         }
     }
-    if l.follow.contains(x, y) {
-        return Hot::Follow;
-    }
-    if l.autostart.contains(x, y) {
-        return Hot::Autostart;
+    if l.audio.is_some() {
+        for (k, r) in l.segs.iter().enumerate() {
+            if r.contains(x, y) {
+                return Hot::Seg(k);
+            }
+        }
     }
     if let Some(b) = l.upd_btn
         && b.contains(x, y)
@@ -608,8 +615,6 @@ fn render(p: &mut Painter, pn: &Panel) {
     // 悬停：整行浅底
     let row_hover = |p: &mut Painter, r: R| p.rrect(r.x, r.y, r.w, r.h, 10.0, th.hover);
     match hot {
-        Hot::Follow => row_hover(p, l.follow),
-        Hot::Autostart => row_hover(p, l.autostart),
         Hot::UpdRow => row_hover(p, l.upd),
         Hot::Settings => row_hover(p, l.settings),
         Hot::Quit => row_hover(p, l.quit),
@@ -665,35 +670,41 @@ fn render(p: &mut Painter, pn: &Panel) {
     let sep = |p: &mut Painter, y: f32| p.rrect(IN, y, W - 2.0 * IN, 1.0, 0.0, th.sep);
     sep(p, l.seps[0]);
 
-    // 声音
-    p.text_mid(IN, l.audio.cy() - 8.0, "声音", &f.row, th.fg);
-    let hint = if v.connected { v.audio_hint.clone() } else { "连上后生效".to_string() };
-    p.text_mid(IN, l.audio.cy() + 10.0, &hint, &f.sub, th.mutd);
-    let tr = R::new(l.segs[0].x - 2.0, l.audio.cy() - SEG_H / 2.0 + 2.0 - 2.0, SEG_W * 4.0 + 4.0, SEG_H);
-    p.rrect(tr.x, tr.y, tr.w, tr.h, 8.0, th.seg_track);
-    for (k, label) in ["关", "1", "2", "两台"].iter().enumerate() {
-        let r = l.segs[k];
-        let on = k == v.audio;
-        if on {
-            p.shadow(r.x, r.y, r.w, r.h, 6.0, 0.0, 1.0, 2.0, 0.0, hexa(0, if th.dark { 0.35 } else { 0.12 }));
-            p.rrect(r.x, r.y, r.w, r.h, 6.0, th.seg_thumb);
-        } else if hot == Hot::Seg(k) {
-            p.rrect(r.x, r.y, r.w, r.h, 6.0, th.hover);
-        }
-        let ft = if on { &f.seg_on } else { &f.seg };
-        let w = p.measure(ft, label);
-        p.text_mid(r.cx() - w / 2.0, r.cy(), label, ft, th.fg);
+    // 开关块：鼠标 / 键盘 / 声音（开 = 绿圆白图标，关 = 灰圆灰图标）
+    use crate::settings::{Icon, icon};
+    let blocks = [(Icon::Mouse, "鼠标", v.mouse), (Icon::Keyboard, "键盘", v.kbd), (Icon::Speaker, "声音", v.audio != 0)];
+    for (k, (ic, label, on)) in blocks.into_iter().enumerate() {
+        let r = l.blocks[k];
+        let bg = if hot == Hot::Block(k) { th.fill.lerp(th.hover, 0.5).alpha(th.fill.a + 0.04) } else { th.fill };
+        p.rrect(r.x, r.y, r.w, r.h, 13.0, bg);
+        let (cx, cy) = (r.cx(), r.y + 22.0);
+        let off_bg = if th.dark { hex(0x48484A) } else { hex(0xE3E3E7) };
+        p.circle(cx, cy, 15.0, if on { th.green } else { off_bg });
+        icon(p, ic, cx, cy, 17.0, 2.0, if on { hex(0xFFFFFF) } else { th.mutd });
+        let w = p.measure(&f.btn, label);
+        p.text_mid(cx - w / 2.0, r.y + 48.0, label, &f.btn, if on { th.fg } else { th.mutd });
     }
 
-    // 开关
-    for (r, label, on) in [(l.follow, "键盘跟随", v.follow), (l.autostart, "开机自启", v.autostart)] {
-        p.text_mid(IN, r.cy(), label, &f.row, th.fg);
-        let sx = W - IN - SW_W;
-        let sy = r.cy() - SW_H / 2.0;
-        p.rrect(sx, sy, SW_W, SW_H, SW_H / 2.0, if on { th.green } else { th.sw_off });
-        let kx = if on { sx + SW_W - 2.0 - 19.0 } else { sx + 2.0 };
-        p.shadow(kx, sy + 2.0, 19.0, 19.0, 9.5, 0.0, 1.0, 3.0, 0.0, hexa(0, 0.2));
-        p.circle(kx + 9.5, sy + SW_H / 2.0, 9.5, hex(0xFFFFFF));
+    // 声音在（开着才有）
+    if let Some(a) = l.audio {
+        p.text_mid(IN, a.cy() - 8.0, "声音在", &f.row, th.fg);
+        let hint = if v.connected { v.audio_hint.clone() } else { "连上后生效".to_string() };
+        p.text_mid(IN, a.cy() + 10.0, &hint, &f.sub, th.mutd);
+        let tr = R::new(l.segs[0].x - 2.0, a.cy() - SEG_H / 2.0, SEG_W * 3.0 + 4.0, SEG_H);
+        p.rrect(tr.x, tr.y, tr.w, tr.h, 8.0, th.seg_track);
+        for (k, label) in ["1", "2", "两台"].iter().enumerate() {
+            let r = l.segs[k];
+            let on = k + 1 == v.audio;
+            if on {
+                p.shadow(r.x, r.y, r.w, r.h, 6.0, 0.0, 1.0, 2.0, 0.0, hexa(0, if th.dark { 0.35 } else { 0.12 }));
+                p.rrect(r.x, r.y, r.w, r.h, 6.0, th.seg_thumb);
+            } else if hot == Hot::Seg(k) {
+                p.rrect(r.x, r.y, r.w, r.h, 6.0, th.hover);
+            }
+            let ft = if on { &f.seg_on } else { &f.seg };
+            let w = p.measure(ft, label);
+            p.text_mid(r.cx() - w / 2.0, r.cy(), label, ft, th.fg);
+        }
     }
     sep(p, l.seps[1]);
 
@@ -788,7 +799,7 @@ fn render(p: &mut Painter, pn: &Panel) {
     sep(p, l.seps[2]);
 
     // 链接
-    p.text_mid(IN, l.settings.cy(), "屏幕排布与连接设置", &f.link, th.fg);
+    p.text_mid(IN, l.settings.cy(), "设置", &f.link, th.fg);
     let cx = W - IN - 3.0;
     let cy = l.settings.cy();
     p.stroke(&[Seg::Line(cx - 3.5, cy - 4.5, cx, cy), Seg::Line(cx - 3.5, cy + 4.5, cx, cy)], 1.5, th.mutd);
@@ -804,9 +815,10 @@ pub fn demo(state: &str, secs: u64) {
         paused: false,
         peer_name: "机械革命".into(),
         audio: 1,
-        audio_hint: "全在 机械革命 放".into(),
-        follow: true,
-        autostart: true,
+        audio_last: 1,
+        audio_hint: "机械革命".into(),
+        mouse: true,
+        kbd: true,
         upd: U::Idle,
         peer_upd: true,
     };
@@ -823,6 +835,10 @@ pub fn demo(state: &str, secs: u64) {
         "fail" => v.upd = U::Failed("连不上 GitHub（连接）".into()),
         "done" => v.upd = U::Updated("0.2.0".into()),
         "paused" => v.paused = true,
+        "off" => {
+            v.kbd = false;
+            v.audio = 0;
+        }
         "offline" => {
             v.connected = false;
             v.peer_upd = false;
@@ -914,17 +930,22 @@ fn click(h: HWND, hot: Hot) {
             nv.paused = !v.paused;
             Some(Cmd::Pause(nv.paused))
         }
-        Hot::Seg(k) if k != v.audio => {
-            nv.audio = k;
-            Some(Cmd::Audio(k))
+        Hot::Seg(k) if k + 1 != v.audio => {
+            nv.audio = k + 1;
+            nv.audio_last = k + 1;
+            Some(Cmd::Audio(k + 1))
         }
-        Hot::Follow => {
-            nv.follow = !v.follow;
-            Some(Cmd::Follow(nv.follow))
+        Hot::Block(0) => {
+            nv.mouse = !v.mouse;
+            Some(Cmd::Mouse(nv.mouse))
         }
-        Hot::Autostart => {
-            nv.autostart = !v.autostart;
-            Some(Cmd::Autostart(nv.autostart))
+        Hot::Block(1) => {
+            nv.kbd = !v.kbd;
+            Some(Cmd::Kbd(nv.kbd))
+        }
+        Hot::Block(_) => {
+            nv.audio = if v.audio == 0 { v.audio_last.clamp(1, 3) } else { 0 };
+            Some(Cmd::Audio(nv.audio))
         }
         Hot::UpdRow => {
             nv.upd = U::Checking;

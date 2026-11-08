@@ -28,6 +28,8 @@ pub struct Config {
     pub input: InputCfg,
     pub clipboard: ClipCfg,
     pub audio: AudioCfg,
+    /// 鼠标、键盘各自的开关（两台同步）。
+    pub share: ShareCfg,
     /// 开机自启（写 HKCU\...\Run）。
     pub autostart: bool,
     /// 本机编号（设置窗口舞台上的大数字、声音“1 / 2”）：1 或 2，0 = 还没定。第一次连上时按当时的排布定
@@ -53,6 +55,24 @@ pub struct InputCfg {
     pub hotkey_vk: u32,
     /// 键盘跟随鼠标：本机键盘打到最后真正在用的那只鼠标所在的那台。
     pub kbd_follow: bool,
+}
+
+/// 鼠标、键盘各自能不能用到对方那台，互不影响。两台同步（任一台改两台一起变；同排布的 rev，较新的覆盖较旧的）。
+/// 声音的开关就是 audio.mode（off = 关）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShareCfg {
+    /// 鼠标：推到边能跨到对方那台。
+    pub mouse: bool,
+    /// 键盘：能打到对方那台（跟着跨过去的光标走；开了跟随还跟最后在用的鼠标走；鼠标关着时总是跟随）。
+    pub keyboard: bool,
+    pub rev: u64,
+}
+
+impl Default for ShareCfg {
+    fn default() -> Self {
+        Self { mouse: true, keyboard: true, rev: 0 }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -133,6 +153,8 @@ impl From<AudioMode> for String {
 #[serde(default)]
 pub struct AudioCfg {
     pub mode: AudioMode,
+    /// 最近一次开着的模式（不会是 off，本机视角）：声音开关重新打开时恢复它。
+    pub last: AudioMode,
     /// 修改时间（毫秒，同排布的 rev）：两台同步模式，较新的覆盖较旧的。
     pub rev: u64,
     /// rev 是给哪个模式发的：和 mode 不一样 = 有人手改了 config.toml（哪怕 kmlink 当时没在跑），要发新 rev。
@@ -154,11 +176,24 @@ pub struct AudioCfg {
 
 impl Default for AudioCfg {
     fn default() -> Self {
-        Self { mode: AudioMode::Off, rev: 0, rev_mode: None, volume: 1.0, buffer_q: None, buffer_min_ms: None, buffer_max_ms: None, buffer_window_s: None }
+        Self { mode: AudioMode::Off, last: AudioMode::Both, rev: 0, rev_mode: None, volume: 1.0, buffer_q: None, buffer_min_ms: None, buffer_max_ms: None, buffer_window_s: None }
     }
 }
 
 impl AudioCfg {
+    /// 改模式（不动 rev）：开着的模式记进 last。
+    pub fn set_mode(&mut self, m: AudioMode) {
+        self.mode = m;
+        if m != AudioMode::Off {
+            self.last = m;
+        }
+    }
+
+    /// 声音开关打开时用的模式：上次开着的那个。
+    pub fn on_mode(&self) -> AudioMode {
+        if self.last == AudioMode::Off { AudioMode::Both } else { self.last }
+    }
+
     /// 发现手改：rev_mode 和 mode 不一致 → rev 变新；旧配置没有 rev_mode → 只补记，不变 rev。改了返回 true（要存盘）。
     pub fn claim_hand_edit(&mut self) -> bool {
         match self.rev_mode {
@@ -268,6 +303,7 @@ impl Default for Config {
             input: InputCfg::default(),
             clipboard: ClipCfg::default(),
             audio: AudioCfg::default(),
+            share: ShareCfg::default(),
             autostart: false,
             num: 0,
         }
@@ -399,7 +435,7 @@ pub fn take_update_cmd(now: u64) -> Option<String> {
     let s = std::fs::read_to_string(&p).ok()?;
     let _ = std::fs::remove_file(&p);
     let c: UpdateCmd = serde_json::from_str(&s).ok()?;
-    (now.abs_diff(c.t) <= RENAME_TTL_MS && (c.cmd == "check" || c.cmd == "update")).then_some(c.cmd)
+    (now.abs_diff(c.t) <= RENAME_TTL_MS && matches!(c.cmd.as_str(), "check" | "update" | "pause" | "resume")).then_some(c.cmd)
 }
 
 impl Config {

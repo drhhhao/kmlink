@@ -13,6 +13,7 @@ mod audio;
 mod audio_cap;
 mod audio_play;
 mod audio_probe;
+mod cable;
 mod clip;
 mod config;
 mod crypto;

@@ -381,7 +381,7 @@ impl Injector {
         self.set_driven(&g, true);
         if !ok {
             self.failed(&mut g);
-        } else if fresh && !carry {
+        } else if fresh && !carry && self.hub.cfg.read().map_or(true, |c| c.share.keyboard) {
             // 对方的鼠标跨过来了，键盘跟着到了这台：马上提示。从只收键盘转过来的键盘本来就在这台，不弹
             self.hub.to_desktop(crate::hub::ToDesktop::KbdNote(true));
         }

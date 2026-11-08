@@ -394,6 +394,9 @@ pub struct Kvm {
     // ── 键盘跟随 ──
     /// 本机开关（cfg.input.kbd_follow）：本机键盘跟随最后真正在用的鼠标
     follow: bool,
+    /// 鼠标、键盘开关（cfg.share，两台同步）：鼠标关 = 不跨屏；键盘关 = 键盘不打到对方（跨过去时按键留在本机）
+    mouse_on: bool,
+    kbd_on: bool,
     /// 对方支持键盘跟随（Hello.caps 带 CAP_KBD）
     peer_kbd: bool,
     /// 只转发键盘中
@@ -457,6 +460,8 @@ impl Kvm {
             desk_ok: true,
             desk_restore: None,
             follow: false,
+            mouse_on: true,
+            kbd_on: true,
             peer_kbd: false,
             kbd: None,
             kbd_in: false,
@@ -492,6 +497,13 @@ impl Kvm {
         self.speed = if s.is_finite() && s > 0.0 { s.min(20.0) } else { 1.0 };
         self.hotkey = cfg.input.hotkey_vk & 0xFF;
         self.follow = cfg.input.kbd_follow;
+        self.mouse_on = cfg.share.mouse;
+        self.kbd_on = cfg.share.keyboard;
+    }
+
+    /// 键盘跟随最后在用的鼠标：键盘开着，且开了跟随或者鼠标关着（鼠标过不去，键盘只能靠跟随过去）。
+    fn follow_on(&self) -> bool {
+        self.kbd_on && (self.follow || !self.mouse_on)
     }
 
     #[cfg(test)]
@@ -611,7 +623,7 @@ impl Kvm {
 
     /// 本机鼠标刚真的在用：条件满足就告诉对方（Active，限频）。只被管理员窗口/安全桌面挡住时记下，poll 里补发。
     fn maybe_active(&mut self, now: u32, out: &mut Vec<Action>) {
-        if self.kbd.is_some() || self.kbd_in || !self.peer_kbd || self.peer.is_none() || self.paused {
+        if self.kbd.is_some() || self.kbd_in || !self.kbd_on || !self.peer_kbd || self.peer.is_none() || self.paused {
             self.act_pend = None;
             return;
         }
@@ -650,7 +662,7 @@ impl Kvm {
         let expired =
             !(0..PEER_REQ_MS).contains(&since(now, t)) && !recent(self.kbd_cool, now, KBD_COOL_MS + PEER_REQ_MS / 2);
         if expired
-            || !self.follow
+            || !self.follow_on()
             || !self.peer_kbd
             || self.peer.is_none()
             || self.driven
@@ -791,6 +803,10 @@ impl Kvm {
                 return false;
             }
             self.armed = true;
+        }
+        if !self.mouse_on {
+            self.refuse_why = "鼠标共享已关";
+            return false;
         }
         if self.paused || self.driven {
             self.refuse_why = if self.paused { "已暂停共享" } else { "本机正被对方控制" };
@@ -938,7 +954,9 @@ impl Kvm {
                     Step::Return(p) => {
                         // 跨回本机：键盘跟着回来，马上提示
                         self.go_home(p, out);
-                        out.push(Action::KbdHere);
+                        if self.kbd_on {
+                            out.push(Action::KbdHere);
+                        }
                     }
                 }
             }
@@ -981,13 +999,18 @@ impl Kvm {
                     self.hotkey_held = true;
                     let exit = d.exit;
                     self.go_home(exit, out);
-                    out.push(Action::KbdHere);
+                    if self.kbd_on {
+                        out.push(Action::KbdHere);
+                    }
                 } else {
                     self.hotkey_held = false;
                 }
                 return Verdict::Swallow;
             }
-            return d.keys.send(&mut self.swallow_keys, epoch, &ev, out);
+            // 键盘关着：按键留在本机（这一轮早先转发出去、还按着的键，抬起照旧发过去）
+            if self.kbd_on || d.keys.remote_keys[vk] {
+                return d.keys.send(&mut self.swallow_keys, epoch, &ev, out);
+            }
         }
         if let Some(k) = self.kbd.as_mut() {
             let v = match k.keys.held(&ev, out) {
@@ -1016,7 +1039,7 @@ impl Kvm {
         }
 
         // 被控时本机有人按键：没开键盘跟随就请对方放手（开了：最后在用的鼠标就在本机屏幕上，键盘本来就该打在本机）
-        if self.driven && !ev.injected && !self.follow {
+        if self.driven && !ev.injected && !self.follow_on() && self.kbd_on {
             self.yield_now(ev.time, false, out);
         }
         if is_hotkey {
@@ -1024,8 +1047,8 @@ impl Kvm {
                 if !self.hotkey_held {
                     self.paused = !self.paused;
                     out.push(Action::Paused(self.paused));
-                    if self.paused && self.driven && self.follow {
-                        out.push(Action::Yield); // 开了跟随时被控端按键不发 Yield：暂停要请对方放手
+                    if self.paused && self.driven && (self.follow_on() || !self.kbd_on) {
+                        out.push(Action::Yield); // 开了跟随 / 键盘关着时被控端按键不发 Yield：暂停要请对方放手
                     }
                     if self.paused && self.kbd_in {
                         out.push(Action::YieldKbd); // 对方的键盘正打到本机：请它收回
@@ -1170,10 +1193,17 @@ impl Kvm {
                 }
             }
             ToInput::Config(cfg) => {
-                let was = self.follow;
+                let (was_follow, was_mouse, was_kbd) = (self.follow_on(), self.mouse_on, self.kbd_on);
                 self.apply_config(&cfg);
-                // 只在键盘跟随被关掉时收回（改排布、改名等重新加载不打断）
-                if was && !self.follow {
+                // 只在开关被关掉时收回（改排布、改名等重新加载不打断）
+                if was_mouse && !self.mouse_on {
+                    self.go_home_exit(out);
+                }
+                if was_kbd && !self.kbd_on && self.kbd_in && !self.kbd_yielded {
+                    self.kbd_yielded = true;
+                    out.push(Action::YieldKbd); // 对方的键盘正打到本机：请它收回（对方也会收到新开关）
+                }
+                if (was_follow && !self.follow_on()) || (was_kbd && !self.kbd_on) {
                     self.kbd_stop(true, out);
                     self.peer_req = None;
                 }
@@ -1194,7 +1224,7 @@ impl Kvm {
                 if self.drive.is_some() {
                     if epoch == 0 || epoch == self.epoch {
                         // 驱动中对方动了它自己的鼠标：光标回本机；开了跟随就让键盘留在对方（原样带上按键记录）
-                        let keep = self.follow && self.peer_kbd && !self.paused && self.desk_ok && !self.fg_blocked;
+                        let keep = self.follow_on() && self.peer_kbd && !self.paused && self.desk_ok && !self.fg_blocked;
                         let prev = self.epoch;
                         if let Some((_, keys)) = self.go_home_exit_with(keep, out) {
                             if keep {
@@ -3206,5 +3236,98 @@ mod tests {
         t.msg(ToInput::KbdIn(true));
         assert_eq!(t.msg(ToInput::PeerStale), vec![Action::YieldKbd]);
         assert_eq!(t.msg(ToInput::PeerStale), vec![]);
+    }
+
+    fn share_cfg(mouse: bool, keyboard: bool, follow: bool) -> Box<Config> {
+        let mut cfg = Config::default();
+        cfg.share.mouse = mouse;
+        cfg.share.keyboard = keyboard;
+        cfg.input.kbd_follow = follow;
+        Box::new(cfg)
+    }
+
+    #[test]
+    fn mouse_off_refuses_crossing_and_brings_cursor_home() {
+        let mut t = setup();
+        t.cross();
+        let e = t.k.epoch;
+        let out = t.msg(ToInput::Config(share_cfg(false, true, false)));
+        assert!(out.contains(&Action::Send(Msg::Leave { epoch: e })));
+        assert!(!t.k.driving());
+        t.t += 5000;
+        assert_eq!(t.mv(1000, 500).0, Verdict::Pass);
+        assert_eq!(t.mv(EDGE.x, EDGE.y), (Verdict::Pass, vec![]));
+        assert_eq!(t.k.refuse_why, "鼠标共享已关");
+        // 改排布等重新加载（鼠标一直开着）不打断驱动
+        t.msg(ToInput::Config(share_cfg(true, true, false)));
+        t.cross();
+        assert!(t.msg(ToInput::Config(share_cfg(true, true, false))).is_empty());
+        assert!(t.k.driving());
+    }
+
+    #[test]
+    fn keyboard_off_keys_stay_local_while_driving() {
+        let mut t = setup();
+        t.msg(ToInput::Config(share_cfg(true, false, false)));
+        t.cross();
+        let e = t.k.epoch;
+        // 按键留在本机，不转发
+        assert_eq!(t.key(0x41, true), (Verdict::Pass, vec![]));
+        assert_eq!(t.key(0x41, false), (Verdict::Pass, vec![]));
+        // 鼠标照常转发
+        assert!(matches!(t.rel(5, 0).1.as_slice(), [Action::Move { .. }]));
+        // 热键照样回到本机，但不弹“键盘”（键盘本来就在本机）
+        let (v, out) = t.key(0x91, true);
+        assert_eq!(v, Verdict::Swallow);
+        assert!(out.contains(&Action::Send(Msg::Leave { epoch: e })));
+        assert!(!out.contains(&Action::KbdHere));
+    }
+
+    #[test]
+    fn keyboard_turned_off_mid_drive_finishes_held_keys_remotely() {
+        let mut t = setup();
+        t.cross();
+        let e = t.k.epoch;
+        assert_eq!(t.key(0x41, true).1, vec![Action::Send(Msg::Key { epoch: e, scan: 0x10, ext: false, vk: 0x41, down: true })]);
+        t.msg(ToInput::Config(share_cfg(true, false, false)));
+        // 已经转发出去的键：抬起照旧发过去；新的键留在本机
+        assert_eq!(t.key(0x41, false).1, vec![Action::Send(Msg::Key { epoch: e, scan: 0x10, ext: false, vk: 0x41, down: false })]);
+        assert_eq!(t.key(0x42, true), (Verdict::Pass, vec![]));
+    }
+
+    #[test]
+    fn keyboard_off_driven_side_typing_does_not_yield() {
+        let mut t = setup();
+        t.msg(ToInput::Config(share_cfg(true, false, false)));
+        t.msg(ToInput::Driven(true));
+        // 对方的鼠标在本机，本机自己的键盘打字：不请对方放手
+        assert_eq!(t.key(0x41, true), (Verdict::Pass, vec![]));
+        // 键盘开着（不跟随）：照旧请对方放手
+        t.msg(ToInput::Config(share_cfg(true, true, false)));
+        assert_eq!(t.key(0x42, true), (Verdict::Pass, vec![Action::Yield]));
+    }
+
+    #[test]
+    fn keyboard_only_follows_peer_mouse_and_off_does_not() {
+        let mut t = setup();
+        // 鼠标关、键盘开、没勾跟随：键盘只能靠跟随过去
+        t.msg(ToInput::Config(share_cfg(false, true, false)));
+        t.msg(ToInput::PeerUp { name: "b".into(), desk: desk(), caps: crate::proto::CAP_KBD });
+        t.t += 5000;
+        let e = t.start_kbd();
+        // 键盘被关掉：收回
+        assert_eq!(t.msg(ToInput::Config(share_cfg(false, false, false))), kbd_leave(e));
+        t.t += 5000;
+        assert_eq!(t.msg(ToInput::PeerActive(0)), vec![]);
+        assert!(!t.k.kbd_out());
+        // 键盘关着时本机鼠标在用也不发 Active
+        assert!(!t.local_move(100).1.contains(&Action::Active(false)));
+    }
+
+    #[test]
+    fn keyboard_off_asks_peer_to_take_back_its_keyboard() {
+        let mut t = setup_follow();
+        t.msg(ToInput::KbdIn(true));
+        assert_eq!(t.msg(ToInput::Config(share_cfg(true, false, true))), vec![Action::YieldKbd]);
     }
 }
