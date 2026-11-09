@@ -329,7 +329,8 @@ impl Ctl {
                     }
                 }
             }
-            let mode = self.port.hub.cfg().audio.mode;
+            // 暂停共享（热键 / 托盘 / 设置窗口）：声音也停（两台的模式设置不动，继续后照旧）
+            let mode = if self.port.hub.status().paused { AudioMode::Off } else { self.port.hub.cfg().audio.mode };
             self.sync_mode();
             self.apply(mode);
         }

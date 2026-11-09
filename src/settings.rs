@@ -72,7 +72,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IsIconic, KillTimer, LoadCursorW, MSG, MoveWindow, PostQuitMessage, RegisterClassExW, SW_HIDE,
     SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetCursor, SetForegroundWindow, SetTimer, SetWindowPos,
     SetWindowTextW, ShowWindow, TranslateMessage, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CAPTURECHANGED,
-    WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_SYSKEYDOWN, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
     WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
 };
@@ -751,6 +751,8 @@ enum Hot {
     Volume,
     /// 连接页的暂停 / 继续
     Pause,
+    /// 通用页暂停热键的键帽（点了录新键）
+    Hotkey,
     PopCancel,
     PopOk,
     Pop,
@@ -956,6 +958,9 @@ struct App {
     paused: bool,
     /// 刚点了暂停 / 继续：主程序取走命令前先按点的显示（最多 3 秒）
     pause_click: Option<(bool, Instant)>,
+    /// 正在录暂停热键；按了不能用的键的时间（灰字变红一会儿）
+    hk_capture: bool,
+    hk_bad: Option<Instant>,
     /// 声音分段选中的段（0 = “1”）、滑块动画（起点位置，以段为单位）
     audio: usize,
     audio_from: f32,
@@ -1102,6 +1107,7 @@ impl App {
             self.page = p;
             self.page_t = Some(Instant::now());
             self.popover = false;
+            self.hk_capture = false;
         }
     }
 
@@ -1171,6 +1177,7 @@ impl App {
             || self.sw_t.iter().flatten().any(|t| ms_since(*t) < SWITCH_MS + 20.0)
             || self.audio_t.is_some_and(|t| ms_since(t) < SWITCH_MS + 20.0)
             || self.page_t.is_some_and(|t| ms_since(t) < DROP_MS + 20.0)
+            || self.hk_bad.is_some_and(|t| ms_since(t) < FLASH_MS + 20.0)
             || self.flash.is_some_and(|(_, t)| ms_since(t) < FLASH_MS + FADE_MS + 20.0)
             || self.copied.is_some_and(|(_, t)| ms_since(t) < FLASH_MS + 20.0)
             || matches!(self.upd_view(), UpdView::Checking | UpdView::Restarting)
@@ -1584,6 +1591,9 @@ fn hit(a: &App, sc: &Scene, x: f32, y: f32) -> Hot {
             if row_rect(TOP_CARD_Y, 0).contains(x, y) {
                 return Hot::Switch(Sw::Autostart);
             }
+            if hotkey_rect(a).contains(x, y) {
+                return Hot::Hotkey;
+            }
             if a.upd_button().is_some_and(|(r, ..)| r.contains(x, y)) {
                 return Hot::Upd;
             }
@@ -1994,11 +2004,26 @@ fn glass_icon(p: &mut Painter, th: &Theme, cx: f32, cy: f32, d: f32, ic: Icon, s
     icon(p, ic, cx, cy, size, 2.0, c);
 }
 
+/// 能当暂停热键的键：功能键和几个平时不打字的锁定键（热键会被全局吞掉，字母数字回车这些不行）。
+fn hotkey_ok(vk: u32) -> bool {
+    matches!(vk, 0x13 | 0x14 | 0x2D | 0x90 | 0x91 | 0x70..=0x87)
+}
+
+/// 通用页暂停热键的键帽（录键时宽度按“按下新键”）。
+fn hotkey_rect(a: &App) -> R {
+    let t = if a.hk_capture { "按下新键".to_string() } else { hotkey_name(a.cfg.input.hotkey_vk) };
+    let w = a.measure(&a.fonts.fbtn, &t) + 20.0;
+    let r1 = row_rect(TOP_CARD_Y, 1);
+    R::new(CTL_R - w, r1.cy() - 12.0, w, 24.0)
+}
+
 fn hotkey_name(vk: u32) -> String {
     match vk & 0xFF {
         0x91 => "Scroll Lock".into(),
         0x13 => "Pause".into(),
         0x14 => "Caps Lock".into(),
+        0x2D => "Insert".into(),
+        0x90 => "Num Lock".into(),
         v @ 0x70..=0x87 => format!("F{}", v - 0x6F),
         v => format!("键 0x{v:02X}"),
     }
@@ -2183,13 +2208,21 @@ fn render(p: &mut Painter, a: &App, sc: &Scene) {
             row_text(p, a, r0, "开机自启", "", th.fg, th.mutd);
             draw_switch(p, th, row_switch(r0), a.switch_t(Sw::Autostart));
             let r1 = row_rect(TOP_CARD_Y, 1);
-            row_text(p, a, r1, "暂停热键", "暂停全部共享", th.fg, th.mutd);
-            let t = hotkey_name(a.cfg.input.hotkey_vk);
-            let w = a.measure(&f.fbtn, &t) + 20.0;
-            let k = R::new(CTL_R - w, r1.cy() - 12.0, w, 24.0);
-            p.rrect(k.x, k.y, k.w, k.h, 7.0, th.fill);
-            p.ring(k.x, k.y, k.w, k.h, 7.0, -1.0, 0.0, th.hair);
-            text_c(p, k.cx(), k.cy(), &t, &f.fbtn, th.fg2);
+            // 点键帽进入“按下新键”：只认功能键，按了别的灰字变红
+            let bad = a.hk_bad.is_some_and(|t| ms_since(t) < FLASH_MS);
+            let (hint, hc) = if bad { ("只能用功能键", th.red) } else { ("暂停跨屏，再按恢复", th.mutd) };
+            row_text(p, a, r1, "暂停热键", hint, th.fg, hc);
+            let k = hotkey_rect(a);
+            if a.hk_capture {
+                p.ring(k.x, k.y, k.w, k.h, 7.0, 1.5, 4.0, th.greenring);
+                p.ring(k.x, k.y, k.w, k.h, 7.0, 0.0, 1.5, th.green);
+                p.rrect(k.x, k.y, k.w, k.h, 7.0, th.card);
+                text_c(p, k.cx(), k.cy(), "按下新键", &f.fbtn, th.mutd);
+            } else {
+                p.rrect(k.x, k.y, k.w, k.h, 7.0, if a.hover == Hot::Hotkey { th.fillh } else { th.fill });
+                p.ring(k.x, k.y, k.w, k.h, 7.0, -1.0, 0.0, th.hair);
+                text_c(p, k.cx(), k.cy(), &hotkey_name(a.cfg.input.hotkey_vk), &f.fbtn, th.fg2);
+            }
             card(p, th, R::new(CX, VER_CARD_Y, CW, 66.0));
             draw_footer(p, a);
         }
@@ -2970,6 +3003,8 @@ pub fn run() {
                 slide: None,
                 paused: false,
                 pause_click: None,
+                hk_capture: false,
+                hk_bad: None,
                 audio,
                 audio_from: audio as f32,
                 audio_t: None,
@@ -3009,7 +3044,8 @@ pub fn run() {
             if r == 0 || r == -1 {
                 break;
             }
-            if msg.message == WM_KEYDOWN && on_key(msg.hwnd, msg.wParam.0 as u16) {
+            // F10 等按键来的是 WM_SYSKEYDOWN（录暂停热键时也要收）
+            if (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN) && on_key(msg.hwnd, msg.wParam.0 as u16) {
                 continue;
             }
             let _ = TranslateMessage(&msg);
@@ -3031,7 +3067,11 @@ pub fn run() {
 fn debug_state() {
     let Ok(v) = std::env::var("KMLINK_UI") else { return };
     // 这些状态在鼠标页（舞台），换新密钥确认框在连接页
-    let page = if v == "popover" { Page::Conn } else { Page::Mouse };
+    let page = match v.as_str() {
+        "popover" => Page::Conn,
+        "hotkey" | "hotkey-bad" => Page::General,
+        _ => Page::Mouse,
+    };
     with_app(|a| {
         a.page = page;
         a.page_from = page.nav_top();
@@ -3047,6 +3087,14 @@ fn debug_state() {
             with_app(|a| {
                 a.hover = Hot::NamePeerOff;
                 a.frozen = true;
+            });
+        }
+        "hotkey" | "hotkey-bad" => {
+            with_app(|a| {
+                a.hk_capture = true;
+                if v == "hotkey-bad" {
+                    a.hk_bad = Some(Instant::now() + Duration::from_secs(60));
+                }
             });
         }
         "popover" => {
@@ -3078,6 +3126,24 @@ fn debug_state() {
 fn on_key(target: HWND, vk: u16) -> bool {
     let Some((main, edits, editing, popover)) = with_app(|a| (a.hwnd, a.edits, a.edit, a.popover)) else { return false };
     let slot = edits.iter().position(|h| *h == target);
+    // 录暂停热键：Esc 取消；能用的键就存（主程序约 1 秒内重新读配置后生效），别的键灰字变红
+    if slot.is_none() && target == main && with_app(|a| a.hk_capture) == Some(true) {
+        let vk = vk as u32;
+        if vk == VK_ESCAPE.0 as u32 {
+            with_app(|a| a.hk_capture = false);
+        } else if hotkey_ok(vk) {
+            with_app(|a| {
+                a.hk_capture = false;
+                a.hk_bad = None;
+            });
+            write_cfg(|c| c.input.hotkey_vk = vk);
+        } else if !matches!(vk, 0x10..=0x12 | 0x5B | 0x5C | 0xA0..=0xA5) {
+            // 单按修饰键不算按错
+            with_app(|a| a.hk_bad = Some(Instant::now()));
+        }
+        refresh();
+        return true;
+    }
     if slot.is_none() {
         if target == main {
             if vk == VK_ESCAPE.0 && popover {
@@ -3607,6 +3673,15 @@ fn on_click(hot: Hot) {
                 _ => {}
             }
         }
+        Hot::Hotkey => {
+            with_app(|a| {
+                a.hk_capture = !a.hk_capture;
+                a.hk_bad = None;
+            });
+            unsafe {
+                let _ = SetFocus(Some(main));
+            }
+        }
         Hot::Pause => {
             let v = with_app(|a| {
                 let v = !a.paused_now();
@@ -3678,6 +3753,10 @@ fn on_down(hwnd: HWND, x: f32, y: f32) {
     }) else {
         return;
     };
+    // 录暂停热键时点到别处：不录了
+    if hot != Hot::Hotkey && with_app(|a| std::mem::replace(&mut a.hk_capture, false)) == Some(true) {
+        refresh();
+    }
     // 点到别处：先提交正在编辑的
     if let Some(f) = editing {
         let same = matches!((f, hot), (Field::Ip, Hot::Ip) | (Field::Key, Hot::Key));
@@ -4022,7 +4101,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                         return IDC_SIZEALL;
                     }
                     match a.hover {
-                        Hot::NameLocal | Hot::NamePeer | Hot::Upd => IDC_HAND,
+                        Hot::NameLocal | Hot::NamePeer | Hot::Upd | Hot::Hotkey | Hot::Nav(_) | Hot::Pause => IDC_HAND,
                         Hot::Peer => IDC_SIZEALL,
                         Hot::Ip | Hot::Key => IDC_IBEAM,
                         _ => IDC_ARROW,
@@ -4191,6 +4270,9 @@ mod tests {
         assert_eq!(slider_frac(SLIDER_X - 50.0), 0.0);
         assert_eq!(slider_frac(SLIDER_X + SLIDER_W + 50.0), 1.0);
         assert_eq!(hotkey_name(0x91), "Scroll Lock");
+        assert_eq!(hotkey_name(0x77), "F8");
+        assert!(hotkey_ok(0x91) && hotkey_ok(0x13) && hotkey_ok(0x70) && hotkey_ok(0x87));
+        assert!(!hotkey_ok(0x41) && !hotkey_ok(0x0D) && !hotkey_ok(0x20) && !hotkey_ok(0x1B) && !hotkey_ok(0xA2));
     }
 
 

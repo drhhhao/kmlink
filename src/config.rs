@@ -51,7 +51,8 @@ pub struct LayoutCfg {
 pub struct InputCfg {
     /// 在对方屏幕上的移动速度倍数。
     pub speed: f64,
-    /// 强制回到本机 / 在本机时切换“锁定不跨屏”的热键（虚拟键码，默认 Scroll Lock = 0x91）。
+    /// 强制回到本机 / 在本机时切换“暂停共享”（跨屏、键盘、剪贴板、声音都停）的热键（虚拟键码，默认 Scroll Lock = 0x91；
+    /// 设置窗口里可换成功能键，见 settings::hotkey_ok）。
     pub hotkey_vk: u32,
     /// 键盘跟随鼠标：本机键盘打到最后真正在用的那只鼠标所在的那台。
     pub kbd_follow: bool,
