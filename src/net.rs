@@ -94,6 +94,14 @@ const GOHOME_AFTER: Duration = Duration::from_millis(2500);
 const PACE_BPS: f64 = 4.0 * 1024.0 * 1024.0;
 /// 最近这么久内有鼠标移动经过本机，就算“鼠标正在移动”。
 const MOUSE_ACTIVE_MS: u64 = 500;
+/// 最近一次有鼠标移动或按键经过本机（发出或收到）的时间（mono_ms，全进程一份）：文件传输据此给键鼠让路。
+static INPUT_AT: AtomicU64 = AtomicU64::new(0);
+
+/// 500ms 内有鼠标移动或按键经过本机（键鼠正在跨屏用）。
+pub fn input_active() -> bool {
+    let t = INPUT_AT.load(Ordering::Relaxed);
+    t != 0 && mono_ms().saturating_sub(t) < MOUSE_ACTIVE_MS
+}
 
 /// 进程内单调毫秒（从第一次调用起算，+1 保证不为 0）。
 fn mono_ms() -> u64 {
@@ -104,6 +112,8 @@ fn mono_ms() -> u64 {
 const MAX_PENDING_HANDSHAKES: usize = 8;
 /// 同一源 IP 同时进行中的入站握手上限。
 const MAX_PENDING_PER_IP: u8 = 2;
+/// 回环地址（经 USB 线进来的连接都是 127.0.0.1：主会话重连 + 文件连接）每 IP 的名额，且总数满了也放进来。
+const MAX_PENDING_LOOPBACK: u8 = 4;
 /// 同一 IP 的同类错误日志至多每分钟一次。
 const IP_LOG_EVERY: Duration = Duration::from_secs(60);
 /// 最后一个 Move 之后多久补发一次。
@@ -156,6 +166,7 @@ pub fn spawn(hub: Arc<Hub>, rx: Receiver<Out>, injector: Arc<Injector>, audio: A
         audio: Some(audio),
         cable: crate::cable::start(hub.clone()),
     };
+    crate::files::start(hub.clone(), opts.cable.clone());
     start(hub, rx, injector, opts);
 }
 
@@ -258,6 +269,10 @@ struct Session {
     /// 声音：audio-cap 线程加密发送 / net-udp 解密（各自只有一个线程用，锁不争用）。
     audio_tx: Mutex<AudioSealer>,
     audio_rx: Mutex<AudioOpener>,
+    /// 文件连接票据（两边相同，只在本会话有效）。
+    file_ticket: [u8; 32],
+    /// 本机是这条会话的客户端（拨号的一方）：文件连接也由客户端拨。
+    client: bool,
 }
 
 struct RxClock {
@@ -342,7 +357,7 @@ fn set_rcvbuf(s: &UdpSocket, bytes: i32) {
 /// 排在前面的至多 64 KiB（WiFi 上约 10ms）；局域网往返只有几毫秒，64 KiB 的窗口传图仍有十几 MB/s。
 const TCP_SNDBUF: i32 = 64 * 1024;
 
-fn set_sndbuf(s: &TcpStream, bytes: i32) {
+pub(crate) fn set_sndbuf(s: &TcpStream, bytes: i32) {
     use std::os::windows::io::AsRawSocket;
     use windows::Win32::Networking::WinSock::{SO_SNDBUF, SOCKET, SOL_SOCKET, setsockopt};
     let v = bytes.to_le_bytes();
@@ -429,6 +444,8 @@ struct Chans {
     urx: UdpOpener,
     atx: AudioSealer,
     arx: AudioOpener,
+    /// 文件连接票据（crypto::SessionKeys.file_ticket）。
+    ticket: [u8; 32],
 }
 
 /// 握手期的绝对截止时间：每次读写前把超时设为剩余时间（防止慢速连接一直占着握手名额）。
@@ -477,14 +494,20 @@ fn is_closed(e: &io::Error) -> bool {
     matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted)
 }
 
-/// 读对方的握手：MAGIC + nonce + 临时公钥。
-fn read_hs<S: Read>(s: &mut S) -> io::Result<([u8; 32], [u8; 32])> {
-    let mut m = [0u8; 4];
-    s.read_exact(&mut m)?;
+/// 读对方的握手：魔数 + nonce + 临时公钥。pre = listener 已经读走的魔数（据此分流主会话 / 文件连接）。
+fn read_hs<S: Read>(s: &mut S, want: &[u8; 4], pre: Option<[u8; 4]>) -> io::Result<([u8; 32], [u8; 32])> {
+    let m = match pre {
+        Some(m) => m,
+        None => {
+            let mut m = [0u8; 4];
+            s.read_exact(&mut m)?;
+            m
+        }
+    };
     if &m == MAGIC_V1 {
         return Err(err(ERR_OLD));
     }
-    if &m != MAGIC {
+    if &m != want {
         return Err(err("握手魔数不对"));
     }
     let mut b = [0u8; 64];
@@ -503,8 +526,8 @@ enum Role<'a> {
     Server(&'a dyn Fn(&[u8; 32]) -> bool),
 }
 
-/// 明文握手 + 派生密钥。client 先发。
-fn handshake<S: Read + Write>(s: &mut S, psk: &[u8; 32], role: Role) -> io::Result<Chans> {
+/// 明文握手：交换 nonce 和临时公钥，算出 DH 共享密钥。返回 (nonce_c, nonce_s, dh, 是客户端)。
+fn exchange<S: Read + Write>(s: &mut S, magic: &[u8; 4], role: Role, pre: Option<[u8; 4]>) -> io::Result<([u8; 32], [u8; 32], [u8; 32], bool)> {
     let eph = crypto::Ephemeral::new();
     let client = matches!(role, Role::Client(_));
     let mine = match role {
@@ -512,17 +535,17 @@ fn handshake<S: Read + Write>(s: &mut S, psk: &[u8; 32], role: Role) -> io::Resu
         Role::Server(_) => crypto::random32(),
     };
     let mut hello = [0u8; 68];
-    hello[..4].copy_from_slice(MAGIC);
+    hello[..4].copy_from_slice(magic);
     hello[4..36].copy_from_slice(&mine);
     hello[36..].copy_from_slice(&eph.pk);
     let (nc, ns, their_pk) = match role {
         Role::Client(_) => {
             s.write_all(&hello)?;
-            let (ns, pk) = read_hs(s)?;
+            let (ns, pk) = read_hs(s, magic, None)?;
             (mine, ns, pk)
         }
         Role::Server(seen) => {
-            let (nc, pk) = read_hs(s)?;
+            let (nc, pk) = read_hs(s, magic, pre)?;
             if seen(&nc) {
                 return Err(err(ERR_REFLECT));
             }
@@ -530,7 +553,18 @@ fn handshake<S: Read + Write>(s: &mut S, psk: &[u8; 32], role: Role) -> io::Resu
             (nc, mine, pk)
         }
     };
-    let mut dh = eph.agree(&their_pk).ok_or_else(|| err(ERR_PEER_KEY))?;
+    let dh = eph.agree(&their_pk).ok_or_else(|| err(ERR_PEER_KEY))?;
+    Ok((nc, ns, dh, client))
+}
+
+/// 明文握手 + 派生密钥。client 先发。
+#[cfg(test)]
+fn handshake<S: Read + Write>(s: &mut S, psk: &[u8; 32], role: Role) -> io::Result<Chans> {
+    handshake_pre(s, psk, role, None)
+}
+
+fn handshake_pre<S: Read + Write>(s: &mut S, psk: &[u8; 32], role: Role, pre: Option<[u8; 4]>) -> io::Result<Chans> {
+    let (nc, ns, mut dh, client) = exchange(s, MAGIC, role, pre)?;
     let k = crypto::derive(psk, &dh, &nc, &ns);
     crypto::wipe(&mut dh);
     Ok(if client {
@@ -542,6 +576,7 @@ fn handshake<S: Read + Write>(s: &mut S, psk: &[u8; 32], role: Role) -> io::Resu
             urx: UdpOpener::new(&k.udp_s2c),
             atx: AudioSealer::new(&k.audio_c2s),
             arx: AudioOpener::new(&k.audio_s2c),
+            ticket: k.file_ticket,
         }
     } else {
         Chans {
@@ -552,11 +587,23 @@ fn handshake<S: Read + Write>(s: &mut S, psk: &[u8; 32], role: Role) -> io::Resu
             urx: UdpOpener::new(&k.udp_c2s),
             atx: AudioSealer::new(&k.audio_s2c),
             arx: AudioOpener::new(&k.audio_c2s),
+            ticket: k.file_ticket,
         }
     })
 }
 
-fn write_frame<W: Write>(w: &mut W, sealer: &mut Sealer, plain: &[u8]) -> io::Result<()> {
+/// 文件连接（KMLF）的握手：同一把配对密钥、密钥域分开，2 秒期限。pre = listener 已读走的魔数。
+pub(crate) fn file_handshake(s: &mut TcpStream, psk: &[u8; 32], client: bool, pre: Option<[u8; 4]>) -> io::Result<(Sealer, Opener)> {
+    let mut dl = Deadline { s, until: Instant::now() + HANDSHAKE_TIMEOUT };
+    let no_reflect = |_: &[u8; 32]| false;
+    let role = if client { Role::Client(crypto::random32()) } else { Role::Server(&no_reflect) };
+    let (nc, ns, mut dh, client) = exchange(&mut dl, proto::FILE_MAGIC, role, pre)?;
+    let (c2s, s2c) = crypto::derive_file(psk, &dh, &nc, &ns);
+    crypto::wipe(&mut dh);
+    Ok(if client { (Sealer::new(&c2s), Opener::new(&s2c)) } else { (Sealer::new(&s2c), Opener::new(&c2s)) })
+}
+
+pub(crate) fn write_frame<W: Write>(w: &mut W, sealer: &mut Sealer, plain: &[u8]) -> io::Result<()> {
     if plain.len() > MAX_PLAIN {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "帧太大"));
     }
@@ -569,7 +616,7 @@ fn write_frame<W: Write>(w: &mut W, sealer: &mut Sealer, plain: &[u8]) -> io::Re
 }
 
 /// 读一帧（密文 ≤ max）并解密。解不开（篡改/重放/密钥不同/计数器用尽）返回 InvalidData + DECRYPT_FAIL。
-fn read_frame<R: Read>(r: &mut R, opener: &mut Opener, max: usize) -> io::Result<Vec<u8>> {
+pub(crate) fn read_frame<R: Read>(r: &mut R, opener: &mut Opener, max: usize) -> io::Result<Vec<u8>> {
     let mut lb = [0u8; 4];
     r.read_exact(&mut lb)?;
     let len = u32::from_le_bytes(lb) as usize;
@@ -692,7 +739,8 @@ struct Admission {
 impl Admission {
     fn admit(&mut self, ip: IpAddr, reserved: bool) -> bool {
         let n = self.per_ip.get(&ip).copied().unwrap_or(0);
-        if n >= MAX_PENDING_PER_IP || (self.total >= MAX_PENDING_HANDSHAKES && !reserved) {
+        let (max, reserved) = if ip.is_loopback() { (MAX_PENDING_LOOPBACK, true) } else { (MAX_PENDING_PER_IP, reserved) };
+        if n >= max || (self.total >= MAX_PENDING_HANDSHAKES && !reserved) {
             return false;
         }
         self.per_ip.insert(ip, n + 1);
@@ -1017,7 +1065,7 @@ impl Net {
     /// 握手、读对方 Hello（= 认证）、互发 Hello/Layout、登记为当前会话。
     /// 客户端先发 Hello；服务端验证了客户端的第一帧才发自己的（认证前不发可预测的内容）。
     /// dialed：主动连接时配置里的 peer 字符串（被动连接为 None）。
-    fn establish(&self, mut stream: TcpStream, dialed: Option<&str>) -> Option<(SessionHandle, TcpStream, Opener, Msg)> {
+    fn establish(&self, mut stream: TcpStream, dialed: Option<&str>, pre: Option<[u8; 4]>) -> Option<(SessionHandle, TcpStream, Opener, Msg)> {
         let client = dialed.is_some();
         let cfg = self.hub.cfg();
         let psk = self.psk(&cfg)?;
@@ -1036,14 +1084,14 @@ impl Net {
         } else {
             Role::Server(&seen)
         };
-        let ch = match handshake(&mut dl, &psk, role) {
+        let ch = match handshake_pre(&mut dl, &psk, role, pre) {
             Ok(c) => c,
             Err(e) => {
                 self.handshake_failed(&e, peer, dialed, &my_nc);
                 return None;
             }
         };
-        let Chans { nonce_c, mut tx, mut rx, utx, urx, atx, arx } = ch;
+        let Chans { nonce_c, mut tx, mut rx, utx, urx, atx, arx, ticket } = ch;
         if client {
             if let Err(e) = self.send_hello(&mut dl, &mut tx, &cfg) {
                 self.note_err(format!("向 {peer} 发送 Hello 失败：{e}"));
@@ -1113,6 +1161,8 @@ impl Net {
             udp_peer: Mutex::new(UdpPeer { addr: Some(SocketAddr::new(ip, *udp_port)), ..Default::default() }),
             audio_tx: Mutex::new(atx),
             audio_rx: Mutex::new(arx),
+            file_ticket: ticket,
+            client,
         });
         if let Err(why) = self.install(&sess) {
             self.log_ip(ip, "yield", format!("与 {ip} 的新连接被拒：{why}"), false);
@@ -1149,6 +1199,15 @@ impl Net {
             let replaced = cur.replace(new.clone()).is_some();
             self.hub.to_desktop(ToDesktop::ClipForget);
             self.injector.begin_session(new.id);
+            // 也在锁内：并发登记时文件连接用的会话（票据、谁拨）和 holder 一致（锁顺序 holder → files.link，同 end_session）
+            crate::files::session_up(crate::files::SessInfo {
+                sid: new.id,
+                client: new.client,
+                peer: new.peer,
+                cable: new.cable,
+                peer_id: new.peer_id,
+                ticket: new.file_ticket,
+            });
             if replaced {
                 crate::log!("新连接替换旧连接");
                 self.hub.to_input(ToInput::PeerDown);
@@ -1173,6 +1232,7 @@ impl Net {
         }
         self.injector.end_session(sess.id);
         self.hub.to_input(ToInput::PeerDown);
+        crate::files::session_down(sess.id);
         self.hub.set_status(|s| {
             s.connected = false;
             s.peer_addr.clear();
@@ -1292,7 +1352,10 @@ impl Net {
             Msg::Leave { epoch } => self.injector.leave(sess.id, epoch),
             Msg::Button { epoch, x, y, button, down } => self.injector.button(sess.id, epoch, x, y, button, down),
             Msg::Wheel { epoch, x, y, delta, horizontal } => self.injector.wheel(sess.id, epoch, x, y, delta, horizontal),
-            Msg::Key { epoch, scan, ext, vk, down } => self.injector.key(sess.id, epoch, scan, ext, vk, down),
+            Msg::Key { epoch, scan, ext, vk, down } => {
+                INPUT_AT.store(mono_ms(), Ordering::Relaxed);
+                self.injector.key(sess.id, epoch, scan, ext, vk, down)
+            }
             Msg::Move { epoch, seq, x, y } => {
                 self.mark_mouse();
                 #[cfg(test)]
@@ -1350,6 +1413,11 @@ impl Net {
                 }
             }
             Msg::Pong { .. } => {}
+            Msg::ClipFiles { mid, count, bytes, tops, dirs, top, digest } => {
+                let s = crate::files::Summary { mid, count, bytes, tops, dirs, top: proto::sanitize_name(top), digest };
+                self.hub.to_desktop(ToDesktop::ClipFiles(s));
+            }
+            Msg::FileDial => crate::files::dial_asked(sess.id),
         }
     }
 
@@ -1469,7 +1537,16 @@ impl Net {
             }
             let me = self.clone();
             let ok = spawn_named("net-conn", move || {
-                let est = me.establish(stream, None);
+                // 先读魔数分流：KMLF = 文件连接（不经过 install，不顶主会话），其余照主会话握手
+                let mut stream = stream;
+                let mut m = [0u8; 4];
+                let got = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).is_ok() && stream.read_exact(&mut m).is_ok();
+                if got && &m == proto::FILE_MAGIC {
+                    crate::files::accept(stream, m);
+                    lock(&me.admit).release(ip);
+                    return;
+                }
+                let est = if got { me.establish(stream, None, Some(m)) } else { None };
                 lock(&me.admit).release(ip);
                 if let Some((sess, s, opener, first)) = est {
                     me.run_reader(sess, s, opener, first);
@@ -1491,7 +1568,7 @@ impl Net {
     fn dial(self: &Arc<Self>, addr: SocketAddr, dialed: &str) -> bool {
         match TcpStream::connect_timeout(&addr, DIAL_TIMEOUT) {
             Ok(s) => {
-                let Some((sess, s, opener, first)) = self.establish(s, Some(dialed)) else { return false };
+                let Some((sess, s, opener, first)) = self.establish(s, Some(dialed), None) else { return false };
                 let me = self.clone();
                 let sess2 = sess.clone();
                 if !spawn_named("net-conn", move || me.run_reader(sess, s, opener, first)) {
@@ -1571,7 +1648,7 @@ impl Net {
             for addr in v4 {
                 match TcpStream::connect_timeout(&addr, DIAL_TIMEOUT) {
                     Ok(s) => {
-                        if let Some((sess, s, opener, first)) = self.establish(s, Some(&peer)) {
+                        if let Some((sess, s, opener, first)) = self.establish(s, Some(&peer), None) {
                             let me = self.clone();
                             let sess2 = sess.clone();
                             if !spawn_named("net-conn", move || me.run_reader(sess, s, opener, first)) {
@@ -1712,6 +1789,7 @@ impl Net {
 
     fn mark_mouse(&self) {
         self.mouse_at.store(mono_ms(), Ordering::Relaxed);
+        INPUT_AT.store(mono_ms(), Ordering::Relaxed);
     }
 
     fn mouse_active(&self) -> bool {
@@ -1795,6 +1873,10 @@ impl Net {
                 self.enqueue(Out::CancelClip);
             }
             Out::CancelClipSend => self.enqueue(Out::CancelClip),
+            Out::Msg(m @ Msg::Key { .. }) => {
+                INPUT_AT.store(mono_ms(), Ordering::Relaxed);
+                self.enqueue(Out::Msg(m));
+            }
             Out::ClipStream { format, raw_len, data } => {
                 // 压缩线程交来新分片 / 结束时叫醒 net-tcp。先拿一下队列锁再通知：net-tcp 查过“没活”到开始等待
                 // 之间一直持有这把锁，所以通知不会落在两者之间丢掉
@@ -2805,7 +2887,7 @@ mod tests {
 
     #[test]
     fn clip_limits() {
-        let mut c = ClipCfg { enabled: true, images: false, max_text_kb: 1, max_image_mb: 1, notify: true };
+        let mut c = ClipCfg { enabled: true, images: false, max_text_kb: 1, max_image_mb: 1, notify: true, files: true };
         assert_eq!(clip_limit(&c, 13), Some(2050));
         assert_eq!(clip_limit(&c, 8), None);
         c.images = true;

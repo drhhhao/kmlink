@@ -29,6 +29,8 @@ pub enum Content {
     Concealed,
     /// 超过上限：不同步（文字超限时也不再退而读图片）。size = 字节数（文字为估算的下限）。
     TooBig { image: bool, size: usize },
+    /// 复制的文件（CF_HDROP 第一层的路径）。
+    Files(Vec<std::path::PathBuf>),
     /// 没有可同步的内容（没有文字/图片、图片同步关闭、图片格式不对）。
     Other,
 }
@@ -216,10 +218,16 @@ fn concealed() -> bool {
 /// 读取剪贴板：有文字就只看文字（空则看图片；超过 max_text 字节直接跳过，不再退而读图片——
 /// Excel 等会为此临时渲染巨幅位图，卡住消息循环甚至弹窗）；没有文字且 want_image 时读图片。
 /// 打不开剪贴板返回 Err(Busy)。
-pub fn read(hwnd: HWND, max_text: usize, want_image: bool, max_image: usize) -> Result<Content, Busy> {
+pub fn read(hwnd: HWND, max_text: usize, want_image: bool, max_image: usize, want_files: bool) -> Result<Content, Busy> {
     let _g = open(hwnd).ok_or(Busy)?;
     if concealed() {
         return Ok(Content::Concealed);
+    }
+    // 文件优先于文字（资源管理器复制文件时有的程序还附带文字）
+    if want_files && available(CF_HDROP) {
+        if let Some(p) = read_hdrop() {
+            return Ok(Content::Files(p));
+        }
     }
     if available(CF_UNICODETEXT) {
         match read_text(max_text) {
@@ -439,6 +447,55 @@ pub fn write_text(hwnd: HWND, text: &str) -> Result<u32, WriteError> {
     })
     .ok_or(WriteError::Failed)?;
     write_global(hwnd, CF_UNICODETEXT, &mut g)
+}
+
+pub const CF_HDROP: u32 = 15;
+
+/// CF_HDROP 里的路径（剪贴板须已打开）。读不到 / 一个都没有：None。
+fn read_hdrop() -> Option<Vec<std::path::PathBuf>> {
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+    let h = unsafe { GetClipboardData(CF_HDROP) }.ok()?;
+    let hd = HDROP(h.0);
+    let n = unsafe { DragQueryFileW(hd, u32::MAX, None) };
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n.min(super::files::MAX_ITEMS as u32 + 1) {
+        let len = unsafe { DragQueryFileW(hd, i, None) } as usize;
+        let mut buf = vec![0u16; len + 1];
+        let got = unsafe { DragQueryFileW(hd, i, Some(&mut buf)) } as usize;
+        if got > 0 {
+            out.push(std::path::PathBuf::from(String::from_utf16_lossy(&buf[..got])));
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// “Preferred DropEffect” 格式（0 = 注册失败）。
+pub fn drop_effect_format() -> u32 {
+    static F: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *F.get_or_init(|| unsafe { RegisterClipboardFormatW(windows::core::w!("Preferred DropEffect")) })
+}
+
+/// 立即写入真文件路径（DROPFILES 字节）+ Preferred DropEffect = 复制 + CanUploadToCloudClipboard = 0。
+/// kmlink 退出前把剪贴板上的虚拟文件换成已预取到本机的真文件时用（立即数据，进程退出后照样能粘贴）。
+pub fn write_hdrop(hwnd: HWND, dropfiles: &[u8]) -> Result<u32, WriteError> {
+    let mut main = Global::filled(dropfiles.len(), |b| b.copy_from_slice(dropfiles)).ok_or(WriteError::Failed)?;
+    let effect = drop_effect_format();
+    let mut eff = Global::filled(4, |b| b.copy_from_slice(&1u32.to_le_bytes()));
+    let cloud = cloud_format();
+    let mut mark = if cloud != 0 { Global::filled(4, |b| b.copy_from_slice(&0u32.to_le_bytes())) } else { None };
+    let g = open(hwnd).ok_or(WriteError::Busy)?;
+    unsafe { EmptyClipboard() }.map_err(|_| WriteError::Failed)?;
+    if !main.give(CF_HDROP) {
+        return Err(WriteError::Failed);
+    }
+    if let (Some(e), true) = (eff.as_mut(), effect != 0) {
+        e.give(effect);
+    }
+    if let Some(m) = mark.as_mut() {
+        m.give(cloud);
+    }
+    drop(g);
+    Ok(seq())
 }
 
 /// 写入对方发来的整块内容（不再拷贝）：图片应已校验过 DIB，文字须是末尾带 0 的 UTF-16 LE。

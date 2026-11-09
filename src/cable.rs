@@ -11,6 +11,10 @@
 //!   对方 boot id 变了（重启了）同样全关。收到自己的 boot id = 线两头插在同一台电脑上，不算连上。
 //! 串口读出错（拔线）：关串口、全关连接，每 2 秒重找一次。
 //! 发送：一个写线程，先发 HELLO/OPEN/CLOSE/DGRAM（高优先），再发 DATA；DATA 队列至多 128 KiB，满了 TCP 那头就等着（背压）。
+//!   文件连接（本机另开的“大块”桥端口进来的，OPEN 帧带 1 字节 1）的 DATA 进第三个队列（至多 256 KiB）：
+//!   只有前两个队列都空时才发，一次至多 16 KiB —— 按键、鼠标永远插在文件数据前面。
+//! 接收：cable-rx 只把 DATA 放进这条连接自己的收队列（大块 4 MiB，其他 1 MiB）就返回，由每条连接一个写线程
+//!   （cable-lw）写本地 TCP；队列满了 / 写不进去只关这一条 —— 绝不因为一条连接卡住 cable-rx（HELLO、鼠标包都在它上面）。
 //! 设备：按 USB 的 VID/PID 在注册表 Enum\USB 下找它的 PortName；环境变量 KMLINK_CABLE=off 关掉，=COMx 指定串口。
 
 use crate::hub::Hub;
@@ -31,6 +35,8 @@ const T_OPEN: u8 = 2;
 const T_DATA: u8 = 3;
 const T_CLOSE: u8 = 4;
 const T_DGRAM: u8 = 5;
+/// 收方丢弃了对不上的数据（多半是收不过来）：请发方把文件数据放慢。老版本不认识，忽略。
+const T_SLOW: u8 = 6;
 const FLAG_SENDER_OPENED: u8 = 0x80;
 const LINK_VER: u8 = 1;
 const HELLO_EVERY: Duration = Duration::from_millis(250);
@@ -42,6 +48,24 @@ const PUMP_CHUNK: usize = 4096;
 const WRITE_BATCH: usize = 8 * 1024;
 /// 排队等着上线的 DATA 至多这么多字节。
 const LOW_MAX: usize = 128 * 1024;
+/// 文件连接的 DATA 至多排这么多字节。
+const BULK_MAX: usize = 256 * 1024;
+/// 写线程一次至多取这么多文件数据（30 MB/s 下按键最多多等约 0.55 ms）。
+const BULK_BATCH: usize = 16 * 1024;
+/// 文件数据的发送速率（字节 / 秒），自适应：线不管流控，收的那台跟不上时（实测笔记本边收边写盘、约 20～30 MB/s）
+/// 线里会混进几 KB 乱数据，整条文件连接只能断开重连。收方一发现乱数据就发 T_SLOW，发方降到 70%；
+/// 3 秒没再出错就每秒加 1 MB/s，至多 BULK_RATE_MAX。
+const BULK_RATE_START: f64 = 16.0 * 1e6;
+const BULK_RATE_MAX: f64 = 30.0 * 1e6;
+const BULK_RATE_MIN: f64 = 2.0 * 1e6;
+const BULK_QUIET: Duration = Duration::from_secs(3);
+/// 令牌桶至多攒这么久的额度。
+const BULK_SLACK: Duration = Duration::from_millis(2);
+/// 每条连接收方向（线 → 本地 TCP）至多排这么多，满了就关这一条。线上没有逐连接的流控，
+/// 这里要容得下本地读方短暂卡住时线全速送来的量（30 MB/s × 约 1 秒）；卡太久由本地写 2 秒超时兜底。
+/// 文件连接另受 B 端额度（≤ 8 MiB 在途）约束。
+const RX_MAX: usize = 32 * 1024 * 1024;
+const RX_MAX_BULK: usize = 16 * 1024 * 1024;
 /// 高优先队列（主要是鼠标位置 / 声音）至多这么多帧，多了丢新的（对方不在时不会积压）。
 const HIGH_MAX: usize = 512;
 /// 线 → 本地连接：写不进去这么久就关掉这条连接。
@@ -402,6 +426,41 @@ struct TxQ {
     high: VecDeque<Vec<u8>>,
     low: VecDeque<Vec<u8>>,
     low_bytes: usize,
+    /// 文件连接的 DATA：前两个队列都空时才发。
+    bulk: VecDeque<Vec<u8>>,
+    bulk_bytes: usize,
+}
+
+/// 线 → 本地 TCP 的收队列。
+#[derive(Default)]
+struct RxQ {
+    q: VecDeque<Vec<u8>>,
+    bytes: usize,
+    closed: bool,
+}
+
+/// 一条经线的连接。
+struct Conn {
+    /// 文件连接（DATA 走大块队列）。
+    bulk: bool,
+    /// 本地这头的 TCP（对方开的连接要等写线程连上本机端口后才有）。
+    stream: OnceLock<Arc<TcpStream>>,
+    rx: Mutex<RxQ>,
+    rx_cv: Condvar,
+}
+
+impl Conn {
+    fn new(bulk: bool) -> Arc<Conn> {
+        Arc::new(Conn { bulk, stream: OnceLock::new(), rx: Mutex::new(RxQ::default()), rx_cv: Condvar::new() })
+    }
+
+    fn shut(&self) {
+        lock(&self.rx).closed = true;
+        self.rx_cv.notify_all();
+        if let Some(s) = self.stream.get() {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+    }
 }
 
 type Sink = Box<dyn Fn(&[u8]) + Send + Sync>;
@@ -412,15 +471,54 @@ pub struct Cable {
     boot: u64,
     link: Mutex<Link>,
     port: Mutex<Option<Arc<port::Port>>>,
-    conns: Mutex<HashMap<Key, Arc<TcpStream>>>,
+    conns: Mutex<HashMap<Key, Arc<Conn>>>,
     /// 桥连到本机 kmlink 的连接，在 kmlink 那边看到的对端地址（= 这些连接的本地地址）。
     inbound: Mutex<HashSet<SocketAddr>>,
     listen: OnceLock<SocketAddr>,
+    /// 文件连接用的桥端口（从这里进来的连接走大块队列）。
+    listen_bulk: OnceLock<SocketAddr>,
     next_id: AtomicU32,
     tx: Mutex<TxQ>,
     tx_cv: Condvar,
     sink: OnceLock<Sink>,
     notify: OnceLock<Notify>,
+    pace: Mutex<Pace>,
+}
+
+/// 文件数据的发送速率（见 BULK_RATE_*）。
+struct Pace {
+    rate: f64,
+    /// KMLINK_BULK_PACE=<MB/s> 定死（测试用；0 = 不限）。
+    fixed: bool,
+    slowed: Option<Instant>,
+    raised: Instant,
+}
+
+impl Pace {
+    fn new() -> Pace {
+        let fixed = std::env::var("KMLINK_BULK_PACE").ok().and_then(|v| v.parse::<f64>().ok());
+        Pace { rate: fixed.map_or(BULK_RATE_START, |mb| mb * 1e6), fixed: fixed.is_some(), slowed: None, raised: Instant::now() }
+    }
+
+    /// 现在的速率（顺带：安静够久就往上加）。
+    fn now(&mut self) -> f64 {
+        if !self.fixed && self.rate < BULK_RATE_MAX && self.slowed.is_none_or(|t| t.elapsed() > BULK_QUIET) && self.raised.elapsed() >= Duration::from_secs(1) {
+            self.rate = (self.rate + 1e6).min(BULK_RATE_MAX);
+            self.raised = Instant::now();
+        }
+        self.rate
+    }
+
+    /// 对方说收不过来。返回降到的速率（同一阵乱数据只降一次：300ms 内的重复请求不算）。
+    fn slow(&mut self) -> Option<f64> {
+        if self.fixed || self.slowed.is_some_and(|t| t.elapsed() < Duration::from_millis(300)) {
+            return None;
+        }
+        self.rate = (self.rate * 0.7).max(BULK_RATE_MIN);
+        self.slowed = Some(Instant::now());
+        self.raised = Instant::now();
+        Some(self.rate)
+    }
 }
 
 /// 启动（KMLINK_CABLE=off 时不启动）。
@@ -439,23 +537,28 @@ pub fn start(hub: Arc<Hub>) -> Option<Arc<Cable>> {
         conns: Mutex::new(HashMap::new()),
         inbound: Mutex::new(HashSet::new()),
         listen: OnceLock::new(),
+        listen_bulk: OnceLock::new(),
         next_id: AtomicU32::new(1),
         tx: Mutex::new(TxQ::default()),
         tx_cv: Condvar::new(),
         sink: OnceLock::new(),
         notify: OnceLock::new(),
+        pace: Mutex::new(Pace::new()),
     });
-    match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
-        Ok(l) => {
-            if let Ok(a) = l.local_addr() {
-                let _ = c.listen.set(a);
+    for bulk in [false, true] {
+        match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+            Ok(l) => {
+                if let Ok(a) = l.local_addr() {
+                    let _ = if bulk { c.listen_bulk.set(a) } else { c.listen.set(a) };
+                }
+                let me = c.clone();
+                spawn("cable-bridge", move || me.run_bridge(l, bulk));
             }
-            let me = c.clone();
-            spawn("cable-bridge", move || me.run_bridge(l));
-        }
-        Err(e) => {
-            crate::log!("USB 线：本地桥端口打开失败：{e}，不用线");
-            return None;
+            Err(e) if !bulk => {
+                crate::log!("USB 线：本地桥端口打开失败：{e}，不用线");
+                return None;
+            }
+            Err(e) => crate::log!("USB 线：文件用的桥端口打开失败：{e}（文件改走局域网）"),
         }
     }
     let me = c.clone();
@@ -495,9 +598,14 @@ impl Cable {
         if self.ready() { self.listen.get().copied() } else { None }
     }
 
-    /// 这条会话（net 看到的对端地址）是经线的吗。
+    /// 线通着时，文件连接连这个地址（走大块队列，不和按键抢线）。
+    pub fn dial_bulk_addr(&self) -> Option<SocketAddr> {
+        if self.ready() { self.listen_bulk.get().copied() } else { None }
+    }
+
+    /// 这条连接（net 看到的对端地址）是经线的吗。
     pub fn owns(&self, peer: SocketAddr) -> bool {
-        self.listen.get() == Some(&peer) || lock(&self.inbound).contains(&peer)
+        self.listen.get() == Some(&peer) || self.listen_bulk.get() == Some(&peer) || lock(&self.inbound).contains(&peer)
     }
 
     /// 经线发一个 UDP 包；线不通返回 false。
@@ -525,20 +633,26 @@ impl Cable {
         true
     }
 
-    /// DATA 进低优先队列；满了就等（背压）。串口换了代 / 连接已关：false。
-    fn push_low(&self, ep: u64, key: Key, f: Vec<u8>) -> bool {
+    /// DATA 进低优先（文件连接：大块）队列；满了就等（背压）。串口换了代 / 连接已关：false。
+    fn push_data(&self, ep: u64, key: Key, bulk: bool, f: Vec<u8>) -> bool {
         let mut q = lock(&self.tx);
         loop {
             if q.ep != ep || !lock(&self.conns).contains_key(&key) {
                 return false;
             }
-            if q.low_bytes < LOW_MAX {
+            let full = if bulk { q.bulk_bytes >= BULK_MAX } else { q.low_bytes >= LOW_MAX };
+            if !full {
                 break;
             }
             q = self.tx_cv.wait_timeout(q, Duration::from_millis(200)).unwrap_or_else(|e| e.into_inner()).0;
         }
-        q.low_bytes += f.len();
-        q.low.push_back(f);
+        if bulk {
+            q.bulk_bytes += f.len();
+            q.bulk.push_back(f);
+        } else {
+            q.low_bytes += f.len();
+            q.low.push_back(f);
+        }
         drop(q);
         self.tx_cv.notify_all();
         true
@@ -550,25 +664,27 @@ impl Cable {
 
     /// 关掉经线的全部连接（会话随之断开，net 改走网络重连）。
     fn close_all(&self) {
-        let all: Vec<_> = lock(&self.conns).drain().map(|(_, s)| s).collect();
+        let all: Vec<_> = lock(&self.conns).drain().map(|(_, c)| c).collect();
         lock(&self.inbound).clear();
-        for s in all {
-            let _ = s.shutdown(Shutdown::Both);
+        for c in all {
+            c.shut();
         }
         let mut q = lock(&self.tx);
         q.low.clear();
         q.low_bytes = 0;
+        q.bulk.clear();
+        q.bulk_bytes = 0;
         q.high.retain(|f| f.get(2).is_some_and(|t| t & 0x7F == T_HELLO));
         drop(q);
         self.tx_cv.notify_all();
     }
 
     fn close_conn(&self, key: Key, tell_peer: bool) {
-        let Some(s) = lock(&self.conns).remove(&key) else { return };
-        if let Ok(a) = s.local_addr() {
+        let Some(c) = lock(&self.conns).remove(&key) else { return };
+        if let Some(a) = c.stream.get().and_then(|s| s.local_addr().ok()) {
             lock(&self.inbound).remove(&a);
         }
-        let _ = s.shutdown(Shutdown::Both);
+        c.shut();
         if tell_peer {
             self.push_high(encode(Self::frame_type(T_CLOSE, key), key.id, &[]));
         }
@@ -681,6 +797,9 @@ impl Cable {
         crate::sys::boost_thread(true);
         let mut buf = vec![0u8; 64 * 1024];
         let mut parser = Parser::default();
+        // 丢弃的字节（CRC 不对 / 半截帧）：至多每秒记一次（排查线上丢数据）
+        let (mut junk_logged, mut junk_at) = (0u64, Instant::now());
+        let mut slow_sent: Option<Instant> = None;
         let why = loop {
             if self.epoch() != ep {
                 return;
@@ -692,14 +811,26 @@ impl Cable {
             if n == 0 {
                 continue;
             }
+            let junk0 = parser.junk;
             parser.push(&buf[..n]);
             while let Some(f) = parser.next() {
                 self.on_frame(f, ep);
+            }
+            if parser.junk > junk0 && slow_sent.is_none_or(|t: Instant| t.elapsed() > Duration::from_millis(200)) {
+                // 多半是本机收不过来：请对方放慢文件数据
+                self.push_high(encode(T_SLOW, 0, &[]));
+                slow_sent = Some(Instant::now());
+            }
+            if parser.junk > junk_logged && junk_at.elapsed() >= Duration::from_secs(1) {
+                crate::log!("USB 线：丢弃了 {} 字节对不上的数据（累计 {}）", parser.junk - junk_logged, parser.junk);
+                junk_logged = parser.junk;
+                junk_at = Instant::now();
             }
         };
         self.port_lost(ep, &why);
     }
 
+    /// 在 cable-rx 上：绝不阻塞（不写本地 TCP、不 connect）。
     fn on_frame(self: &Arc<Self>, f: RxFrame, ep: u64) {
         let kind = f.t & 0x7F;
         // 发送方开的连接 = 本机看来是对方开的
@@ -745,27 +876,34 @@ impl Cable {
                     self.push_high(encode(Self::frame_type(T_CLOSE, key), key.id, &[]));
                     return;
                 }
-                let port = self.hub.cfg().port;
-                let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-                match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
-                    Ok(s) => {
-                        if let Ok(a) = s.local_addr() {
-                            lock(&self.inbound).insert(a);
-                        }
-                        self.adopt(key, s, ep);
-                    }
-                    Err(e) => {
-                        crate::log!("USB 线：连本机端口 {port} 失败：{e}");
-                        self.push_high(encode(Self::frame_type(T_CLOSE, key), key.id, &[]));
-                    }
+                // 先登记（之后的 DATA 有地方排），由这条连接的写线程去连本机端口
+                let c = Conn::new(f.payload.first() == Some(&1));
+                lock(&self.conns).insert(key, c.clone());
+                let me = self.clone();
+                if !spawn("cable-lw", move || me.run_local_writer(key, c, ep, true)) {
+                    self.close_conn(key, true);
                 }
             }
             T_DATA => {
-                let s = lock(&self.conns).get(&key).cloned();
-                match s {
-                    Some(s) => {
-                        if (&*s).write_all(&f.payload).is_err() {
+                let c = lock(&self.conns).get(&key).cloned();
+                match c {
+                    Some(c) => {
+                        let max = if c.bulk { RX_MAX_BULK } else { RX_MAX };
+                        let over = {
+                            let mut q = lock(&c.rx);
+                            if q.bytes + f.payload.len() > max {
+                                true
+                            } else {
+                                q.bytes += f.payload.len();
+                                q.q.push_back(f.payload);
+                                false
+                            }
+                        };
+                        if over {
+                            crate::log!("USB 线：一条连接的本地这头收不过来，关掉它");
                             self.close_conn(key, true);
+                        } else {
+                            c.rx_cv.notify_all();
                         }
                     }
                     None => {
@@ -779,39 +917,88 @@ impl Cable {
                     sink(&f.payload);
                 }
             }
+            T_SLOW => {
+                if let Some(r) = lock(&self.pace).slow() {
+                    crate::log!("USB 线：对方收不过来，文件数据降到 {:.0} MB/s", r / 1e6);
+                }
+            }
             _ => {}
         }
     }
 
-    /// 登记一条经线的连接，起线程把它的数据泵到线上。
-    fn adopt(self: &Arc<Self>, key: Key, s: TcpStream, ep: u64) {
-        let _ = s.set_nodelay(true);
-        let _ = s.set_write_timeout(Some(LOCAL_WRITE_TIMEOUT));
-        let s = Arc::new(s);
-        lock(&self.conns).insert(key, s.clone());
-        let me = self.clone();
-        if !spawn("cable-pump", move || me.pump(key, s, ep)) {
-            self.close_conn(key, true);
+    /// 每条连接一个：（对方开的先连本机端口，）再把收队列里的数据写进本地 TCP。写不进去只关这一条。
+    fn run_local_writer(self: Arc<Self>, key: Key, c: Arc<Conn>, ep: u64, connect: bool) {
+        if connect {
+            let port = self.hub.cfg().port;
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
+                Ok(s) => {
+                    if let Ok(a) = s.local_addr() {
+                        lock(&self.inbound).insert(a);
+                    }
+                    let _ = s.set_nodelay(true);
+                    let _ = s.set_write_timeout(Some(LOCAL_WRITE_TIMEOUT));
+                    let s = Arc::new(s);
+                    let _ = c.stream.set(s.clone());
+                    // 连上之前就被关了（对方 CLOSE / 线断了）
+                    if !lock(&self.conns).contains_key(&key) {
+                        let _ = s.shutdown(Shutdown::Both);
+                        lock(&self.inbound).remove(&s.local_addr().unwrap_or(addr));
+                        return;
+                    }
+                    let me = self.clone();
+                    let bulk = c.bulk;
+                    if !spawn("cable-pump", move || me.pump(key, s, ep, bulk)) {
+                        self.close_conn(key, true);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    crate::log!("USB 线：连本机端口 {port} 失败：{e}");
+                    self.close_conn(key, true);
+                    return;
+                }
+            }
+        }
+        let Some(s) = c.stream.get().cloned() else { return };
+        loop {
+            let data = {
+                let mut q = lock(&c.rx);
+                loop {
+                    if q.closed {
+                        return;
+                    }
+                    if let Some(d) = q.q.pop_front() {
+                        q.bytes -= d.len();
+                        break d;
+                    }
+                    q = c.rx_cv.wait_timeout(q, Duration::from_millis(500)).unwrap_or_else(|e| e.into_inner()).0;
+                }
+            };
+            if (&*s).write_all(&data).is_err() {
+                self.close_conn(key, true);
+                return;
+            }
         }
     }
 
     /// 本地连接 → 线。
-    fn pump(self: Arc<Self>, key: Key, s: Arc<TcpStream>, ep: u64) {
+    fn pump(self: Arc<Self>, key: Key, s: Arc<TcpStream>, ep: u64, bulk: bool) {
         let mut buf = vec![0u8; PUMP_CHUNK];
         loop {
             let n = match (&*s).read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            if !self.push_low(ep, key, encode(Self::frame_type(T_DATA, key), key.id, &buf[..n])) {
+            if !self.push_data(ep, key, bulk, encode(Self::frame_type(T_DATA, key), key.id, &buf[..n])) {
                 break;
             }
         }
         self.close_conn(key, true);
     }
 
-    /// 本机 net 的 dialer 连进来 = 要经线连对方。
-    fn run_bridge(self: Arc<Self>, l: TcpListener) {
+    /// 本机连进桥端口 = 要经线连对方（bulk = 文件连接用的那个端口）。
+    fn run_bridge(self: Arc<Self>, l: TcpListener, bulk: bool) {
         for c in l.incoming() {
             let Ok(s) = c else {
                 std::thread::sleep(Duration::from_millis(100));
@@ -827,10 +1014,17 @@ impl Cable {
             let _ = s.set_nodelay(true);
             let _ = s.set_write_timeout(Some(LOCAL_WRITE_TIMEOUT));
             let s = Arc::new(s);
-            lock(&self.conns).insert(key, s.clone());
-            self.push_high(encode(Self::frame_type(T_OPEN, key), key.id, &[]));
+            let conn = Conn::new(bulk);
+            let _ = conn.stream.set(s.clone());
+            lock(&self.conns).insert(key, conn.clone());
+            self.push_high(encode(Self::frame_type(T_OPEN, key), key.id, if bulk { &[1] } else { &[] }));
             let me = self.clone();
-            if !spawn("cable-pump", move || me.pump(key, s, ep)) {
+            if !spawn("cable-lw", move || me.run_local_writer(key, conn, ep, false)) {
+                self.close_conn(key, true);
+                continue;
+            }
+            let me = self.clone();
+            if !spawn("cable-pump", move || me.pump(key, s, ep, bulk)) {
                 self.close_conn(key, true);
             }
         }
@@ -838,9 +1032,12 @@ impl Cable {
 
     fn run_writer(self: Arc<Self>, p: Arc<port::Port>, ep: u64) {
         crate::sys::boost_thread(true);
-        let mut out = Vec::with_capacity(WRITE_BATCH + MAX_PAYLOAD + 64);
+        let mut out = Vec::with_capacity(WRITE_BATCH + BULK_BATCH + MAX_PAYLOAD + 64);
+        // 文件数据的令牌桶：下一批最早什么时候能发
+        let mut pace_at = Instant::now();
         loop {
             out.clear();
+            let mut bulk_sent = false;
             {
                 let mut q = lock(&self.tx);
                 loop {
@@ -849,6 +1046,15 @@ impl Cable {
                     }
                     if !q.high.is_empty() || !q.low.is_empty() {
                         break;
+                    }
+                    if !q.bulk.is_empty() {
+                        let now = Instant::now();
+                        if now >= pace_at {
+                            break;
+                        }
+                        // 只有文件数据在等：等到令牌够（期间来了按键 / 鼠标照样马上发）
+                        q = self.tx_cv.wait_timeout(q, pace_at - now).unwrap_or_else(|e| e.into_inner()).0;
+                        continue;
                     }
                     q = self.tx_cv.wait_timeout(q, Duration::from_millis(500)).unwrap_or_else(|e| e.into_inner()).0;
                 }
@@ -860,8 +1066,24 @@ impl Cable {
                     q.low_bytes -= f.len();
                     out.extend_from_slice(&f);
                 }
+                // 文件数据：只有按键、鼠标、主会话都没在排队时才发，一次至多 BULK_BATCH
+                if out.is_empty() && Instant::now() >= pace_at {
+                    while out.len() < BULK_BATCH {
+                        let Some(f) = q.bulk.pop_front() else { break };
+                        q.bulk_bytes -= f.len();
+                        out.extend_from_slice(&f);
+                    }
+                    bulk_sent = !out.is_empty();
+                }
             }
             self.tx_cv.notify_all();
+            let rate = if bulk_sent { lock(&self.pace).now() } else { 0.0 };
+            if bulk_sent && rate > 0.0 {
+                // 闲了一阵后至多攒 BULK_SLACK 的额度（不一下子猛发一大串）
+                let now = Instant::now();
+                let floor = now.checked_sub(BULK_SLACK).unwrap_or(now);
+                pace_at = pace_at.max(floor) + Duration::from_secs_f64(out.len() as f64 / rate);
+            }
             let mut done = 0;
             while done < out.len() {
                 match p.write(&out[done..]) {
@@ -948,6 +1170,28 @@ mod tests {
         let got = all(&mut p);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].t, T_HELLO);
+    }
+
+    #[test]
+    fn pace_slows_once_per_burst_and_recovers() {
+        let mut p = Pace { rate: 20e6, fixed: false, slowed: None, raised: Instant::now() };
+        assert_eq!(p.slow(), Some(14e6));
+        // 同一阵乱数据的重复请求不再降
+        assert_eq!(p.slow(), None);
+        assert_eq!(p.now(), 14e6);
+        // 很久没出错：每秒加 1 MB/s
+        p.slowed = Some(Instant::now() - Duration::from_secs(10));
+        p.raised = Instant::now() - Duration::from_secs(2);
+        assert_eq!(p.now(), 15e6);
+        assert_eq!(p.now(), 15e6);
+        // 不低于下限
+        p.rate = BULK_RATE_MIN;
+        p.slowed = None;
+        assert_eq!(p.slow(), Some(BULK_RATE_MIN));
+        // 定死的不变
+        let mut f = Pace { rate: 5e6, fixed: true, slowed: None, raised: Instant::now() - Duration::from_secs(9) };
+        assert_eq!(f.slow(), None);
+        assert_eq!(f.now(), 5e6);
     }
 
     #[test]

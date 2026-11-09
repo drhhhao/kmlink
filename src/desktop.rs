@@ -125,6 +125,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 代次 g 还是本机剪贴板的最新内容吗（clip-ole 线程放虚拟文件前核对，免得旧文件盖掉刚写的新内容）。
+pub(crate) fn clip_current(g: u64) -> bool {
+    sync(|s| s.current(g))
+}
+
 fn sync<R>(f: impl FnOnce(&mut ClipSync) -> R) -> R {
     f(&mut lock(&SYNC))
 }
@@ -204,7 +209,7 @@ fn is_big_text(s: &str) -> bool {
 }
 
 fn is_clip(m: &ToDesktop) -> bool {
-    matches!(m, ToDesktop::ClipText(_) | ToDesktop::ClipData(_))
+    matches!(m, ToDesktop::ClipText(_) | ToDesktop::ClipData(_) | ToDesktop::ClipFiles(_))
 }
 
 /// 一轮 drain：剪贴板消息（ClipText / ClipData）只留最新一条，旧的当场丢弃（释放内存）；其余按原顺序。
@@ -529,6 +534,8 @@ enum Incoming {
     Text(String),
     /// 图片 / 大段文字：已在 GlobalAlloc 的内存里，直接交给剪贴板。
     Data(clip::Blob),
+    /// 对方复制的文件（已拉到并校验过的清单）：写成剪贴板上的虚拟文件。
+    Files(Arc<crate::files::fetch::Remote>),
 }
 
 impl Incoming {
@@ -539,6 +546,7 @@ impl Incoming {
                 format!("文字 {} 字节", b.text_len)
             }
             Incoming::Data(b) => format!("图片 {} 字节", b.mem.len()),
+            Incoming::Files(r) => format!("文件 {} 项、{} 字节", r.man.items.len(), r.man.bytes),
         }
     }
 }
@@ -557,6 +565,7 @@ fn incoming_note(what: &mut Incoming, who: String) -> Note {
             (Kind::Text, island::preview(&head.unwrap_or_default()))
         }
         Incoming::Data(b) => (Kind::Image, island::size_text(b.mem.len())),
+        Incoming::Files(r) => (Kind::Files, r.summary.what()),
     };
     Note { who, kind, detail, ok: true }
 }
@@ -898,6 +907,24 @@ impl State {
                 crate::panel::refresh(self.panel_view());
             }
             ToDesktop::UpdTipSeen(v) => self.upd_tip_seen = Some(v),
+            ToDesktop::ClipFiles(s) => self.incoming_files(s),
+            ToDesktop::FilesScanned { g, r } => self.files_scanned(g, r),
+            ToDesktop::FilesReady { g, ver, r } => self.files_ready(g, ver, r),
+            ToDesktop::FilesWritten(w) => self.files_written(w),
+            ToDesktop::FilesSeq(seq) => {
+                LAST_WRITE.with(|w| w.set(Some(seq)));
+                self.last_seq = Some(seq);
+            }
+            ToDesktop::FilesNote(r, n) => {
+                use crate::files::fetch::Note;
+                // 进度只在灵动岛上（资源管理器不弹复制框），所以「提示」关了也照样显示
+                match n {
+                    Note::Progress { read, total } => island::files_progress(read, total, &r.summary.what(), r.man.files() as u32),
+                    Note::Done(k) => island::files_done(k),
+                    Note::Failed => island::files_failed(),
+                    Note::Cancelled => island::files_cancelled(),
+                }
+            }
             ToDesktop::Quit => return false,
         }
         true
@@ -930,6 +957,10 @@ impl State {
 
     /// 对方发来的剪贴板内容：校验后写入（剪贴板被占则稍后重试）。
     fn incoming(&mut self, m: ToDesktop) {
+        if let ToDesktop::ClipFiles(s) = m {
+            self.incoming_files(s);
+            return;
+        }
         let what = accept_incoming(m, &self.hub.cfg().clipboard, self.hub.status().paused);
         // 有了更新的对方内容：之前没写进去的那条作废
         self.drop_pending();
@@ -946,12 +977,22 @@ impl State {
 
     /// 写入对方内容；剪贴板被占则留着，定时器重试。
     fn try_write(&mut self, mut p: PendingWrite) {
+        if let Incoming::Files(r) = &p.what {
+            // 虚拟文件在 clip-ole 线程上写（异步），结果经 ToDesktop::FilesWritten 回来
+            let g = sync(|s| s.generation);
+            if !crate::files::ole::set(r.clone(), g, p.ver, p.tries) {
+                sync(|s| s.forget());
+                self.hub.send(Msg::ClipForget);
+            }
+            return;
+        }
         // 提示要在写入前取（写入成功后那块内存就归系统了）
         let note = incoming_note(&mut p.what, self.hub.status().peer_name);
         let r = match &mut p.what {
             Incoming::Text(t) => clip::write_text(self.hwnd, t),
             // 成功则这块内存归系统；失败时还在 b.mem 里（Busy 留着重试，放弃时随 p 释放）
             Incoming::Data(b) => clip::write_owned(self.hwnd, b.format, &mut b.mem),
+            Incoming::Files(_) => return,
         };
         match r {
             Ok(seq) => {
@@ -963,6 +1004,7 @@ impl State {
                 let h = match &p.what {
                     Incoming::Text(t) => hash_text(t),
                     Incoming::Data(b) => b.hash,
+                    Incoming::Files(r) => r.summary.digest,
                 };
                 sync(|s| s.written(p.ver, h));
                 if matches!(p.what, Incoming::Data(_)) {
@@ -1005,6 +1047,114 @@ impl State {
         // 告诉对方两边已不一致（只在“已同步 → 不一致”时发一次），免得对方之后复制同样内容时被当成回声不发
         if was_synced && self.hub.status().connected {
             self.hub.send(Msg::ClipForget);
+        }
+    }
+
+    // ---------- 复制粘贴文件 ----------
+
+    /// 本机复制的文件展开完了：登记清单、发摘要、弹“本机 已复制 …”。展开失败（太多、名字不支持）：不同步。
+    fn files_scanned(&mut self, g: u64, r: Result<crate::files::scan::Scanned, &'static str>) {
+        if !sync(|s| s.current(g)) {
+            return; // 展开期间又复制了别的
+        }
+        let s = match r {
+            Ok(s) => s,
+            Err(why) => {
+                log!("本机复制的文件不同步：{why}");
+                self.local_other();
+                self.note_unsynced(Kind::Files, why.into());
+                return;
+            }
+        };
+        let Some(f) = crate::files::get() else { return };
+        let digest = s.man.digest();
+        // 两边已一致（又复制了同一批文件 / 刚粘出来的又被复制）：不发；本机登记过的那份清单重新算“当前”
+        if !sync(|x| x.offer(g, digest)) {
+            f.serve.revive(digest);
+            return;
+        }
+        let (n, kb) = (s.man.items.len(), s.man.bytes / 1024);
+        let sum = f.serve.register(s.man, s.paths, f.peer_id());
+        log!("本机复制了文件：{n} 项，{kb} KB");
+        self.hub.to_net(Out::CancelClip);
+        self.hub.send(sum.to_msg());
+        self.note(&Note { who: self.hub.cfg().name, kind: Kind::Files, detail: sum.what(), ok: true });
+    }
+
+    /// 对方复制了文件（摘要）：开着同步就去拉完整清单。
+    fn incoming_files(&mut self, s: crate::files::Summary) {
+        let c = self.hub.cfg().clipboard;
+        self.drop_pending();
+        if !c.enabled || !c.files || self.hub.status().paused {
+            log!("对方复制的文件没接收（暂停或关闭了同步）");
+            sync(|x| x.forget());
+            self.hub.send(Msg::ClipForget);
+            return;
+        }
+        crate::files::prefetch::cancel();
+        let (g, ver) = sync(|x| {
+            let ver = x.incoming();
+            (x.generation, ver)
+        });
+        crate::files::list_async(s, g, ver);
+    }
+
+    /// 对方的完整清单到了：写成剪贴板上的虚拟文件。
+    fn files_ready(&mut self, g: u64, ver: u64, r: Result<Arc<crate::files::fetch::Remote>, &'static str>) {
+        if !sync(|x| x.current(g)) {
+            return; // 期间本机复制了别的 / 对方又复制了别的
+        }
+        match r {
+            Ok(remote) => {
+                if !crate::files::ole::usable() {
+                    log!("kmlink 以管理员身份运行且 COM 安全没设成：资源管理器调不进来，不放虚拟文件");
+                    sync(|x| x.forget());
+                    self.hub.send(Msg::ClipForget);
+                    self.note(&Note { who: self.hub.status().peer_name, kind: Kind::Files, detail: "管理员模式".into(), ok: false });
+                    return;
+                }
+                self.try_write(PendingWrite { what: Incoming::Files(remote), ver, tries: 0 });
+            }
+            Err(_) => {
+                sync(|x| x.forget());
+                self.hub.send(Msg::ClipForget);
+            }
+        }
+    }
+
+    /// 虚拟文件写进剪贴板的结果。
+    fn files_written(&mut self, w: crate::files::ole::Written) {
+        if !sync(|s| s.current(w.g)) {
+            // 期间有了更新的内容（本机复制了别的 / 又复制了同样的文字 / 对方又发来别的）：这次的结果不算数。
+            // 两边是否一致已说不准：都撤销“已同步”（最多多发一次），免得之后同样的内容被当回声不发
+            if w.r.is_ok() {
+                log!("对方的文件写入剪贴板时已有更新的内容");
+            }
+            sync(|s| s.forget());
+            self.hub.send(Msg::ClipForget);
+            return;
+        }
+        match w.r {
+            Ok(seq) => {
+                LAST_WRITE.with(|x| x.set(Some(seq)));
+                self.last_seq = Some(seq);
+                self.hub.to_net(Out::CancelClipSend);
+                sync(|s| s.written(w.ver, w.remote.summary.digest));
+                log!("已写入对方的文件（{} 项，{} KB）", w.remote.man.items.len(), w.remote.man.bytes / 1024);
+                self.note(&Note { who: self.hub.status().peer_name, kind: Kind::Files, detail: w.remote.summary.what(), ok: true });
+                crate::files::prefetch::begin(w.remote);
+            }
+            Err(clip::WriteError::Busy) if w.tries < WRITE_RETRIES => {
+                self.pending = Some(PendingWrite { what: Incoming::Files(w.remote), ver: w.ver, tries: w.tries + 1 });
+                unsafe {
+                    SetTimer(Some(self.hwnd), TIMER_WRITE, WRITE_RETRY_MS, None);
+                }
+            }
+            Err(e) => {
+                log!("写入对方的文件失败（{e:?}），放弃");
+                sync(|s| s.forget());
+                self.hub.send(Msg::ClipForget);
+            }
         }
     }
 
@@ -1240,18 +1390,25 @@ impl State {
         if LAST_WRITE.with(|w| w.get()) == Some(seq) || self.last_seq == Some(seq) {
             return;
         }
+        // 剪贴板是我们自己放的虚拟文件（clip-ole 线程）：不读（读延迟渲染的格式会回到自己身上）
+        if crate::files::ole::owns_clipboard() {
+            self.last_seq = Some(seq);
+            return;
+        }
         let c = self.hub.cfg();
         let st = self.hub.status();
         if !c.clipboard.enabled || !st.connected || st.paused {
             // 不同步，但要记下本机有了别的内容
             self.retry = None;
             self.last_seq = Some(seq);
+            crate::files::local_changed();
             self.local_other();
             return;
         }
         let max_text = c.clipboard.max_text_kb as usize * 1024;
         let max_image = c.clipboard.max_image_mb as usize * 1024 * 1024;
-        let content = match clip::read(self.hwnd, max_text, c.clipboard.images, max_image) {
+        let want_files = c.clipboard.files && st.peer_caps & crate::proto::CAP_FILES != 0;
+        let content = match clip::read(self.hwnd, max_text, c.clipboard.images, max_image, want_files) {
             Ok(x) => x,
             Err(clip::Busy) => {
                 // 打不开：不记 last_seq，稍后重试
@@ -1274,7 +1431,14 @@ impl State {
         };
         self.retry = None;
         self.last_seq = Some(seq);
+        // 本机剪贴板有了新内容：之前发出的文件清单变旧、对方文件的预取作废
+        crate::files::local_changed();
         match content {
+            clip::Content::Files(paths) => {
+                let generation = sync(|s| s.local());
+                self.drop_pending();
+                crate::files::scan_async(generation, paths);
+            }
             clip::Content::Text(text) if !is_big_text(&text) => {
                 let h = hash_text(&text);
                 // 两边已一致（回声）：不发；待写的对方内容也照常写
@@ -1901,7 +2065,7 @@ mod tests {
 
     #[test]
     fn incoming_rules() {
-        let mut c = config::ClipCfg { enabled: true, images: true, max_text_kb: 1, max_image_mb: 1, notify: true };
+        let mut c = config::ClipCfg { enabled: true, images: true, max_text_kb: 1, max_image_mb: 1, notify: true, files: true };
         let ok = |m: ToDesktop, c: &config::ClipCfg, paused: bool| accept_incoming(m, c, paused).is_some();
         assert!(ok(ToDesktop::ClipText("a".into()), &c, false));
         assert!(!ok(ToDesktop::ClipText(String::new()), &c, false));

@@ -25,9 +25,31 @@ pub struct SessionKeys {
     pub udp_s2c: [u8; 32],
     pub audio_c2s: [u8; 32],
     pub audio_s2c: [u8; 32],
+    /// 文件连接的会话票据：两边相同、只在本会话有效（文件连接握手后第一帧带上，证明是同一会话的对方）。
+    pub file_ticket: [u8; 32],
 }
 
 pub fn derive(psk: &[u8; 32], dh: &[u8; 32], nonce_c: &[u8; 32], nonce_s: &[u8; 32]) -> SessionKeys {
+    let k = expander(psk, dh, nonce_c, nonce_s);
+    SessionKeys {
+        c2s: k(b"kmlink c2s"),
+        s2c: k(b"kmlink s2c"),
+        udp_c2s: k(b"kmlink udp c2s"),
+        udp_s2c: k(b"kmlink udp s2c"),
+        audio_c2s: k(b"kmlink audio c2s"),
+        audio_s2c: k(b"kmlink audio s2c"),
+        file_ticket: k(b"kmlink file ticket"),
+    }
+}
+
+/// 文件连接（KMLF）两个方向的密钥：info 和主连接不同（密钥域分开）——中间人把 KMLF 改成 KML2，
+/// 两边派生出的密钥对不上，第一帧就解不开。
+pub fn derive_file(psk: &[u8; 32], dh: &[u8; 32], nonce_c: &[u8; 32], nonce_s: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let k = expander(psk, dh, nonce_c, nonce_s);
+    (k(b"kmlink file c2s"), k(b"kmlink file s2c"))
+}
+
+fn expander(psk: &[u8; 32], dh: &[u8; 32], nonce_c: &[u8; 32], nonce_s: &[u8; 32]) -> impl Fn(&[u8]) -> [u8; 32] {
     let mut salt = [0u8; 64];
     salt[..32].copy_from_slice(nonce_c);
     salt[32..].copy_from_slice(nonce_s);
@@ -36,19 +58,11 @@ pub fn derive(psk: &[u8; 32], dh: &[u8; 32], nonce_c: &[u8; 32], nonce_s: &[u8; 
     ikm[32..].copy_from_slice(dh);
     let hk = Hkdf::<Sha256>::new(Some(&salt), &ikm);
     wipe(&mut ikm);
-    let k = |info: &[u8]| {
+    move |info: &[u8]| {
         let mut out = [0u8; 32];
         // 32 字节远小于 HKDF-SHA256 上限（255*32），不会失败
         hk.expand(info, &mut out).expect("hkdf expand 32");
         out
-    };
-    SessionKeys {
-        c2s: k(b"kmlink c2s"),
-        s2c: k(b"kmlink s2c"),
-        udp_c2s: k(b"kmlink udp c2s"),
-        udp_s2c: k(b"kmlink udp s2c"),
-        audio_c2s: k(b"kmlink audio c2s"),
-        audio_s2c: k(b"kmlink audio s2c"),
     }
 }
 

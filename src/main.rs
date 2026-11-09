@@ -20,6 +20,7 @@ mod crypto;
 mod cursor;
 mod desktop;
 mod elev;
+mod files;
 mod geom;
 mod hub;
 mod inject;
@@ -100,6 +101,8 @@ fn daemon(with_console: bool) {
     }
     sys::dpi_aware();
     log::init("kmlink");
+    // 最先设 COM 安全（之后任何线程一用 COM 就设不了了）：管理员身份运行时资源管理器才能粘贴对方的文件
+    files::ole::init();
     ui::load_fonts();
 
     // 刚被旧版本更新换上来：先等旧进程退出（它还占着单实例互斥量）
@@ -137,6 +140,8 @@ fn daemon(with_console: bool) {
     update::spawn(hub.clone(), updated_from);
     input::run(hub.clone(), rx.input); // 阻塞到“退出”
 
+    // 剪贴板上的虚拟文件换成真文件或清空（退出后没人能提供内容）
+    files::shutdown(std::time::Duration::from_secs(1));
     injector.release_all();
     audio.shutdown();
 

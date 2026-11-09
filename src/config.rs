@@ -85,6 +85,8 @@ pub struct ClipCfg {
     pub max_image_mb: u32,
     /// 复制后在屏幕底部弹提示（两台同时弹）。
     pub notify: bool,
+    /// 复制的文件也同步（粘贴时才传）。
+    pub files: bool,
 }
 
 /// 声音模式（本机视角）。两台同步：对方的“本机听”= 本机的“对方听”。
@@ -386,7 +388,7 @@ impl Default for InputCfg {
 
 impl Default for ClipCfg {
     fn default() -> Self {
-        Self { enabled: true, images: true, max_text_kb: 1024, max_image_mb: 32, notify: true }
+        Self { enabled: true, images: true, max_text_kb: 1024, max_image_mb: 32, notify: true, files: true }
     }
 }
 

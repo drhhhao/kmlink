@@ -30,12 +30,16 @@ pub const CAP_AUDIO: u32 = 2;
 pub const CAP_UPDATE: u32 = 4;
 /// Hello.caps：鼠标、键盘各自开关、两台同步（Share 消息）。
 pub const CAP_SHARE: u32 = 8;
+/// Hello.caps：复制粘贴文件（ClipFiles / FileDial 消息，KMLF 文件连接）。
+pub const CAP_FILES: u32 = 16;
 /// 本机支持的能力。
-pub const CAPS: u32 = CAP_KBD | CAP_AUDIO | CAP_UPDATE | CAP_SHARE;
+pub const CAPS: u32 = CAP_KBD | CAP_AUDIO | CAP_UPDATE | CAP_SHARE | CAP_FILES;
 /// TCP 握手魔数（KML2：握手带 X25519 临时公钥）。
 pub const MAGIC: &[u8; 4] = b"KML2";
 /// 旧版魔数：收到它说明对方版本太旧。
 pub const MAGIC_V1: &[u8; 4] = b"KML1";
+/// 文件连接的握手魔数（同一把密钥、密钥域分开；不顶主会话）。
+pub const FILE_MAGIC: &[u8; 4] = b"KMLF";
 /// 我们自己注入的输入事件带这个 dwExtraInfo，钩子据此忽略。
 pub const INJECT_MARK: usize = 0x4B4D_4C4E;
 
@@ -163,6 +167,12 @@ pub enum Msg {
     UpdTip {
         version: String,
     },
+    /// 本机复制了文件：只发摘要（≤ 4 KiB），完整清单在文件连接上按需拉。只发给 caps 带 CAP_FILES 的对方。
+    /// mid = 清单 id（32 位 hex）；count = 总项数（含文件夹）；bytes = 总字节；tops = 第一层项数；
+    /// dirs = 第一层里文件夹的个数；top = 第一层只有一项时它的名字（提示里显示）；digest = 回声摘要。
+    ClipFiles { mid: String, count: u32, bytes: u64, tops: u32, dirs: u32, top: String, digest: u64 },
+    /// 请对方拨文件连接（本机是主会话的服务端，要用文件连接时发）。
+    FileDial,
 }
 
 /// UDP 明文。

@@ -89,6 +89,18 @@ pub enum ToDesktop {
     Update,
     /// 对方已经为这个版本弹过“新版”提示。
     UpdTipSeen(String),
+    /// 对方复制了文件（摘要）。
+    ClipFiles(crate::files::Summary),
+    /// 本机复制的文件展开完了（g = 当时的剪贴板代次）。
+    FilesScanned { g: u64, r: Result<crate::files::scan::Scanned, &'static str> },
+    /// 对方的完整清单拉到了（g / ver = 收到摘要时的代次和 ClipSync.ver）。
+    FilesReady { g: u64, ver: u64, r: Result<std::sync::Arc<crate::files::fetch::Remote>, &'static str> },
+    /// 虚拟文件写进剪贴板的结果。
+    FilesWritten(crate::files::ole::Written),
+    /// 剪贴板换成了带真文件路径的对象（预取完）：新的序号。
+    FilesSeq(u32),
+    /// 粘贴进度 / 结果（谁的清单、什么）。
+    FilesNote(std::sync::Arc<crate::files::fetch::Remote>, crate::files::fetch::Note),
     Quit,
 }
 

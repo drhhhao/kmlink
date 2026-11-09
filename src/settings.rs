@@ -30,7 +30,7 @@
 //! 4. 声音页：设备条（正在放的那台编号实心 + 屏幕中间喇叭；点屏幕 = 选在哪放），卡片：在哪放（1 / 2 / 两台，
 //!    1、2 = 标着这个编号的那台放，存成本机视角的 audio.mode here/there/both，改了写新 rev 由主程序同步给对方；
 //!    声音关着时点了只记进 audio.last），音量滑杆（audio.volume，0～100%，步长 5%）。
-//! 5. 剪贴板页：复制提示开关（clipboard.notify）。
+//! 5. 剪贴板页：文件开关（clipboard.files，复制的文件也同步）、复制提示开关（clipboard.notify）。
 //! 6. 通用页：开机自启（直接改注册表）、暂停热键（只显示）；版本 + 更新卡片：左“kmlink 0.1.2”（对方不支持一键更新时带
 //!    “· 对方 0.1.0”），有新版时绿色小标签；右边一个动作：检查更新 / 正在检查… / 已是最新 / 更新两台（对方不支持：
 //!    “对方需手动更新”+ 更新本机）/ 正在更新 45% + 进度条 / 正在重启… / 已更新到 x / 更新失败 · 原因 + 重试。
@@ -579,10 +579,11 @@ enum Sw {
     Clip,
     Follow,
     Notify,
+    Files,
     Autostart,
 }
 
-const SW_N: usize = 7;
+const SW_N: usize = 8;
 
 /// 侧栏玻璃板
 const SIDEBAR: R = R::new(10.0, 10.0, 200.0, 520.0);
@@ -1132,6 +1133,7 @@ impl App {
             c.clipboard.enabled,
             c.input.kbd_follow,
             c.clipboard.notify,
+            c.clipboard.files,
             autostart,
         ]
     }
@@ -1584,6 +1586,9 @@ fn hit(a: &App, sc: &Scene, x: f32, y: f32) -> Hot {
         }
         Page::Clip => {
             if row_rect(TOP_CARD_Y, 0).contains(x, y) {
+                return Hot::Switch(Sw::Files);
+            }
+            if row_rect(TOP_CARD_Y, 1).contains(x, y) {
                 return Hot::Switch(Sw::Notify);
             }
         }
@@ -2194,11 +2199,16 @@ fn render(p: &mut Painter, a: &App, sc: &Scene) {
             p.alpha = 1.0;
         }
         Page::Clip => {
-            card(p, th, R::new(CX, TOP_CARD_Y, CW, 66.0));
-            let row = row_rect(TOP_CARD_Y, 0);
-            row_text(p, a, row, "复制提示", "复制后弹提示", tc(th.fg), tc(th.mutd));
+            card(p, th, R::new(CX, TOP_CARD_Y, CW, 116.0));
+            row_lines(p, th, TOP_CARD_Y, 2);
+            // 先管同步什么，再管提不提示
+            let r0 = row_rect(TOP_CARD_Y, 0);
+            row_text(p, a, r0, "文件", "复制的文件也同步", tc(th.fg), tc(th.mutd));
+            let r1 = row_rect(TOP_CARD_Y, 1);
+            row_text(p, a, r1, "复制提示", "复制后弹提示", tc(th.fg), tc(th.mutd));
             p.alpha = if on { 1.0 } else { 0.45 };
-            draw_switch(p, th, row_switch(row), a.switch_t(Sw::Notify));
+            draw_switch(p, th, row_switch(r0), a.switch_t(Sw::Files));
+            draw_switch(p, th, row_switch(r1), a.switch_t(Sw::Notify));
             p.alpha = 1.0;
         }
         Page::General => {
@@ -3454,7 +3464,7 @@ fn poll() {
             if let Some(c) = new_cfg {
                 let sw = App::sw_from(&c, c.autostart);
                 a.set_audio(audio_seg_index(&c));
-                for (i, s) in [Sw::Mouse, Sw::Kbd, Sw::Audio, Sw::Clip, Sw::Follow, Sw::Notify, Sw::Autostart].into_iter().enumerate() {
+                for (i, s) in [Sw::Mouse, Sw::Kbd, Sw::Audio, Sw::Clip, Sw::Follow, Sw::Notify, Sw::Files, Sw::Autostart].into_iter().enumerate() {
                     a.set_sw(s, sw[i]);
                 }
                 // 正在拖的滑杆不被重新读入盖掉
@@ -3638,6 +3648,9 @@ fn on_click(hot: Hot) {
                     }
                     Sw::Notify => {
                         write_cfg(|c| c.clipboard.notify = v);
+                    }
+                    Sw::Files => {
+                        write_cfg(|c| c.clipboard.files = v);
                     }
                     Sw::Autostart => {
                         // 开机自启：直接改注册表（主程序没在跑也要生效），开关和配置都按实际结果来

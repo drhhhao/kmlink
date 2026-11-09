@@ -31,6 +31,7 @@ use crate::ui::{Font, text_cov, text_px};
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BitBlt, CreateCompatibleDC,
     CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, GetMonitorInfoW, HBITMAP, HDC, HGDIOBJ,
@@ -41,7 +42,7 @@ use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::Shell::{QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetCursorPos, HWND_TOPMOST, IDC_HAND, KillTimer, LWA_ALPHA, LoadCursorW, MA_NOACTIVATE,
+    CreateWindowExW, DefWindowProcW, GetCursorPos, GetWindowRect, HWND_TOPMOST, IDC_ARROW, IDC_HAND, PostMessageW, KillTimer, LWA_ALPHA, LoadCursorW, MA_NOACTIVATE,
     RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetCursor,
     SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WM_LBUTTONUP, WM_MOUSEACTIVATE,
     WM_MOUSEMOVE, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
@@ -50,6 +51,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// WM_MOUSELEAVE（windows crate 里没有导出常量的版本也能用）
 const WM_MOUSELEAVE: u32 = 0x02A3;
 use windows::core::w;
+
+mod xfer;
+use xfer::{CARD_H, CARD_W, XPhase, Xfer};
+
+/// 下一帧（DwmFlush 等到这次合成后投递：帧跟显示器刷新率走）
+const WM_FRAME: u32 = 0x8000 + 0x41;
 
 // ───────────────────────── 提示内容 ─────────────────────────
 
@@ -60,6 +67,8 @@ pub enum Kind {
     Image,
     /// 密码等敏感内容
     Secret,
+    /// 文件（detail = 提示里“已复制”后面的话：文件名 / “3 个文件”；没同步时是原因）
+    Files,
 }
 
 impl Kind {
@@ -69,6 +78,7 @@ impl Kind {
             Kind::Text => 0,
             Kind::Image => 1,
             Kind::Secret => 2,
+            Kind::Files => 3,
         }
     }
 
@@ -76,6 +86,7 @@ impl Kind {
         match c {
             1 => Kind::Image,
             2 => Kind::Secret,
+            3 => Kind::Files,
             _ => Kind::Text,
         }
     }
@@ -105,6 +116,8 @@ enum Icon {
     Restart,
     /// 对勾（已更新）
     Check,
+    /// 文件（复制了文件 / 没传完）
+    File,
 }
 
 /// 实际显示的内容：粗体主词 + 常规后半句（可空）+ 图标；strong = 加强版警示（停更久、抖更明显、抖两次）。
@@ -125,6 +138,11 @@ struct Tip {
 
 impl Tip {
     fn clip(n: &Note) -> Tip {
+        if n.kind == Kind::Files {
+            // 复制了文件：“工位电脑 已复制 3 个文件”；没同步：“文件太多 没同步”
+            let (word, verb) = if n.ok { (n.who.clone(), format!("{VERB} {}", n.detail)) } else { (n.detail.clone(), "没同步".to_string()) };
+            return Tip { word, verb, cut_verb: true, icon: Icon::File, ok: n.ok, strong: false, button: None, hold: None };
+        }
         Tip { word: n.who.clone(), verb: VERB.into(), cut_verb: false, icon: Icon::Copy, ok: n.ok, strong: false, button: None, hold: None }
     }
 
@@ -140,7 +158,7 @@ impl Tip {
 
     /// 最小宽度：剪贴板沿用 MIN_W；键盘提示按内容来（“键盘”只有 80）。
     fn min_w(&self) -> f32 {
-        if self.icon == Icon::Copy { MIN_W } else { H }
+        if matches!(self.icon, Icon::Copy | Icon::File) { MIN_W } else { H }
     }
 
     fn hold(&self) -> Duration {
@@ -671,13 +689,9 @@ fn draw_content(
     let tx = ((PAD_L + ICON + GAP) * s).round() as i32;
     let mut masks = Vec::new();
     let probe = Dib::new(1, 1)?;
+    let nw = text_width(probe.dc, &fonts.bold, name);
     for (txt, f, x) in [(name, &fonts.bold, tx), (verb, &fonts.regular, 0)] {
-        let x = if masks.is_empty() {
-            x
-        } else {
-            let nw = text_width(probe.dc, &fonts.bold, name);
-            tx + nw + (WORD_GAP * s).round() as i32
-        };
+        let x = if masks.is_empty() { x } else { tx + nw + (WORD_GAP * s).round() as i32 };
         // 竖直居中：按字号算基线（ui::Font::baseline_at）
         let y = f.baseline_at(chh as f32 / 2.0 + 0.5 * s).round() as i32;
         masks.push(text_cov(f, cw, chh, x, y, &String::from_utf16_lossy(txt))?);
@@ -806,6 +820,20 @@ fn draw_content(
                             - sw * 0.6));
                     over(p, [1.0, 1.0, 1.0], arc.max(head) * cov);
                 }
+                Icon::File => {
+                    // 一张纸（Lucide file）：9×13 的描边圆角框，右上角折起（22 单位画布）
+                    let k = |v: f32| v * u;
+                    let (gx, gy) = (fx - (icx - k(11.0)), fy - (icy - k(11.0)));
+                    let fold = gx > 12.3 * u && gy < 7.7 * u;
+                    let mut d = if fold { f32::MAX } else { sd_rrect(fx, fy, icx, icy, k(4.5), k(6.5), k(1.3)).abs() - sw / 2.0 };
+                    let (ax, ay) = (icx + k(1.5), icy - k(6.5));
+                    let (bx, by) = (icx + k(4.5), icy - k(3.5));
+                    d = d
+                        .min(seg_d(fx, fy, ax, ay, bx, by) - sw / 2.0)
+                        .min(seg_d(fx, fy, ax, ay, ax, by) - sw / 2.0)
+                        .min(seg_d(fx, fy, ax, by, bx, by) - sw / 2.0);
+                    over(p, [1.0, 1.0, 1.0], sat(0.5 - d) * cov);
+                }
             }
         }
     }
@@ -914,6 +942,12 @@ fn choose_glass(bd: &Backdrop, cx: f32, cy: f32, wf: f32, s: f32) -> (bool, f32)
     } else {
         let (al, ad) = (need(true), need(false));
         if al - LIGHT.a <= ad - DARK.a + 0.06 { (true, al) } else { (false, ad) }
+    }
+}
+
+impl Content {
+    fn empty() -> Content {
+        Content { w: 0, h: 0, px: Vec::new() }
     }
 }
 
@@ -1064,6 +1098,14 @@ struct Island {
     hover: bool,
     /// 排好的主词、后半句（悬停变化时重画内容层用）
     name_verb: Option<(Vec<u16>, Vec<u16>)>,
+    /// 传输大岛（粘贴对方文件时）
+    xfer: Option<Xfer>,
+    /// 上一帧的玻璃（形状没变就直接拿来用）
+    glass: Option<(Pose, Vec<u8>)>,
+    /// 已经约了下一帧（WM_FRAME 在路上）
+    frame_pending: bool,
+    /// 传输大岛的接鼠标窗口现在摆着
+    xfer_hit: bool,
 }
 
 thread_local! {
@@ -1085,6 +1127,54 @@ pub fn keyboard(ok: bool, here: &str) {
         return;
     }
     with_island(|is| is.present(&Tip::keyboard(ok, here)));
+}
+
+/// 粘贴对方的文件：传输大岛（「接收中」小胶囊长成卡片，玻璃里灌水显示进度，悬停可取消）。
+/// title = 「3 个文件」或文件名，n = 文件个数。只能在 desktop 线程调用。
+pub fn files_progress(read: u64, total: u64, title: &str, n: u32) {
+    with_island(|is| is.xfer_report(read, total, title, n));
+}
+
+/// 粘贴完了：大岛收回成「已收到 3 个文件」（没有大岛时直接弹）。
+pub fn files_done(n: u32) {
+    with_island(|is| {
+        if let Some(x) = is.xfer.as_mut()
+            && x.end.is_none()
+        {
+            x.finish();
+            is.tick();
+            return;
+        }
+        let t = Tip { word: "已收到".into(), verb: format!("{n} 个文件"), cut_verb: true, icon: Icon::Check, ok: true, strong: false, button: None, hold: None };
+        is.present(&t);
+    });
+}
+
+/// 没传完：大岛变琥珀、收回成「没传完」并轻抖。
+pub fn files_failed() {
+    with_island(|is| {
+        if let Some(x) = is.xfer.as_mut()
+            && x.end.is_none()
+        {
+            x.fail();
+            is.tick();
+            return;
+        }
+        let t = Tip { word: "没传完".into(), verb: String::new(), cut_verb: true, icon: Icon::File, ok: false, strong: false, button: None, hold: None };
+        is.present(&t);
+    });
+}
+
+/// 取消了：大岛收回成灰色「已取消」。
+pub fn files_cancelled() {
+    with_island(|is| {
+        if let Some(x) = is.xfer.as_mut()
+            && x.end.is_none()
+        {
+            x.cancel();
+            is.tick();
+        }
+    });
 }
 
 /// 检查更新的提示要显示成什么。
@@ -1179,6 +1269,10 @@ fn with_island(f: impl FnOnce(&mut Island)) {
                 hit: None,
                 hover: false,
                 name_verb: None,
+                xfer: None,
+                glass: None,
+                frame_pending: false,
+                xfer_hit: false,
             });
         }
         if let Some(is) = g.as_mut() {
@@ -1228,6 +1322,13 @@ fn create_hit_window() -> Option<HWND> {
 }
 
 unsafe extern "system" fn hit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // 借不到 = 正在改岛（摆窗口时同步发来的消息）：按默认处理
+    let Some(xfer) = ISLAND.with(|cell| cell.try_borrow().ok().map(|g| g.as_ref().is_some_and(|is| is.xfer.is_some()))) else {
+        return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+    };
+    if xfer {
+        return unsafe { xfer_hit(hwnd, msg, wp, lp) };
+    }
     let set_hover = |on: bool| {
         ISLAND.with(|cell| {
             if let Ok(mut g) = cell.try_borrow_mut()
@@ -1273,7 +1374,90 @@ unsafe extern "system" fn hit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
+/// 传输大岛上的鼠标：进出卡片 = 悬停（「取消」浮出）；点在「取消」上 = 取消这次粘贴。
+unsafe fn xfer_hit(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let with = |f: &mut dyn FnMut(&mut Island)| {
+        ISLAND.with(|cell| {
+            if let Ok(mut g) = cell.try_borrow_mut()
+                && let Some(is) = g.as_mut()
+            {
+                f(is);
+            }
+        });
+    };
+    let on_btn = |hwnd: HWND| -> bool {
+        let mut p = POINT::default();
+        if unsafe { GetCursorPos(&mut p) }.is_err() {
+            return false;
+        }
+        let mut r = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut r) }.is_err() {
+            return false;
+        }
+        let mut hit = false;
+        ISLAND.with(|cell| {
+            if let Ok(g) = cell.try_borrow()
+                && let Some(is) = g.as_ref()
+                && let Some(x) = is.xfer.as_ref()
+            {
+                let (bx, by, bw, bh) = x.btn_rect();
+                let s = is.s;
+                let (px, py) = ((p.x - r.left) as f32 / s, (p.y - r.top) as f32 / s);
+                // 按钮四周放宽 4px，好点
+                hit = x.button_live() && px >= bx - 4.0 && px < bx + bw + 4.0 && py >= by - 4.0 && py < by + bh + 4.0;
+            }
+        });
+        hit
+    };
+    match msg {
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_SETCURSOR => unsafe {
+            let c = if on_btn(hwnd) { IDC_HAND } else { IDC_ARROW };
+            let _ = SetCursor(LoadCursorW(None, c).ok());
+            LRESULT(1)
+        },
+        WM_MOUSEMOVE => {
+            let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+            unsafe {
+                let _ = TrackMouseEvent(&mut tme);
+            }
+            with(&mut |is| is.xfer_hover(true));
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            with(&mut |is| is.xfer_hover(false));
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            if on_btn(hwnd) {
+                let any = crate::files::cancel_paste();
+                crate::log!("文件：灵动岛上点了取消（{}）", if any { "正在粘贴" } else { "已经没在粘贴" });
+                with(&mut |is| {
+                    if let Some(x) = is.xfer.as_mut() {
+                        x.cancel();
+                    }
+                    is.place_hit(false);
+                    is.tick();
+                });
+            }
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_FRAME {
+        ISLAND.with(|cell| {
+            if let Ok(mut g) = cell.try_borrow_mut()
+                && let Some(is) = g.as_mut()
+            {
+                is.frame_pending = false;
+                is.tick();
+            }
+        });
+        return LRESULT(0);
+    }
     if msg == WM_TIMER && wp.0 == TIMER_ANIM {
         ISLAND.with(|cell| {
             if let Ok(mut g) = cell.try_borrow_mut()
@@ -1310,20 +1494,37 @@ fn cursor_monitor() -> Option<(RECT, f32)> {
 impl Island {
     /// 窗口大小（物理像素）：按最宽的胶囊 + 弹簧过冲 + 四周留边，固定不变（换内容不用改窗口）。
     fn win_size(s: f32) -> (i32, i32) {
-        (((MAX_W * 1.05 + 2.0 * MARGIN) * s).ceil() as i32, ((H + 2.0 * MARGIN) * s).ceil() as i32)
+        (((MAX_W.max(CARD_W) * 1.05 + 2.0 * MARGIN) * s).ceil() as i32, ((CARD_H + 2.0 * MARGIN) * s).ceil() as i32)
+    }
+
+    /// 胶囊停稳时的中心 y（窗口坐标，物理像素）：贴着窗口底部（大卡片往上长）。
+    fn rest_cy(wh: usize, s: f32) -> f32 {
+        wh as f32 - (MARGIN + H / 2.0) * s
     }
 
     fn present(&mut self, note: &Tip) {
+        // 传输大岛在场：别的提示让路
+        if self.xfer.is_some() {
+            return;
+        }
         let fresh = matches!(self.phase, Phase::Hidden);
-        if fresh {
-            // 新弹出：定位、截背景
-            let Some((work, s)) = cursor_monitor() else { return };
+        if fresh && !self.open() {
+            return;
+        }
+        self.show_tip(note, fresh);
+    }
+
+    /// 新弹出：定位、截背景、备好位图。
+    fn open(&mut self) -> bool {
+        {
+            let Some((work, s)) = cursor_monitor() else { return false };
             let (ww, wh) = Island::win_size(s);
             let rest_cy = work.bottom as f32 - (MARGIN_BOTTOM + H / 2.0) * s;
             self.x = (work.left + work.right) / 2 - ww / 2;
-            self.y = (rest_cy - wh as f32 / 2.0).round() as i32;
+            self.y = (rest_cy - Island::rest_cy(wh as usize, s)).round() as i32;
             self.s = s;
-            let Some(mut raw) = capture(self.x, self.y, ww, wh) else { return };
+            self.glass = None;
+            let Some(mut raw) = capture(self.x, self.y, ww, wh) else { return false };
             let (wu, hu) = (ww as usize, wh as usize);
             let mean_lum = raw.iter().map(|c| lum(*c)).sum::<f32>() / raw.len().max(1) as f32;
             // 浅/深玻璃的模糊程度不同：先按“原图亮度”粗定，再精确选
@@ -1340,9 +1541,13 @@ impl Island {
             self.dib = Dib::new(ww, wh);
             if self.dib.is_none() {
                 self.bd = None;
-                return;
+                return false;
             }
         }
+        true
+    }
+
+    fn show_tip(&mut self, note: &Tip, fresh: bool) {
         let s = self.s;
         let Some((name, verb, wf)) = layout(&note.word, &note.verb, note.cut_verb, note.min_w(), note.button, s) else {
             return;
@@ -1351,7 +1556,7 @@ impl Island {
         self.wf = wf;
         if fresh {
             let bd = self.bd.as_ref().unwrap();
-            let (cx, cy) = (bd.w as f32 / 2.0, bd.h as f32 / 2.0);
+            let (cx, cy) = (bd.w as f32 / 2.0, Island::rest_cy(bd.h, s));
             let (light, a) = choose_glass(bd, cx, cy, wf, s);
             self.light = light;
             self.tint_a = a;
@@ -1390,6 +1595,10 @@ impl Island {
 
     /// 推进动画、画一帧，并定下一次定时器。
     fn tick(&mut self) {
+        if self.xfer.is_some() {
+            self.xfer_tick();
+            return;
+        }
         let now = Instant::now();
         let ms = |t: Instant| now.saturating_duration_since(t).as_secs_f32() * 1000.0;
         let wf = self.wf;
@@ -1453,16 +1662,119 @@ impl Island {
             }
         };
         self.frame(pose);
+        self.schedule(next);
+    }
+
+    /// 约下一帧：在动（next = FRAME_MS）就等这次合成完立刻出下一帧（跟显示器刷新率，60/120/144Hz 都顺），
+    /// 否则定时器到点再醒。
+    fn schedule(&mut self, next: u32) {
         unsafe {
+            if next <= FRAME_MS {
+                let _ = KillTimer(Some(self.hwnd), TIMER_ANIM);
+                if self.frame_pending {
+                    return;
+                }
+                if DwmFlush().is_ok() && PostMessageW(Some(self.hwnd), WM_FRAME, WPARAM(0), LPARAM(0)).is_ok() {
+                    self.frame_pending = true;
+                    return;
+                }
+            }
             SetTimer(Some(self.hwnd), TIMER_ANIM, next, None);
         }
+    }
+
+    // ───────────── 传输大岛 ─────────────
+
+    fn xfer_report(&mut self, read: u64, total: u64, title: &str, n: u32) {
+        if busy_fullscreen() && self.xfer.is_none() {
+            return;
+        }
+        if self.xfer.as_ref().is_some_and(|x| x.end.is_some()) {
+            // 上一次的收尾还没走完：又开始了一次新的粘贴 → 换新的
+            self.hide();
+        }
+        if self.xfer.is_none() {
+            // 正在显示的小提示让路（不播离场，直接换）
+            if !matches!(self.phase, Phase::Hidden) {
+                self.hide();
+            }
+            if !self.open() {
+                return;
+            }
+            let s = self.s;
+            let bd = self.bd.as_ref().unwrap();
+            let cy = Island::rest_cy(bd.h, s) - (CARD_H - H) / 2.0 * s;
+            let (light, a) = choose_glass(bd, bd.w as f32 / 2.0, cy, CARD_W, s);
+            self.light = light;
+            self.tint_a = a;
+            self.content = Some(Content::empty());
+            self.phase = Phase::Appear { start: Instant::now() };
+            self.xfer = Some(Xfer::new(title, n, s));
+            if let Some(x) = self.xfer.as_mut() {
+                x.report(read, total);
+            }
+            self.tick();
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+            }
+            return;
+        }
+        if let Some(x) = self.xfer.as_mut() {
+            x.report(read, total);
+        }
+    }
+
+    fn xfer_hover(&mut self, on: bool) {
+        if let Some(x) = self.xfer.as_mut() {
+            x.hover(on);
+        }
+        self.tick();
+    }
+
+    fn xfer_tick(&mut self) {
+        let Some(x) = self.xfer.as_mut() else { return };
+        let now = x.now();
+        x.update(now);
+        if x.phase == XPhase::Gone {
+            self.hide();
+            return;
+        }
+        let pose = x.pose();
+        let card = x.phase == XPhase::Card;
+        let animating = x.animating(now);
+        let wait = x.wait_ms(now);
+        let s = self.s;
+        let (Some(bd), Some(content), Some(dib)) = (self.bd.as_ref(), self.content.as_ref(), self.dib.as_mut()) else {
+            return;
+        };
+        let (cx, cy) = (bd.w as f32 / 2.0, Island::rest_cy(bd.h, s));
+        let out = dib.bytes();
+        // 玻璃：形状没变就用上一帧的（水、文字每帧在上面重画）
+        match &mut self.glass {
+            Some((p, g)) if *p == pose && g.len() == out.len() => out.copy_from_slice(g),
+            slot => {
+                let f = Frame { bd, content, light: self.light, tint_a: self.tint_a, s, cx, cy };
+                f.draw(pose, out);
+                *slot = Some((pose, out.to_vec()));
+            }
+        }
+        if let Some(x) = self.xfer.as_mut() {
+            x.overlay(out, bd.w, bd.h, cx, cy, s, self.light, now);
+        }
+        self.push(255);
+        if card != self.xfer_hit {
+            self.xfer_hit = card;
+            self.place_hit(card);
+        }
+        self.schedule(if animating { FRAME_MS } else { wait });
     }
 
     fn frame(&mut self, pose: Pose) {
         let (Some(bd), Some(content), Some(dib)) = (self.bd.as_ref(), self.content.as_ref(), self.dib.as_mut()) else {
             return;
         };
-        let f = Frame { bd, content, light: self.light, tint_a: self.tint_a, s: self.s, cx: bd.w as f32 / 2.0, cy: bd.h as f32 / 2.0 };
+        let f = Frame { bd, content, light: self.light, tint_a: self.tint_a, s: self.s, cx: bd.w as f32 / 2.0, cy: Island::rest_cy(bd.h, self.s) };
         f.draw(pose, dib.bytes());
         self.push(255);
     }
@@ -1495,12 +1807,15 @@ impl Island {
         self.content = None;
         self.note = None;
         self.name_verb = None;
+        self.xfer = None;
+        self.xfer_hit = false;
+        self.glass = None;
     }
 
     /// 胶囊在屏幕上的矩形（物理像素，停稳时）。
     fn capsule_rect(&self) -> RECT {
         let (ww, wh) = Island::win_size(self.s);
-        let (cx, cy) = (self.x + ww / 2, self.y + wh / 2);
+        let (cx, cy) = (self.x + ww / 2, self.y + Island::rest_cy(wh as usize, self.s).round() as i32);
         let (hw, hh) = ((self.wf * self.s / 2.0).ceil() as i32, (H * self.s / 2.0).ceil() as i32);
         RECT { left: cx - hw, top: cy - hh, right: cx + hw, bottom: cy + hh }
     }
@@ -1524,6 +1839,29 @@ impl Island {
             }
             return;
         }
+        if self.xfer.is_some() {
+            // 传输大岛：盖住整张卡片（悬停、点取消）
+            if self.hit.is_none() {
+                self.hit = create_hit_window();
+            }
+            let Some(h) = self.hit else { return };
+            let (ww, wh) = Island::win_size(self.s);
+            let s = self.s;
+            let cy = self.y as f32 + Island::rest_cy(wh as usize, s) - (CARD_H - H) / 2.0 * s;
+            let (w, hh) = (CARD_W * s, CARD_H * s);
+            unsafe {
+                let _ = SetWindowPos(
+                    h,
+                    Some(HWND_TOPMOST),
+                    (self.x as f32 + ww as f32 / 2.0 - w / 2.0).round() as i32,
+                    (cy - hh / 2.0).round() as i32,
+                    w.round() as i32,
+                    hh.round() as i32,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
+            return;
+        }
         let Some(label) = self.note.as_ref().and_then(|n| n.button) else {
             return;
         };
@@ -1538,7 +1876,7 @@ impl Island {
         let cw = (self.wf * self.s).ceil() + 2.0;
         let chh = (H * self.s).ceil() + 2.0;
         let ox = self.x as f32 + ww as f32 / 2.0 - cw / 2.0;
-        let oy = self.y as f32 + wh as f32 / 2.0 - chh / 2.0;
+        let oy = self.y as f32 + Island::rest_cy(wh as usize, self.s) - chh / 2.0;
         unsafe {
             let _ = SetWindowPos(
                 h,
@@ -1757,6 +2095,11 @@ mod tests {
             ("restart", Tip::upd("正在重启", String::new(), Icon::Restart, true, None, UPD_BUSY_HOLD), false),
             ("done", Tip::upd("已更新", "0.2.0".into(), Icon::Check, true, None, UPD_DONE_HOLD), false),
             ("fail", Tip::upd("更新失败", "网络不通".into(), Icon::Up, false, None, HOLD_FAIL), false),
+            ("fcopy", Tip::clip(&Note { who: "工位电脑".into(), kind: Kind::Files, detail: "3 个文件".into(), ok: true }), false),
+            ("fname", Tip::clip(&Note { who: "工位电脑".into(), kind: Kind::Files, detail: "季度报告-最终版.pdf".into(), ok: true }), false),
+            ("fmany", Tip::clip(&Note { who: "工位电脑".into(), kind: Kind::Files, detail: "文件太多".into(), ok: false }), false),
+            ("fdone", Tip { word: "已收到".into(), verb: "3 个文件".into(), cut_verb: true, icon: Icon::Check, ok: true, strong: false, button: None, hold: None }, false),
+            ("ffail", Tip { word: "没传完".into(), verb: String::new(), cut_verb: true, icon: Icon::File, ok: false, strong: false, button: None, hold: None }, false),
         ];
         for (tag, bgc) in [("light", [0.95, 0.95, 0.96]), ("dark", [0.06, 0.08, 0.14])] {
             for (name_tag, t, hover) in &tips {

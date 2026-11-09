@@ -80,6 +80,11 @@ fn own_rid() -> u32 {
     })
 }
 
+/// 本进程以管理员身份（高完整性）运行。
+pub fn self_elevated() -> bool {
+    own_rid() >= HIGH_RID
+}
+
 thread_local! {
     /// (前台 pid, 结果)：同一个进程不重复查。
     static CACHE: Cell<(u32, bool)> = const { Cell::new((0, false)) };
